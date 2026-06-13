@@ -15,6 +15,7 @@ import type { Scene } from './render/scene'
 import type { BeamScene } from './render/beamScene'
 import type { LabelScene } from './render/labelScene'
 import type { PickCandidate } from './core/picking'
+import type { PathFilter } from './core/filter'
 
 // Core
 import { Timeline } from './core/timeline'
@@ -24,6 +25,7 @@ import { createFrameState, stepFrame } from './core/frameStep'
 import { seedTree } from './core/tree'
 import { Emitter } from './core/emitter'
 import { nearestWithinRadius } from './core/picking'
+import { compilePathFilter } from './core/filter'
 
 // Render
 import { Camera, autoFrame } from './render/camera'
@@ -129,6 +131,19 @@ export type RunewoodActorClickPayload = {
 }
 
 /**
+ * Payload for the `nodeHover` event: the node the cursor is currently over, with
+ * the live screen-pixel position to anchor a host tooltip, or `null` once the
+ * cursor leaves every node. Emitted only on a change (enter, move to a different
+ * node, or leave), never every frame, so a host can drive a tooltip cheaply.
+ */
+export type RunewoodNodeHoverPayload = {
+  /** The hovered node's full slash-joined path, e.g. `seraphim/api/src/main.rs`. */
+  path: string
+  /** The cursor position in canvas-relative screen pixels, for positioning a tooltip. */
+  screen: { x: number, y: number }
+} | null
+
+/**
  * The controller's typed event surface (issue #10): each key is an event name and
  * its value is that event's payload type. Drives {@link RunewoodController.on} /
  * {@link RunewoodController.off} so subscribing is fully type-checked.
@@ -138,6 +153,9 @@ export type RunewoodActorClickPayload = {
  * - `reachedLiveEdge`: emitted when the playhead catches up to the newest event
  *   while following live, so a host can light up a "live" indicator.
  * - `nodeClick` / `actorClick`: emitted when a click resolves to a node / actor.
+ * - `nodeHover`: emitted when the hovered node changes (enter / move-to-different /
+ *   leave); the payload carries the node path + cursor screen point, or `null` on
+ *   leave. A host drives a tooltip off this; the library stays framework-agnostic.
  */
 export type RunewoodEventMap = {
   play: void
@@ -146,6 +164,7 @@ export type RunewoodEventMap = {
   reachedLiveEdge: void
   nodeClick: RunewoodNodeClickPayload
   actorClick: RunewoodActorClickPayload
+  nodeHover: RunewoodNodeHoverPayload
 }
 
 /** The snapshot {@link RunewoodController.getState} returns. */
@@ -243,6 +262,24 @@ export type RunewoodOptions = {
    * exposed so a harness can pin it.
    */
   resolution?: number
+  /**
+   * Whitelist globs for forest paths. When non-empty, only events / seed paths
+   * matching at least one pattern are kept; an exclude still subtracts from the
+   * survivors. Empty / omitted (the default) means "every path is a candidate".
+   * Supports `**`, `*`, `?`, and `{a,b}` alternation; see {@link compilePathFilter}.
+   *
+   * Filtering is **construction-time** for v1: the predicate is compiled once
+   * here and applied at ingest and seed. To change it, rebuild the controller.
+   */
+  include?: string[]
+  /**
+   * Blacklist globs for forest paths, the common case: omit noise like
+   * `**\/node_modules/**`, `**\/__pycache__/**`, `**\/.git/**`, `**\/dist/**`.
+   * A path matching any exclude is dropped even if it also matched an include
+   * (exclude wins). Pathless `pulse` events are actor-level and always kept.
+   * Construction-time, same as {@link include}.
+   */
+  exclude?: string[]
 }
 
 /**
@@ -321,9 +358,32 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // Click hit slop in screen pixels, converted to world units per click via zoom.
   const hitRadiusPx = options.hitRadius ?? DEFAULT_HIT_RADIUS_PX
 
-  // The pointer listener, kept so destroy can detach it. Created on init once the
-  // canvas exists; null before init and after teardown.
-  let pointerListener: ((pointerEvent: PointerEvent) => void) | null = null
+  // Construction-time path filter (issue #180): compiled once from the include /
+  // exclude globs and applied at ingest and seed. Pathless `pulse` events bypass
+  // it (no path to filter); see `ingest`. A trivially-keep-all predicate when the
+  // host configured neither list.
+  const pathFilter: PathFilter = compilePathFilter({ include: options.include, exclude: options.exclude })
+
+  // The canvas pointer + wheel listeners, kept so destroy can detach every one.
+  // Created on init once the canvas exists; null before init and after teardown.
+  let pointerDownListener: ((pointerEvent: PointerEvent) => void) | null = null
+  let pointerMoveListener: ((pointerEvent: PointerEvent) => void) | null = null
+  let pointerUpListener: ((pointerEvent: PointerEvent) => void) | null = null
+  let pointerLeaveListener: ((pointerEvent: PointerEvent) => void) | null = null
+  let wheelListener: ((wheelEvent: WheelEvent) => void) | null = null
+
+  // Drag tracking: a press starts a potential drag; we pan on each move and only
+  // treat the gesture as a click on release if the pointer barely moved (so a drag
+  // to pan never deep-links). `dragOrigin` is the press point (canvas-relative),
+  // `dragLast` the previous move point we panned from, `dragExceededThreshold`
+  // latches once the movement crosses `CLICK_DRAG_THRESHOLD_PX`.
+  let dragOrigin: { x: number, y: number } | null = null
+  let dragLast: { x: number, y: number } | null = null
+  let dragExceededThreshold = false
+
+  // The path of the node the cursor currently hovers, so `nodeHover` fires only on
+  // a change (enter / move-to-different / leave) rather than every pointer move.
+  let hoveredPath: string | null = null
 
   // Whether the playhead was sitting exactly on the newest event on the previous
   // tick, so `reachedLiveEdge` fires once on the transition rather than every frame.
@@ -728,13 +788,27 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       resizeObserver.observe(container)
     }
 
-    // Wire pointer hit-testing on the live canvas. The listener stays a thin shell:
-    // it converts the screen point to world space via the camera and hands the pure
-    // picking math the live node / actor positions; see `handlePointer`.
+    // Wire pointer interaction on the live canvas. Every listener stays a thin
+    // shell: it computes the canvas-relative screen point and defers the real work
+    // to the pure pieces (the camera's pan / zoom / unproject math and the pure
+    // `nearestWithinRadius`). Down/move/up implement drag-to-pan with a click-vs-
+    // drag threshold; move also drives the hover hit-test; wheel zooms anchored at
+    // the cursor. See `handlePointerDown` / `handlePointerMove` / etc.
     const canvas = backend.canvas
     if (canvas) {
-      pointerListener = (pointerEvent: PointerEvent): void => handlePointer(pointerEvent, canvas)
-      canvas.addEventListener('pointerdown', pointerListener)
+      pointerDownListener = (pointerEvent: PointerEvent): void => handlePointerDown(pointerEvent, canvas)
+      pointerMoveListener = (pointerEvent: PointerEvent): void => handlePointerMove(pointerEvent, canvas)
+      pointerUpListener = (pointerEvent: PointerEvent): void => handlePointerUp(pointerEvent, canvas)
+      pointerLeaveListener = (): void => handlePointerLeave()
+      wheelListener = (wheelEvent: WheelEvent): void => handleWheel(wheelEvent, canvas)
+
+      canvas.addEventListener('pointerdown', pointerDownListener)
+      canvas.addEventListener('pointermove', pointerMoveListener)
+      canvas.addEventListener('pointerup', pointerUpListener)
+      canvas.addEventListener('pointerleave', pointerLeaveListener)
+      // `passive: false` so we can `preventDefault` and stop the page scrolling
+      // when the user zooms the forest with the wheel.
+      canvas.addEventListener('wheel', wheelListener, { passive: false })
     }
 
     ready = true
@@ -758,18 +832,74 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     rafHandle = requestAnimationFrame(frame)
   }
 
-  /**
-   * Resolves one pointer event to the nearest node and actor and emits
-   * `nodeClick` / `actorClick`. The screen point is taken relative to the canvas
-   * (so an offset / scrolled host still hits correctly), unprojected to world
-   * space by the camera, and matched against the live spring positions (nodes) and
-   * the actor orb centroids (actors) by the pure {@link nearestWithinRadius}. The
-   * screen-pixel hit slop is divided by the live zoom so the radius is constant on
-   * screen at any zoom.
-   */
-  function handlePointer(pointerEvent: PointerEvent, canvas: HTMLCanvasElement): void {
+  /** The pointer position relative to the canvas top-left, in CSS pixels. */
+  function screenPointOf(pointerEvent: PointerEvent | WheelEvent, canvas: HTMLCanvasElement): { x: number, y: number } {
     const rect = canvas.getBoundingClientRect()
-    const screenPoint = { x: pointerEvent.clientX - rect.left, y: pointerEvent.clientY - rect.top }
+    return { x: pointerEvent.clientX - rect.left, y: pointerEvent.clientY - rect.top }
+  }
+
+  /**
+   * Begins a potential drag: records the press point and captures the pointer so
+   * moves keep arriving even if the cursor leaves the canvas mid-drag. Whether
+   * this becomes a pan or a click is decided on release by how far the pointer
+   * moved (see {@link handlePointerUp}).
+   */
+  function handlePointerDown(pointerEvent: PointerEvent, canvas: HTMLCanvasElement): void {
+    const screenPoint = screenPointOf(pointerEvent, canvas)
+    dragOrigin = screenPoint
+    dragLast = screenPoint
+    dragExceededThreshold = false
+    // Keep receiving moves / the up even if the cursor slips off the canvas.
+    canvas.setPointerCapture?.(pointerEvent.pointerId)
+  }
+
+  /**
+   * Handles a move. While a button is held this pans the camera by the per-move
+   * screen delta (and, once the move crosses the click threshold, detaches
+   * auto-follow so the user's view sticks like a maps app). With no button held it
+   * drives the hover hit-test instead. The two are mutually exclusive: a drag
+   * suppresses hover so a tooltip never flickers under a pan.
+   */
+  function handlePointerMove(pointerEvent: PointerEvent, canvas: HTMLCanvasElement): void {
+    const screenPoint = screenPointOf(pointerEvent, canvas)
+
+    if (dragOrigin && dragLast) {
+      const totalDeltaX = screenPoint.x - dragOrigin.x
+      const totalDeltaY = screenPoint.y - dragOrigin.y
+      if (Math.hypot(totalDeltaX, totalDeltaY) > CLICK_DRAG_THRESHOLD_PX) {
+        dragExceededThreshold = true
+        // A deliberate manual pan detaches auto-follow so the camera stops yanking
+        // the view back to the active region each frame. `follow(true)` re-enables it.
+        following = false
+      }
+      // Pan by the incremental delta since the last move so the world tracks the
+      // cursor 1:1. Even sub-threshold moves pan; the threshold only gates whether
+      // the gesture counts as a click on release.
+      const moveDeltaX = screenPoint.x - dragLast.x
+      const moveDeltaY = screenPoint.y - dragLast.y
+      camera.panByScreen(moveDeltaX, moveDeltaY)
+      dragLast = screenPoint
+      return
+    }
+
+    updateHover(screenPoint)
+  }
+
+  /**
+   * Ends a gesture. If the pointer barely moved (under the click threshold) the
+   * press is treated as a click and resolved to the nearest node / actor; a real
+   * drag emits nothing (it already panned). Either way the drag state is cleared.
+   */
+  function handlePointerUp(pointerEvent: PointerEvent, canvas: HTMLCanvasElement): void {
+    canvas.releasePointerCapture?.(pointerEvent.pointerId)
+    const wasClick = dragOrigin !== null && !dragExceededThreshold
+    dragOrigin = null
+    dragLast = null
+    if (!wasClick) {
+      return
+    }
+
+    const screenPoint = screenPointOf(pointerEvent, canvas)
     const worldPoint = camera.screenToWorld(screenPoint)
     const worldRadius = hitRadiusPx / camera.zoom
 
@@ -782,6 +912,58 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     if (actorId !== null) {
       emitter.emit('actorClick', { actor: actorId })
     }
+  }
+
+  /** The cursor left the canvas: abandon any in-flight drag and clear the hover. */
+  function handlePointerLeave(): void {
+    dragOrigin = null
+    dragLast = null
+    setHovered(null, null)
+  }
+
+  /**
+   * Zooms the camera anchored at the cursor on a wheel event, so scrolling up
+   * zooms in toward the cursor and down zooms out, clamped by the camera's own
+   * limits. Like a manual pan, a wheel zoom detaches auto-follow so the user's
+   * chosen view sticks. `preventDefault` stops the page from scrolling under it.
+   */
+  function handleWheel(wheelEvent: WheelEvent, canvas: HTMLCanvasElement): void {
+    wheelEvent.preventDefault()
+    const screenAnchor = screenPointOf(wheelEvent, canvas)
+    // deltaY < 0 is a scroll up (zoom in); raising the factor above 1 zooms in.
+    const factor = wheelEvent.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP
+    camera.zoomBy(factor, screenAnchor)
+    following = false
+  }
+
+  /**
+   * Hit-tests the cursor against the live node positions and emits `nodeHover`
+   * only when the result changes. The screen-pixel hit slop is divided by the live
+   * zoom so the hover radius is constant on screen at any zoom, mirroring picking.
+   */
+  function updateHover(screenPoint: { x: number, y: number }): void {
+    const worldPoint = camera.screenToWorld(screenPoint)
+    const worldRadius = hitRadiusPx / camera.zoom
+    const nodePath = nearestWithinRadius(worldPoint, nodeCandidates(), worldRadius)
+    setHovered(nodePath, screenPoint)
+  }
+
+  /**
+   * Updates the hovered node and emits `nodeHover` on a change only (enter, move to
+   * a different node, or leave). A move within the same node does not re-emit, so a
+   * host tooltip is driven cheaply; the host positions it from its own pointer
+   * tracking if it wants per-pixel following.
+   */
+  function setHovered(path: string | null, screenPoint: { x: number, y: number } | null): void {
+    if (path === hoveredPath) {
+      return
+    }
+    hoveredPath = path
+    if (path === null || screenPoint === null) {
+      emitter.emit('nodeHover', null)
+      return
+    }
+    emitter.emit('nodeHover', { path, screen: { x: screenPoint.x, y: screenPoint.y }})
   }
 
   /** The live node pick candidates: every spring-tracked node at its drawn position. */
@@ -828,8 +1010,12 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   return {
     ingest(events: RunewoodEvent | RunewoodEvent[]): void {
       const batch = Array.isArray(events) ? events : [ events ]
+      // Drop excluded paths at the ingest boundary so they never reach the
+      // timeline (filtering is construction-time for v1). A pathless event (a
+      // `pulse`) is actor-level with nothing to filter, so it is always kept.
+      const filtered = batch.filter((event) => event.path === undefined || pathFilter(event.path))
       const run = (): void => {
-        for (const event of batch) {
+        for (const event of filtered) {
           timeline.append(event)
         }
         // Bound a long-running live feed: drop history beyond the retention cap
@@ -847,14 +1033,17 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       }
     },
     seed(paths: string[]): void {
+      // Drop excluded seed paths before they ever enter the tree, mirroring the
+      // ingest filter so seeded structure honors the same blacklist / whitelist.
+      const keptPaths = paths.filter((path) => pathFilter(path))
       const run = (): void => {
         // Seed dim structure onto the live tree in place: `seedTree` only adds
         // missing nodes as `seeded` and never downgrades a discovered node, which
         // is exactly the merge we want, so it shows immediately without disturbing
         // anything already lit. Record the paths on the state too, so a later
         // backward seek re-seeds them when it re-folds the tree.
-        seedTree(frameState.tree, paths)
-        frameState.seededPaths.push(...paths)
+        seedTree(frameState.tree, keptPaths)
+        frameState.seededPaths.push(...keptPaths)
       }
       if (ready) {
         run()
@@ -924,13 +1113,32 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       resizeObserver = null
       reducedMotionQuery = null
 
-      // Detach the pointer listener before the backend (and its canvas) go away,
-      // and drop every event subscriber so the controller leaves nothing behind.
+      // Detach every pointer / wheel listener before the backend (and its canvas)
+      // go away, and drop every event subscriber so the controller leaves nothing
+      // behind.
       const canvas = backend.canvas
-      if (pointerListener && canvas) {
-        canvas.removeEventListener('pointerdown', pointerListener)
+      if (canvas) {
+        if (pointerDownListener) {
+          canvas.removeEventListener('pointerdown', pointerDownListener)
+        }
+        if (pointerMoveListener) {
+          canvas.removeEventListener('pointermove', pointerMoveListener)
+        }
+        if (pointerUpListener) {
+          canvas.removeEventListener('pointerup', pointerUpListener)
+        }
+        if (pointerLeaveListener) {
+          canvas.removeEventListener('pointerleave', pointerLeaveListener)
+        }
+        if (wheelListener) {
+          canvas.removeEventListener('wheel', wheelListener)
+        }
       }
-      pointerListener = null
+      pointerDownListener = null
+      pointerMoveListener = null
+      pointerUpListener = null
+      pointerLeaveListener = null
+      wheelListener = null
       emitter.clear()
 
       scene?.clear()
@@ -967,6 +1175,20 @@ const ACTOR_LABEL_FADE_MS = 3_000
  * small node still selects it, without grabbing unrelated neighbors.
  */
 const DEFAULT_HIT_RADIUS_PX = 16
+
+/**
+ * How far (in screen pixels) the pointer may travel between press and release and
+ * still count as a click rather than a drag. Beyond this the gesture is a pan, so
+ * dragging to navigate never accidentally deep-links via `nodeClick`.
+ */
+const CLICK_DRAG_THRESHOLD_PX = 4
+
+/**
+ * Multiplicative zoom applied per wheel notch: one scroll-up multiplies the zoom
+ * by this, one scroll-down divides by it. ~1.1 is a smooth, controllable step
+ * that still moves perceptibly per notch.
+ */
+const WHEEL_ZOOM_STEP = 1.1
 
 /**
  * Resolves the option's loose theme input (a built-in name, a full theme, or a

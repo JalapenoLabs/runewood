@@ -49,6 +49,13 @@ const DIRECTORY_SEGMENTS = [
   'helpers', 'internal', 'modules', 'services', 'pkg', 'cmd',
 ]
 
+/**
+ * Noise directory segments the path filter is meant to omit. The generator
+ * occasionally roots an invented path under one of these so the playground's
+ * exclude globs visibly remove them from the forest.
+ */
+const NOISE_SEGMENTS = [ 'node_modules', '__pycache__', '.git', 'dist' ]
+
 /** Freeform command labels attached to pathless `pulse` events for flavor. */
 const PULSE_COMMANDS = [
   'cargo build', 'yarn install', 'git status', 'docker compose up',
@@ -223,6 +230,11 @@ export function createSyntheticStream(options: SyntheticOptions) {
     const root = forest.focusByActor.get(actor) ?? REPO_ROOTS[randomInt(0, REPO_ROOTS.length - 1)]
     const depth = randomInt(1, MAX_PATH_DEPTH)
     const segments: string[] = [ root ]
+    // Occasionally route the path through a noise directory (node_modules, etc.) so
+    // the playground's exclude filter has something to visibly strip out.
+    if (Math.random() < NOISE_PATH_CHANCE) {
+      segments.push(NOISE_SEGMENTS[randomInt(0, NOISE_SEGMENTS.length - 1)])
+    }
     for (let level = 0; level < depth; level += 1) {
       segments.push(DIRECTORY_SEGMENTS[randomInt(0, DIRECTORY_SEGMENTS.length - 1)])
     }
@@ -361,6 +373,8 @@ const DIRECTORY_DELETE_CHANCE = 0.15
 const CROSS_REPO_HOP_CHANCE = 0.08
 /** Deepest invented path, in directory levels below the repo root. */
 const MAX_PATH_DEPTH = 6
+/** Chance an invented path is routed through a noise directory the filter should strip. */
+const NOISE_PATH_CHANCE = 0.18
 /** Fewest events in a manual (button-triggered) burst. */
 const BURST_MANUAL_MIN = 30
 /** Most events in a manual burst. */

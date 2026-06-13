@@ -13,6 +13,7 @@ export type {
 } from './core/layout'
 export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
 export type { PickCandidate } from './core/picking'
+export type { PathFilter, PathFilterOptions } from './core/filter'
 
 export { applyEvent, createTree, seedTree } from './core/tree'
 export { Timeline } from './core/timeline'
@@ -20,6 +21,7 @@ export { computeTargets, stepSprings, nodeHeat } from './core/layout'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
 export { Emitter } from './core/emitter'
 export { nearestWithinRadius } from './core/picking'
+export { compilePathFilter } from './core/filter'
 
 // The public controller: the single entry point a host mounts against a div.
 export { createRunewood } from './runewood'
@@ -30,5 +32,6 @@ export type {
   RunewoodSeekPayload,
   RunewoodNodeClickPayload,
   RunewoodActorClickPayload,
+  RunewoodNodeHoverPayload,
   RunewoodPlaybackState,
 } from './runewood'

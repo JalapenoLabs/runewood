@@ -125,6 +125,47 @@
         color: #8b82b8;
       }
 
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .field label {
+        font-size: 11px;
+        color: #b9a8ff;
+      }
+
+      #exclude {
+        width: 100%;
+        min-height: 54px;
+        resize: vertical;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: rgba(30, 24, 56, 0.9);
+        border: 1px solid rgba(180, 160, 255, 0.35);
+        color: inherit;
+        font: inherit;
+        font-size: 11px;
+      }
+
+      /* The hover tooltip lives in the playground host, not the library: the
+         library only emits the `nodeHover` event with the path + screen point. */
+      #hover-tooltip {
+        position: fixed;
+        z-index: 20;
+        padding: 4px 8px;
+        border-radius: 6px;
+        background: rgba(12, 10, 24, 0.92);
+        border: 1px solid rgba(180, 160, 255, 0.4);
+        color: #e7e2ff;
+        font-size: 11px;
+        pointer-events: none;
+        white-space: nowrap;
+        transform: translate(12px, 12px);
+        display: none;
+      }
+
       #legend {
         display: flex;
         flex-direction: column;
@@ -167,6 +208,8 @@
   </head>
   <body>
     <div id="canvas-host"></div>
+
+    <div id="hover-tooltip"></div>
 
     <button id="panel-restore" type="button" hidden>Show controls</button>
 
@@ -216,6 +259,14 @@
         <input id="controls" type="checkbox" checked />
       </div>
 
+      <div class="field">
+        <label for="exclude">Exclude paths (glob, comma or newline separated)</label>
+        <textarea
+          id="exclude"
+          spellcheck="false"
+        >**/node_modules/**, **/__pycache__/**, **/.git/**, **/dist/**</textarea>
+      </div>
+
       <div id="legend">
         <h2>Color legend</h2>
         <div id="legend-grid" class="legend-grid"></div>
@@ -223,7 +274,10 @@
 
       <pre id="state-readout">{}</pre>
 
-      <p class="hint">nodeClick / actorClick log to the console.</p>
+      <p class="hint">
+        Drag to pan, wheel to zoom (auto-follow detaches). Hover a node for its
+        path. nodeClick / actorClick log to the console.
+      </p>
     </div>
 
     <script type="module" src="./main.ts"></script>

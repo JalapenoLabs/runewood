@@ -50,6 +50,12 @@ const LEGEND_FILE_SAMPLES = [
 
 const STATE_READOUT_INTERVAL_MS = 250
 
+/**
+ * How long to wait after the last keystroke in the exclude field before rebuilding
+ * the controller, so typing a multi-pattern list does not rebuild on every key.
+ */
+const EXCLUDE_REBUILD_DEBOUNCE_MS = 400
+
 function main(): void {
   const canvasHost = requireElement<HTMLDivElement>('canvas-host')
   const stateReadout = requireElement<HTMLPreElement>('state-readout')
@@ -65,6 +71,8 @@ function main(): void {
   const panel = requireElement<HTMLDivElement>('panel')
   const panelRestore = requireElement<HTMLButtonElement>('panel-restore')
   const legendGrid = requireElement<HTMLDivElement>('legend-grid')
+  const excludeInput = requireElement<HTMLTextAreaElement>('exclude')
+  const hoverTooltip = requireElement<HTMLDivElement>('hover-tooltip')
 
   // The legend mirrors the engine's own coloring, so it is built from the same
   // theme + colorForPath the forest uses and refreshed whenever the theme changes.
@@ -72,15 +80,19 @@ function main(): void {
 
   // Build the engine. We start paused-following-live so the synthetic stream's
   // newest events drag the view, and pre-seed the known structure as dim nodes.
+  // The exclude globs from the panel feed the controller's construction-time path
+  // filter, so excluded paths (node_modules, __pycache__, ...) never enter the forest.
   let controller = createRunewood(canvasHost, {
     theme: 'dusk',
     bloom: 'high',
     showLabels: true,
     autoplay: true,
     followLive: true,
+    exclude: parseExcludePatterns(excludeInput.value),
   })
   controller.seed(seedPaths())
   wireControllerLogging(controller)
+  wireHoverTooltip(controller, hoverTooltip)
 
   const stream = createSyntheticStream({
     eventsPerSecond: Number(rateInput.value),
@@ -132,6 +144,17 @@ function main(): void {
   bloomSelect.addEventListener('change', () => rebuild())
   labelsToggle.addEventListener('change', () => rebuild())
 
+  // Rebuilding the controller is the way to apply new exclude globs (filtering is
+  // construction-time), so editing the patterns rebuilds in place, debounced so a
+  // burst of keystrokes does not thrash the renderer. Mirrors the theme rebuild.
+  let excludeDebounce: ReturnType<typeof setTimeout> | null = null
+  excludeInput.addEventListener('input', () => {
+    if (excludeDebounce !== null) {
+      clearTimeout(excludeDebounce)
+    }
+    excludeDebounce = setTimeout(() => rebuild(), EXCLUDE_REBUILD_DEBOUNCE_MS)
+  })
+
   // The engine exposes `getState()` for a host to render its own transport rather
   // than shipping a built-in overlay (issue #11 is not implemented yet), so this
   // toggle shows or hides the playground's own control panel chrome over the canvas
@@ -151,15 +174,20 @@ function main(): void {
   function rebuild(): void {
     const wasRunning = stream.isRunning()
     controller.destroy()
+    // The tooltip belongs to the old controller's hover events; hide it so a stale
+    // path does not linger across the rebuild.
+    hoverTooltip.style.display = 'none'
     controller = createRunewood(canvasHost, {
       theme: themeSelect.value as ThemeName,
       bloom: bloomSelect.value as BloomQuality,
       showLabels: labelsToggle.checked,
       autoplay: true,
       followLive: true,
+      exclude: parseExcludePatterns(excludeInput.value),
     })
     controller.seed(seedPaths())
     wireControllerLogging(controller)
+    wireHoverTooltip(controller, hoverTooltip)
     // Repoint the stream's sink at the new controller by recreating nothing: the
     // closure already captures `controller` by reference through the outer binding,
     // so re-reading it on each emit picks up the rebuild. We just resume if needed.
@@ -173,6 +201,39 @@ function main(): void {
   setInterval(() => {
     stateReadout.textContent = JSON.stringify(controller.getState(), null, 2)
   }, STATE_READOUT_INTERVAL_MS)
+}
+
+/**
+ * Splits the exclude textarea's freeform text into glob patterns. Patterns are
+ * separated by commas or newlines, trimmed, and empties dropped, so an operator
+ * can type `**\/node_modules/**, **\/dist/**` on one line or one per line.
+ */
+function parseExcludePatterns(raw: string): string[] {
+  return raw
+    .split(/[,\n]/)
+    .map((pattern) => pattern.trim())
+    .filter((pattern) => pattern.length > 0)
+}
+
+/**
+ * Drives the playground's DOM tooltip from the library's `nodeHover` event. The
+ * tooltip itself lives here in the host, not the library, so the core stays
+ * framework-agnostic: the library only emits the hovered path + screen point, and
+ * the playground decides how to render it. The screen point is canvas-relative,
+ * and the canvas fills the viewport, so it doubles as a viewport coordinate for a
+ * `position: fixed` tooltip.
+ */
+function wireHoverTooltip(controller: ReturnType<typeof createRunewood>, tooltip: HTMLDivElement): void {
+  controller.on('nodeHover', (payload) => {
+    if (payload === null) {
+      tooltip.style.display = 'none'
+      return
+    }
+    tooltip.textContent = payload.path
+    tooltip.style.left = `${payload.screen.x}px`
+    tooltip.style.top = `${payload.screen.y}px`
+    tooltip.style.display = 'block'
+  })
 }
 
 /**
