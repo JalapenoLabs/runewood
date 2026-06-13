@@ -319,6 +319,16 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   let springs: SpringState = new Map()
   let frameState: FrameState = createFrameState()
 
+  // The radial layout targets, memoized across frames. They derive purely from the
+  // tree structure (which paths exist + how they nest), never from touch counts or
+  // time, so recomputing the whole tidy-tree every frame is pure waste once the
+  // structure is stable. We recompute only when a step reports it added a node (or
+  // a rebuild/seed changed the structure); the springs keep easing toward these
+  // cached targets every frame regardless, which stays cheap. `targets` starts
+  // empty (an empty forest) and `targetsStale` forces the first real recompute.
+  let targets = new Map<string, Vec2>()
+  let targetsStale = true
+
   // The forward-only visual shell, created once the backend is ready.
   const backend = new PixiBackend()
   let scene: Scene | null = null
@@ -453,6 +463,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
     lastFoldedPlayhead = now
     frameState = step.state
+    // A step that added a node (or re-folded the tree) invalidates the cached
+    // layout targets; otherwise the structure is unchanged and the cache stands.
+    if (step.structureChanged) {
+      targetsStale = true
+    }
 
     // Fire `reachedLiveEdge` on the transition into "caught up to the newest event
     // while following live", not every frame we sit there. A host lights its live
@@ -466,9 +481,16 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // 2. Spawn this tick's beams / pulses into the transient particle field.
     spawnEffects(step.beams, step.pulses)
 
-    // 3. Recompute layout targets from the (re)folded tree and step the springs in
-    //    place. One long-lived SpringState across frames, never reconstructed.
-    const targets = computeTargets(frameState.tree, options.layout)
+    // 3. Layout targets are memoized: recompute the radial tidy-tree only when the
+    //    structure changed this step (a node was added, a rebuild, or a seed),
+    //    since the targets are a pure function of the tree's shape, not of touch
+    //    counts or time. The springs still ease toward the cached targets every
+    //    frame (cheap), so motion stays fluid while the expensive layout recompute
+    //    is skipped on the common no-structure-change frame.
+    if (targetsStale) {
+      targets = computeTargets(frameState.tree, options.layout)
+      targetsStale = false
+    }
     const motionScale = prefersReducedMotion() ? 0 : 1
     springs = stepSprings(springs, targets, deltaMs * motionScale, options.springs)
 
@@ -504,10 +526,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       zoom: snapshot.zoom,
       viewport: { x: snapshot.viewport.width, y: snapshot.viewport.height },
     })
-    scene.update(frameState.tree, springs, now, theme)
+    // Thread the live camera zoom into the scenes so they can floor on-screen sizes
+    // (branch thickness, actor orbs, actor labels) and keep them visible no matter
+    // how far the camera has pulled out. `snapshot.zoom` is the same value the
+    // backend was just handed, so the floors track exactly what is on screen.
+    const zoom = snapshot.zoom
+    scene.update(frameState.tree, springs, now, theme, zoom)
 
     const activities = buildActorActivities()
-    beamScene.update(activities, now, theme)
+    beamScene.update(activities, now, theme, zoom)
 
     // Labels can be suppressed wholesale; when off, the scene gets an empty
     // candidate set so it tears its retained text down rather than holding stale.
@@ -749,6 +776,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       timeline.getEvents(),
     )
     frameState = step.state
+    // A backward seek re-folds the tree, so its cached layout targets are stale and
+    // must be recomputed on the next tick.
+    if (step.structureChanged) {
+      targetsStale = true
+    }
     // The seek already folded the tree to the sought time, so keep the loop's
     // fold cursor in sync: without this the next tick would re-cross everything
     // between a stale cursor and the new playhead (a forward seek) or fight the
@@ -1044,6 +1076,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         // backward seek re-seeds them when it re-folds the tree.
         seedTree(frameState.tree, keptPaths)
         frameState.seededPaths.push(...keptPaths)
+        // Seeding adds dim structure to the tree, so the cached layout targets must
+        // be recomputed to place the newly seeded nodes.
+        targetsStale = true
       }
       if (ready) {
         run()

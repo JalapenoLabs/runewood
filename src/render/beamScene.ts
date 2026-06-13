@@ -85,10 +85,14 @@ export class BeamScene {
    * Particles are drawn into a single cleared graphic (their count swings every
    * frame, so one batched object is cheaper than churning a graphic per particle).
    * Actors are retained per id and culled once fully faded.
+   *
+   * @param zoom the live camera zoom (world-units-to-pixels), used to floor the
+   *   actor orb radius at a constant on-screen size so an actor never shrinks to an
+   *   unreadable dot as the forest grows and the camera pulls out.
    */
-  public update(activities: ActorActivity[], now: number, theme: RunewoodTheme): void {
+  public update(activities: ActorActivity[], now: number, theme: RunewoodTheme, zoom: number): void {
     this.drawParticles(this.field.activeParticles(now), theme)
-    this.drawActors(activities, now, theme)
+    this.drawActors(activities, now, theme, zoom)
   }
 
   /**
@@ -128,8 +132,19 @@ export class BeamScene {
    * longer present in `activities` or fully faded so the layer never keeps a dead
    * orb around.
    */
-  private drawActors(activities: ActorActivity[], now: number, theme: RunewoodTheme): void {
+  private drawActors(activities: ActorActivity[], now: number, theme: RunewoodTheme, zoom: number): void {
     const present = new Set<string>()
+
+    // Floor the orb radius at a constant on-screen size. Orbs are drawn in world
+    // units that the camera scales by `zoom`, so a "little opus dude" shrinks to an
+    // unreadable dot once the camera pulls far out as the repo grows. Dividing the
+    // screen-pixel floor by the live zoom yields the world radius that lands on
+    // exactly that many screen pixels, so an actor stays roughly constant on screen
+    // and you can always tell who is doing what. The `max` only ever enlarges a
+    // too-small orb; up close the world size wins and nothing changes.
+    const minWorldRadius = zoom > 0
+      ? MIN_ACTOR_SCREEN_PX / zoom
+      : 0
 
     for (const activity of activities) {
       const visual = actorVisualFor(activity, now, this.actorOptions)
@@ -148,10 +163,11 @@ export class BeamScene {
         this.actorGraphics.set(activity.actor, graphics)
       }
 
+      const radius = Math.max(visual.size, minWorldRadius)
       const color = hslToRgbInt(visual.color)
       graphics.clear()
       graphics
-        .circle(0, 0, visual.size)
+        .circle(0, 0, radius)
         .fill({ color, alpha: visual.alpha * theme.bloomIntensity })
       graphics.position.set(visual.position.x, visual.position.y)
     }
@@ -174,6 +190,14 @@ export class BeamScene {
     }
   }
 }
+
+/**
+ * The minimum on-screen radius, in screen pixels, an actor orb is ever drawn at.
+ * The world radius is floored at `MIN_ACTOR_SCREEN_PX / zoom` so an actor stays
+ * roughly this size on screen no matter how far the camera zooms out, keeping the
+ * "who is doing what" orb readable as the forest grows around it.
+ */
+const MIN_ACTOR_SCREEN_PX = 9
 
 /** Construction options for a {@link BeamScene}; forwards tuning to the pure models. */
 export type BeamSceneOptions = {

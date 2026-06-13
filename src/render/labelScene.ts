@@ -22,6 +22,18 @@ const LABEL_FONT_SIZE_SCALE = 0.75
 const LABEL_FONT_SIZE = LABEL_BASE_FONT_SIZE * LABEL_FONT_SIZE_SCALE
 
 /**
+ * The minimum on-screen height, in screen pixels, an *actor* label is ever drawn
+ * at. Labels are sized in world units that the camera scales by `zoom`, so an
+ * actor's name shrinks to an illegible smear once the camera pulls far out. For
+ * actor labels only (the "who is doing what" headline the user must always read),
+ * the world font size is floored at `MIN_ACTOR_LABEL_SCREEN_PX / zoom` so the name
+ * stays roughly constant on screen. File and root labels keep their plain world
+ * font size: per the design they are allowed to shrink and the file tier is culled
+ * outright when the camera is too far out (see the LOD model).
+ */
+const MIN_ACTOR_LABEL_SCREEN_PX = 13
+
+/**
  * The retained label layer that sits *above* the forest and the beams (issue #7):
  * one persistent pixi {@link Text} per label, keyed by candidate id, created when
  * a label first appears and torn down once it is culled or fully faded. It mirrors
@@ -95,9 +107,18 @@ export class LabelScene {
       // Update the glyph in place. The label color is a global theme decision, so
       // every kind shares the theme's label hue; the per-kind distinction is
       // carried by alpha (subtle roots vs full file/actor flashes).
+      //
+      // Actor labels get a constant-on-screen floor: their world font size is lifted
+      // to `MIN_ACTOR_LABEL_SCREEN_PX / zoom` when that exceeds the base, so the
+      // name stays readable however far the camera zooms out. Up close the base size
+      // wins and nothing changes. File / root labels keep the plain world size.
+      const isActor = decision.kind === 'actor'
+      const minActorFontSize = isActor && zoom > 0
+        ? MIN_ACTOR_LABEL_SCREEN_PX / zoom
+        : 0
       text.text = decision.text
       text.style.fill = hslToRgbInt(theme.label)
-      text.style.fontSize = LABEL_FONT_SIZE
+      text.style.fontSize = Math.max(LABEL_FONT_SIZE, minActorFontSize)
       text.alpha = decision.alpha
       text.position.set(decision.position.x, decision.position.y)
     }

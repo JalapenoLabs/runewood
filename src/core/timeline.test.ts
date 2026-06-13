@@ -301,4 +301,58 @@ describe('Timeline.crossedBetween', () => {
     const crossed = timeline.crossedBetween(lastFolded, timeline.time)
     expect(crossed.map((entry) => entry.path)).toEqual([ 'repo/live.ts' ])
   })
+
+  // The binary-search rewrite must keep the exact same (after, through] semantics,
+  // so these pin down the boundary and duplicate-time behavior the search hinges on.
+  it('returns the same contiguous slice the linear filter would, with duplicate timestamps', () => {
+    // Several events share at=2000; the half-open interval must include every one
+    // of them when 2000 is the upper bound and exclude every one when it is the
+    // lower bound, which is exactly where an off-by-one in the search would show.
+    const timeline = new Timeline([
+      event({ at: 1000, path: 'a' }),
+      event({ at: 2000, path: 'b' }),
+      event({ at: 2000, path: 'c' }),
+      event({ at: 2000, path: 'd' }),
+      event({ at: 3000, path: 'e' }),
+    ])
+
+    expect(timeline.crossedBetween(1000, 2000).map((entry) => entry.path)).toEqual([ 'b', 'c', 'd' ])
+    expect(timeline.crossedBetween(2000, 3000).map((entry) => entry.path)).toEqual([ 'e' ])
+    expect(timeline.crossedBetween(2000, 2000)).toEqual([])
+  })
+
+  it('collects from the first event past the lower bound through the upper, in order', () => {
+    const timeline = new Timeline([
+      event({ at: 100, path: 'a' }),
+      event({ at: 200, path: 'b' }),
+      event({ at: 300, path: 'c' }),
+      event({ at: 400, path: 'd' }),
+      event({ at: 500, path: 'e' }),
+    ])
+
+    // A window that starts and ends mid-log: only the strictly-greater-than lower
+    // bound through the inclusive upper bound, contiguous and time-ordered.
+    expect(timeline.crossedBetween(150, 400).map((entry) => entry.path)).toEqual([ 'b', 'c', 'd' ])
+
+    // A lower bound landing exactly on an event excludes that event but keeps the rest.
+    expect(timeline.crossedBetween(200, 500).map((entry) => entry.path)).toEqual([ 'c', 'd', 'e' ])
+  })
+
+  it('returns an empty slice when the whole log is at or before the lower bound', () => {
+    const timeline = new Timeline([
+      event({ at: 100 }),
+      event({ at: 200 }),
+    ])
+    expect(timeline.crossedBetween(200, 900)).toEqual([])
+    expect(timeline.crossedBetween(500, 900)).toEqual([])
+  })
+
+  it('returns the whole log when the window spans before the first through after the last', () => {
+    const timeline = new Timeline([
+      event({ at: 100, path: 'a' }),
+      event({ at: 200, path: 'b' }),
+      event({ at: 300, path: 'c' }),
+    ])
+    expect(timeline.crossedBetween(0, 9999).map((entry) => entry.path)).toEqual([ 'a', 'b', 'c' ])
+  })
 })

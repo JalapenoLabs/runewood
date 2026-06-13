@@ -84,18 +84,26 @@ export type BloomCapabilities = {
  */
 const BLUR_PASSES_BY_QUALITY = {
   off: 0,
-  low: 2,
-  high: 6,
+  // Raised (low 2 -> 4, high 6 -> 10) so the blur is genuinely smooth rather than
+  // a few banded passes that read as a hard ring. More passes is the chief lever on
+  // "soft glow vs crisp halo"; high is pushed well up so the bloom dissolves into a
+  // luminous haze instead of tracing a sharp lighter circle around each node.
+  low: 4,
+  high: 10,
 } as const satisfies Record<BloomQuality, number>
 
 /**
  * The base blur radius per quality, before the theme's `bloomIntensity` widens
  * it. A wider halo at `high` is the visible difference from `low`.
  */
+// The blur radius was the root of the "hard lighter ring with no blur" the user
+// saw: at the old radius the glow barely spread past the node's own halo disc, so
+// it read as a crisp second circle rather than a soft halo. Widened hard (low
+// 4 -> 12, high 12 -> 32) so the light genuinely bleeds outward into a soft haze.
 const BASE_BLUR_BY_QUALITY = {
   off: 0,
-  low: 4,
-  high: 12,
+  low: 12,
+  high: 32,
 } as const satisfies Record<BloomQuality, number>
 
 /**
@@ -117,7 +125,7 @@ const BASE_STRENGTH_BY_QUALITY = {
  * top of the per-quality base, in the filter's pixel units. At full intensity a
  * `high` halo reaches `BASE_BLUR_BY_QUALITY.high + this`.
  */
-const BLUR_INTENSITY_SPREAD = 6
+const BLUR_INTENSITY_SPREAD = 16
 
 /**
  * The lowest and highest bright-pass threshold the theme's `glowFalloff` maps

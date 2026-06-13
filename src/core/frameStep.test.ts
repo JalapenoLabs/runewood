@@ -223,4 +223,64 @@ describe('stepFrame', () => {
       expect(step.state.playhead).toBe(1000)
     })
   })
+
+  describe('structureChanged signal', () => {
+    it('is true when a crossed event adds a new node', () => {
+      const state = createFrameState()
+      const events = [ event({ at: 1000, action: 'create', path: 'repo/a.ts' }) ]
+
+      const step = stepFrame(state, forward(1000, events), events)
+
+      expect(step.structureChanged).toBe(true)
+    })
+
+    it('is false when every crossed event only re-touches existing nodes', () => {
+      // First fold adds the node.
+      const created = stepFrame(
+        createFrameState(),
+        forward(1000, [ event({ at: 1000, action: 'create', path: 'repo/a.ts' }) ]),
+        [],
+      )
+      expect(created.structureChanged).toBe(true)
+
+      // A later modify + scan of that same node changes no structure, so the layout
+      // can be left memoized: structureChanged must be false.
+      const events = [
+        event({ at: 1500, action: 'modify', path: 'repo/a.ts' }),
+        event({ at: 1600, action: 'scan', path: 'repo/a.ts' }),
+      ]
+      const reTouched = stepFrame(created.state, forward(1600, events), events)
+      expect(reTouched.structureChanged).toBe(false)
+    })
+
+    it('is false on a still frame with no crossed events', () => {
+      const step = stepFrame(createFrameState(), forward(1000, []), [])
+      expect(step.structureChanged).toBe(false)
+    })
+
+    it('is false when a crossed event only deletes an existing node', () => {
+      const created = stepFrame(
+        createFrameState(),
+        forward(1000, [ event({ at: 1000, action: 'create', path: 'repo/a.ts' }) ]),
+        [],
+      )
+
+      // Deleting retains the node (for the fade), so the structure the layout
+      // depends on is unchanged: targets must not be invalidated.
+      const events = [ event({ at: 2000, action: 'delete', path: 'repo/a.ts' }) ]
+      const deleted = stepFrame(created.state, forward(2000, events), events)
+      expect(deleted.structureChanged).toBe(false)
+    })
+
+    it('is true on a backward-seek rebuild (the re-fold discards any cached layout)', () => {
+      const log = [
+        event({ at: 1000, action: 'create', path: 'repo/a.ts' }),
+        event({ at: 2000, action: 'create', path: 'repo/b.ts' }),
+      ]
+      const forwarded = stepFrame(createFrameState(), forward(2000, log), log)
+
+      const rebuilt = stepFrame(forwarded.state, rewind(1500), log)
+      expect(rebuilt.structureChanged).toBe(true)
+    })
+  })
 })

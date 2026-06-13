@@ -149,6 +149,25 @@
         font-size: 11px;
       }
 
+      /* The FPS counter sits in the top-right corner, away from the control panel
+         (top-left), computed from RAF deltas so an operator can confirm the
+         rendering frame rate while driving the synthetic stream. */
+      #fps-counter {
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        z-index: 12;
+        padding: 6px 10px;
+        border-radius: 8px;
+        border: 1px solid rgba(180, 160, 255, 0.3);
+        background: rgba(12, 10, 24, 0.82);
+        backdrop-filter: blur(8px);
+        color: #b9f5c8;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+        pointer-events: none;
+      }
+
       /* The hover tooltip lives in the playground host, not the library: the
          library only emits the `nodeHover` event with the path + screen point. */
       #hover-tooltip {
@@ -209,6 +228,8 @@
   <body>
     <div id="canvas-host"></div>
 
+    <div id="fps-counter">-- FPS</div>
+
     <div id="hover-tooltip"></div>
 
     <button id="panel-restore" type="button" hidden>Show controls</button>
@@ -225,10 +246,16 @@
         <button id="burst" type="button">Burst</button>
       </div>
 
-      <div class="row">
-        <label for="rate">Rate</label>
-        <input id="rate" type="range" min="0" max="120" step="1" value="14" />
-        <span id="rate-value">14/s</span>
+      <div class="field">
+        <div class="row">
+          <label for="rate">Events/sec</label>
+          <input id="rate" type="range" min="0" max="120" step="1" value="14" />
+          <span id="rate-value">14/s</span>
+        </div>
+        <p class="hint">
+          How many synthetic activity events the generator emits per second (not a
+          frame rate). The FPS counter in the top-right shows the render rate.
+        </p>
       </div>
 
       <div class="row">

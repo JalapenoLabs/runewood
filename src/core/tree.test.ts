@@ -20,7 +20,7 @@ function event(overrides: Partial<RunewoodEvent>): RunewoodEvent {
 describe('applyEvent', () => {
   it('creates intermediate directories on the way to a file', () => {
     const root = createTree()
-    const node = applyEvent(root, event({ action: 'create' }))
+    const { node } = applyEvent(root, event({ action: 'create' }))
 
     expect(node?.path).toBe('repo/src/main.rs')
     expect(node?.isFile).toBe(true)
@@ -35,7 +35,7 @@ describe('applyEvent', () => {
   it('bumps touch count and timestamp on every hit', () => {
     const root = createTree()
     applyEvent(root, event({ at: 1000 }))
-    const node = applyEvent(root, event({ at: 2000 }))
+    const { node } = applyEvent(root, event({ at: 2000 }))
 
     expect(node?.touchCount).toBe(2)
     expect(node?.lastTouchedAt).toBe(2000)
@@ -46,7 +46,7 @@ describe('applyEvent', () => {
     applyEvent(root, event({ path: 'repo/src/a.ts' }))
     applyEvent(root, event({ path: 'repo/src/b.ts' }))
 
-    const deleted = applyEvent(root, event({ action: 'delete', path: 'repo/src' }))
+    const { node: deleted } = applyEvent(root, event({ action: 'delete', path: 'repo/src' }))
 
     expect(deleted?.status).toBe('deleted')
     expect(deleted?.children.get('a.ts')?.status).toBe('deleted')
@@ -57,7 +57,7 @@ describe('applyEvent', () => {
     const root = createTree()
     applyEvent(root, event({ action: 'create' }))
     applyEvent(root, event({ action: 'delete' }))
-    const node = applyEvent(root, event({ action: 'create' }))
+    const { node } = applyEvent(root, event({ action: 'create' }))
 
     expect(node?.status).toBe('discovered')
   })
@@ -66,7 +66,7 @@ describe('applyEvent', () => {
     const root = createTree()
     applyEvent(root, event({ action: 'create' }))
     applyEvent(root, event({ action: 'delete' }))
-    const node = applyEvent(root, event({ action: 'scan' }))
+    const { node } = applyEvent(root, event({ action: 'scan' }))
 
     expect(node?.status).toBe('deleted')
   })
@@ -78,15 +78,15 @@ describe('applyEvent', () => {
     const before = root.children.get('repo')?.children.get('src')?.children.get('main.rs')
     expect(before?.status).toBe('seeded')
 
-    const node = applyEvent(root, event({ action: 'scan' }))
+    const { node } = applyEvent(root, event({ action: 'scan' }))
     expect(node?.status).toBe('discovered')
     expect(node).toBe(before)
   })
 
   it('ignores pulse events and pathless events without touching the tree', () => {
     const root = createTree()
-    expect(applyEvent(root, event({ action: 'pulse', path: undefined }))).toBeNull()
-    expect(applyEvent(root, event({ path: '   ' }))).toBeNull()
+    expect(applyEvent(root, event({ action: 'pulse', path: undefined })).node).toBeNull()
+    expect(applyEvent(root, event({ path: '   ' })).node).toBeNull()
     expect(root.children.size).toBe(0)
   })
 
@@ -110,6 +110,50 @@ describe('applyEvent', () => {
     expect(first).toEqual(second)
     expect(first.children.get('repo')?.children.get('a.ts')?.status).toBe('deleted')
     expect(first.children.get('repo')?.children.get('lib')?.children.get('b.ts')?.status).toBe('discovered')
+  })
+})
+
+describe('applyEvent structural-change signal', () => {
+  it('reports created when an event reaches a brand-new node', () => {
+    const root = createTree()
+    const { created } = applyEvent(root, event({ action: 'create', path: 'repo/a.ts' }))
+    expect(created).toBe(true)
+  })
+
+  it('reports created when only some intermediate directories already exist', () => {
+    const root = createTree()
+    // First event builds repo/ and repo/src/ and the file.
+    applyEvent(root, event({ action: 'create', path: 'repo/src/a.ts' }))
+    // A sibling under the existing repo/src still adds a new leaf, so it is created.
+    const { created } = applyEvent(root, event({ action: 'create', path: 'repo/src/b.ts' }))
+    expect(created).toBe(true)
+  })
+
+  it('does not report created when re-touching an existing node', () => {
+    const root = createTree()
+    applyEvent(root, event({ action: 'create', path: 'repo/a.ts' }))
+
+    const modified = applyEvent(root, event({ action: 'modify', path: 'repo/a.ts' }))
+    expect(modified.created).toBe(false)
+
+    const scanned = applyEvent(root, event({ action: 'scan', path: 'repo/a.ts' }))
+    expect(scanned.created).toBe(false)
+  })
+
+  it('does not report created when deleting an existing node (delete retains the node)', () => {
+    const root = createTree()
+    applyEvent(root, event({ action: 'create', path: 'repo/a.ts' }))
+
+    const deleted = applyEvent(root, event({ action: 'delete', path: 'repo/a.ts' }))
+    // The node is retained for the fade, so a delete never changes the structure
+    // the layout depends on: created must be false.
+    expect(deleted.created).toBe(false)
+  })
+
+  it('never reports created for a pulse or pathless event', () => {
+    const root = createTree()
+    expect(applyEvent(root, event({ action: 'pulse', path: undefined })).created).toBe(false)
+    expect(applyEvent(root, event({ path: '   ' })).created).toBe(false)
   })
 })
 

@@ -200,7 +200,21 @@ export class Timeline {
     if (throughInclusive <= afterExclusive) {
       return []
     }
-    return this.events.filter((event) => event.at > afterExclusive && event.at <= throughInclusive)
+    // The log is kept sorted by `at`, so the crossed slice is contiguous: binary
+    // search the first event strictly past `afterExclusive`, then walk forward
+    // collecting until one exceeds `throughInclusive`. This is O(log n + k) in the
+    // number of crossed events `k`, versus the O(n) full-array filter it replaces,
+    // which matters when the controller folds this every frame over a long log.
+    const start = this.firstIndexAfter(afterExclusive)
+    const crossed: RunewoodEvent[] = []
+    for (let index = start; index < this.events.length; index++) {
+      const event = this.events[index]
+      if (event.at > throughInclusive) {
+        break
+      }
+      crossed.push(event)
+    }
+    return crossed
   }
 
   /** Fraction of the timeline elapsed, 0..1. Returns 0 for an empty or zero-length log. */
@@ -267,6 +281,28 @@ export class Timeline {
       return last
     }
     return time
+  }
+
+  /**
+   * Binary-searches the index of the first event whose time is strictly greater
+   * than `at`, i.e. the lower bound of the half-open `(at, ...]` slice. Returns
+   * `events.length` when every event is at or before `at`. The log is sorted by
+   * `at`, so this is the O(log n) lookup {@link crossedBetween} uses to skip
+   * straight to the start of the crossed window instead of scanning from zero.
+   */
+  private firstIndexAfter(at: number): number {
+    let low = 0
+    let high = this.events.length
+    while (low < high) {
+      const mid = (low + high) >>> 1
+      if (this.events[mid].at > at) {
+        high = mid
+      }
+      else {
+        low = mid + 1
+      }
+    }
+    return low
   }
 
   /**

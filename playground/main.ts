@@ -51,6 +51,14 @@ const LEGEND_FILE_SAMPLES = [
 const STATE_READOUT_INTERVAL_MS = 250
 
 /**
+ * Exponential-smoothing weight for the FPS readout: each frame blends this much of
+ * the new instantaneous rate into the running average, so the number is steady and
+ * readable rather than jittering every frame. ~0.1 settles within a few frames
+ * while still reacting to a real, sustained drop.
+ */
+const FPS_SMOOTHING = 0.1
+
+/**
  * How long to wait after the last keystroke in the exclude field before rebuilding
  * the controller, so typing a multi-pattern list does not rebuild on every key.
  */
@@ -73,6 +81,13 @@ function main(): void {
   const legendGrid = requireElement<HTMLDivElement>('legend-grid')
   const excludeInput = requireElement<HTMLTextAreaElement>('exclude')
   const hoverTooltip = requireElement<HTMLDivElement>('hover-tooltip')
+  const fpsCounter = requireElement<HTMLDivElement>('fps-counter')
+
+  // Drive the FPS readout off the page's own requestAnimationFrame deltas, which
+  // tick at the display refresh and reflect the real render rate the user feels.
+  // The instantaneous `1000 / deltaMs` is noisy, so it is exponentially smoothed
+  // into a steady number an operator can read while changing the events/sec.
+  startFpsCounter(fpsCounter)
 
   // The legend mirrors the engine's own coloring, so it is built from the same
   // theme + colorForPath the forest uses and refreshed whenever the theme changes.
@@ -201,6 +216,36 @@ function main(): void {
   setInterval(() => {
     stateReadout.textContent = JSON.stringify(controller.getState(), null, 2)
   }, STATE_READOUT_INTERVAL_MS)
+}
+
+/**
+ * Runs a self-contained requestAnimationFrame loop that measures the page's frame
+ * rate from the RAF timestamp deltas and writes a smoothed reading into `counter`.
+ * It is independent of the engine's own loop (it only times how often the browser
+ * paints), so it reflects the true on-screen frame rate the user feels, including
+ * any jank the engine introduces. The first frame has no delta to measure from, so
+ * it only seeds the timestamp; every frame after blends its instantaneous rate in.
+ */
+function startFpsCounter(counter: HTMLDivElement): void {
+  let smoothedFps = 0
+  let lastTimestamp: number | null = null
+
+  function tick(timestamp: number): void {
+    if (lastTimestamp !== null) {
+      const deltaMs = timestamp - lastTimestamp
+      if (deltaMs > 0) {
+        const instantFps = 1000 / deltaMs
+        smoothedFps = smoothedFps === 0
+          ? instantFps
+          : smoothedFps + (instantFps - smoothedFps) * FPS_SMOOTHING
+        counter.textContent = `${Math.round(smoothedFps)} FPS`
+      }
+    }
+    lastTimestamp = timestamp
+    requestAnimationFrame(tick)
+  }
+
+  requestAnimationFrame(tick)
 }
 
 /**

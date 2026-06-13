@@ -57,23 +57,41 @@ export function seedTree(root: TreeNode, paths: string[]): void {
 }
 
 /**
- * Folds one event into the tree, mutating it in place, and returns the node
- * the event landed on so callers can aim effects at it. Returns null for
- * events that do not target the tree (`pulse`, or a missing/blank path).
+ * The result of folding one event: the node it landed on (or `null` for an event
+ * that does not target the tree), plus whether reaching that node *created* any
+ * new node in the tree. `created` is the structural-change signal the controller
+ * memoizes the radial layout on: targets depend only on which paths exist and how
+ * they nest, so they need recomputing only when a fold added a node, never on a
+ * mere modify/scan/delete of an existing one.
  */
-export function applyEvent(root: TreeNode, event: RunewoodEvent): TreeNode | null {
+export type ApplyEventResult = {
+  /** The node the event landed on, or `null` for a pulse / pathless event. */
+  node: TreeNode | null
+  /** Whether folding this event added at least one new node to the tree. */
+  created: boolean
+}
+
+/**
+ * Folds one event into the tree, mutating it in place, and reports the node the
+ * event landed on (so callers can aim effects at it) along with whether it added
+ * any new node to the tree (so the controller can memoize the layout, recomputing
+ * targets only when the structure actually changed). Returns a `null` node for
+ * events that do not target the tree (`pulse`, or a missing/blank path); those
+ * never create structure, so `created` is `false`.
+ */
+export function applyEvent(root: TreeNode, event: RunewoodEvent): ApplyEventResult {
   if (event.action === 'pulse') {
-    return null
+    return { node: null, created: false }
   }
   const path = event.path?.trim()
   if (!path) {
     // A tree-targeting action with no path is malformed input; flag it rather
     // than silently dropping it so host-side mapping bugs surface early.
     console.debug('runewood: dropping pathless tree event', event)
-    return null
+    return { node: null, created: false }
   }
 
-  const node = ensurePath(root, path, 'discovered')
+  const { node, created } = ensurePath(root, path, 'discovered')
   node.touchCount += 1
   node.lastTouchedAt = event.at
 
@@ -85,13 +103,19 @@ export function applyEvent(root: TreeNode, event: RunewoodEvent): TreeNode | nul
     // node keeps (or upgrades) it to discovered.
     node.status = 'discovered'
   }
-  return node
+  return { node, created }
 }
 
-/** Walks `path` from the root, creating missing intermediate nodes. */
-function ensurePath(root: TreeNode, path: string, statusForNew: NodeStatus): TreeNode {
+/**
+ * Walks `path` from the root, creating missing intermediate nodes, and reports
+ * whether any node along the way had to be created. `created` is the structural
+ * signal the layout memoization keys off: it is `true` if the target node or any
+ * of its ancestors did not already exist.
+ */
+function ensurePath(root: TreeNode, path: string, statusForNew: NodeStatus): { node: TreeNode, created: boolean } {
   const segments = path.split('/').filter((segment) => segment.length > 0)
   let current = root
+  let created = false
   for (const [ index, segment ] of segments.entries()) {
     let child = current.children.get(segment)
     if (!child) {
@@ -106,10 +130,11 @@ function ensurePath(root: TreeNode, path: string, statusForNew: NodeStatus): Tre
         lastTouchedAt: null,
       }
       current.children.set(segment, child)
+      created = true
     }
     current = child
   }
-  return current
+  return { node: current, created }
 }
 
 /** Deleting a directory deletes everything under it. */

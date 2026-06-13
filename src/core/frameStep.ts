@@ -118,6 +118,16 @@ export type FrameStep = {
    * lists.
    */
   clearParticles: boolean
+  /**
+   * Whether this step changed the tree *structure*, i.e. added at least one node.
+   * The shell memoizes the radial layout on this: targets derive purely from which
+   * paths exist and how they nest, so they only need recomputing when a node was
+   * added. A forward step that merely re-touched, modified, or deleted existing
+   * nodes leaves this `false` so the cached targets stand and the springs keep
+   * easing toward them cheaply. A rebuild always reports `true`: the tree was
+   * re-folded from scratch, so any cached targets must be discarded.
+   */
+  structureChanged: boolean
 }
 
 /** Tuning for the actor recency window. */
@@ -201,9 +211,17 @@ function advanceForward(state: FrameState, result: AdvanceResult, activityWindow
   // refresh it, so a quiet actor's pointer set shrinks rather than growing forever.
   pruneActorWindow(state.actors, result.playhead, activityWindowMs)
 
+  // Whether any crossed event added a node this tick. The shell recomputes the
+  // radial layout only when this is true (or on a rebuild); otherwise the cached
+  // targets stand, which is the single biggest per-frame saving at high event rates.
+  let structureChanged = false
+
   for (const event of result.crossed) {
-    const node = applyEvent(state.tree, event)
+    const { node, created } = applyEvent(state.tree, event)
     accumulateActor(state.actors, event, node)
+    if (created) {
+      structureChanged = true
+    }
 
     if (node) {
       // A path-targeting event (the node folded in): a beam from the actor to the
@@ -228,6 +246,7 @@ function advanceForward(state: FrameState, result: AdvanceResult, activityWindow
     beams,
     pulses,
     clearParticles: false,
+    structureChanged,
   }
 }
 
@@ -255,7 +274,7 @@ function rebuildToPlayhead(
     if (event.at > playhead) {
       break
     }
-    const node = applyEvent(tree, event)
+    const { node } = applyEvent(tree, event)
     accumulateActor(actors, event, node)
   }
 
@@ -268,6 +287,9 @@ function rebuildToPlayhead(
     beams: [],
     pulses: [],
     clearParticles: true,
+    // A rebuild re-folds the whole tree, so any cached layout targets are stale by
+    // definition; force the shell to recompute them.
+    structureChanged: true,
   }
 }
 

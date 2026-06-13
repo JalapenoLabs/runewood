@@ -99,6 +99,27 @@ describe('bloomParametersFor', () => {
     // switching to high is a clear glow jump, exactly the user's ask.
     expect(low.strength).toBeGreaterThan(lowQuality.strength * 1.5)
   })
+
+  it('produces a wide, smooth blur so the glow reads as a soft haze, not a hard ring', () => {
+    // The user saw a crisp lighter ring with no blur radius. The fix widened the
+    // blur kernel and raised the pass count hard, so a high-quality glow must now be
+    // a genuinely large, multi-pass blur rather than the old narrow one.
+    const high = bloomParametersFor('high', 0.65, 1.4)
+
+    // A wide kernel: well past the node's own halo disc so the light bleeds out.
+    expect(high.blur).toBeGreaterThanOrEqual(32)
+    // Many passes so the blur is smooth, not banded into a visible ring.
+    expect(high.quality).toBeGreaterThanOrEqual(10)
+  })
+
+  it('widens the blur further as the theme bloom intensity rises', () => {
+    const dim = bloomParametersFor('high', 0.1, 1.4)
+    const bright = bloomParametersFor('high', 1, 1.4)
+
+    // The intensity spread was widened, so a full-intensity theme spreads its light
+    // substantially further than a dim one, deepening the soft-haze look.
+    expect(bright.blur - dim.blur).toBeGreaterThanOrEqual(10)
+  })
 })
 
 describe('resolveBloomQuality', () => {
