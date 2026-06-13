@@ -51,6 +51,7 @@
     "vitest": "^4.1.8"
   },
   "dependencies": {
+    "pixi-filters": "^6.1.5",
     "pixi.js": "^8.19.0"
   }
 }

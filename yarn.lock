@@ -1887,6 +1887,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@types/gradient-parser@npm:^0.1.2":
+  version: 0.1.5
+  resolution: "@types/gradient-parser@npm:0.1.5"
+  checksum: 10c0/8347fb24885aeb133421baec58d0eab4e8ec43d17f337bc4f1d23bde99ca5e87b82b44834eb00d71fd820503c530d4c75e4d9a98652e09b2f04b08fbc1057762
+  languageName: node
+  linkType: hard
+
 "@types/json-schema@npm:^7.0.15":
   version: 7.0.15
   resolution: "@types/json-schema@npm:7.0.15"
@@ -6319,6 +6326,17 @@ __metadata:
   languageName: node
   linkType: hard
 
+"pixi-filters@npm:^6.1.5":
+  version: 6.1.5
+  resolution: "pixi-filters@npm:6.1.5"
+  dependencies:
+    "@types/gradient-parser": "npm:^0.1.2"
+  peerDependencies:
+    pixi.js: ">=8.0.0-0"
+  checksum: 10c0/e0cf1586454532b4438d72acced2da8558ee2292b61474395aa60c8c6d92c1337f9a4370d5c0b441fc6010aecbe2065e88a7415bc7c5dbc10d34f0372bae08cd
+  languageName: node
+  linkType: hard
+
 "pixi.js@npm:^8.19.0":
   version: 8.19.0
   resolution: "pixi.js@npm:8.19.0"
@@ -6885,6 +6903,7 @@ __metadata:
     "@jalapenolabs/cli": "https://github.com/jalapenolabs/cli.git"
     eslint: "npm:9.31.0"
     jiti: "npm:^2.7.0"
+    pixi-filters: "npm:^6.1.5"
     pixi.js: "npm:^8.19.0"
     release-it: "npm:^20.2.0"
     tsup: "npm:^8.5.1"

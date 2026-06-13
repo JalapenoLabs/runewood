@@ -9,18 +9,23 @@ import type {
   BeamDrawCommand,
   LabelDrawCommand,
 } from './backend'
-import type { Hsl } from '../core/theme'
+import type { Hsl, RunewoodTheme } from '../core/theme'
 import type { SceneOptions } from './scene'
 import type { BeamSceneOptions } from './beamScene'
 import type { LabelLodOptions } from './labels'
+import type { BloomQuality } from './bloom'
 
 // Core
 import { Application, Container, Graphics, Text } from 'pixi.js'
+
+// Lib
+import { AdvancedBloomFilter } from 'pixi-filters'
 
 import { Scene } from './scene'
 import { BeamScene } from './beamScene'
 import { LabelScene } from './labelScene'
 import { hslToRgbInt } from './color'
+import { bloomParametersFor } from './bloom'
 
 /**
  * The concrete {@link RenderBackend} for v1, built on pixi.js v8. This is the
@@ -73,6 +78,25 @@ export class PixiBackend implements RenderBackend {
    * {@link LabelScene} this backend hands out parents its glyphs here.
    */
   private labelLayer: Container | null = null
+
+  /**
+   * The bloom post-process filter applied over the whole {@link world} (issue
+   * #8). It is created lazily by {@link setBloom} the first time a non-`off`
+   * quality is requested and is the single, sealed point where pixi's filter
+   * pipeline meets the engine. When bloom is `off` the filter is detached from
+   * the world entirely (the world's `filters` array is cleared) so there is zero
+   * per-frame cost, which is exactly why bloom is the first effect the quality
+   * switch turns down.
+   */
+  private bloomFilter: AdvancedBloomFilter | null = null
+
+  /**
+   * The bloom quality currently applied, so a repeated {@link setBloom} call with
+   * the same quality is cheap and the backend can re-derive the filter on a theme
+   * change. Defaults to `off`: a freshly initialized backend renders no glow
+   * until the controller drives a quality in.
+   */
+  private bloomQuality: BloomQuality = 'off'
 
   public async init(options: RenderBackendInitOptions): Promise<void> {
     if (this.application) {
@@ -172,6 +196,52 @@ export class PixiBackend implements RenderBackend {
       return null
     }
     return new LabelScene(this.labelLayer, options)
+  }
+
+  /**
+   * Sets the bloom post-process over the rendered scene at runtime. This is the
+   * single entry point the controller (#9) and the options surface (#10) drive to
+   * toggle and tune the glow; callers pass the already-resolved
+   * {@link import('./bloom').BloomQuality} (after any reduced-motion/low-end
+   * downgrade) plus the active theme, whose `bloomIntensity` and `glowFalloff`
+   * shape the concrete filter parameters via the pure
+   * {@link import('./bloom').bloomParametersFor}.
+   *
+   * The filter is applied to {@link world}, the one container holding every
+   * layer, so the glow composites over the finished forest, beams, and labels.
+   * `off` detaches the filter so there is no per-frame cost (bloom is the most
+   * expensive effect, so turning it down must be genuinely free, not a zeroed
+   * pass that still runs). Safe to call before {@link init}: it no-ops with a
+   * debug note, since the controller re-drives the quality after init anyway.
+   */
+  public setBloom(quality: BloomQuality, theme: RunewoodTheme): void {
+    this.bloomQuality = quality
+
+    if (!this.world) {
+      // The world is built in init(); a backend can be told its bloom quality
+      // before then, so just record it and apply when the layers exist.
+      console.debug('runewood: PixiBackend.setBloom called before init, deferring', { quality })
+      return
+    }
+
+    if (quality === 'off') {
+      // Detach the filter so the pass does not run at all. Keep the instance
+      // around so re-enabling does not rebuild it from scratch.
+      this.world.filters = []
+      return
+    }
+
+    const parameters = bloomParametersFor(quality, theme.bloomIntensity, theme.glowFalloff)
+
+    if (!this.bloomFilter) {
+      this.bloomFilter = new AdvancedBloomFilter()
+    }
+    this.bloomFilter.threshold = parameters.threshold
+    this.bloomFilter.blur = parameters.blur
+    this.bloomFilter.bloomScale = parameters.strength
+    this.bloomFilter.quality = parameters.quality
+
+    this.world.filters = [ this.bloomFilter ]
   }
 
   public resize(width: number, height: number): void {
@@ -286,6 +356,14 @@ export class PixiBackend implements RenderBackend {
     // Tear down the renderer and remove the canvas; pixi recursively destroys
     // the stage and its children.
     this.application.destroy(true, { children: true })
+
+    // The bloom filter is parented to the world by reference, not as a child, so
+    // pixi's recursive destroy does not reach it. Destroy it explicitly to free
+    // its GPU resources, then drop the reference.
+    this.bloomFilter?.destroy()
+    this.bloomFilter = null
+    this.bloomQuality = 'off'
+
     this.application = null
     this.world = null
     this.edgeLayer = null
