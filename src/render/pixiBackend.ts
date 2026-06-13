@@ -11,11 +11,13 @@ import type {
 } from './backend'
 import type { Hsl } from '../core/theme'
 import type { SceneOptions } from './scene'
+import type { BeamSceneOptions } from './beamScene'
 
 // Core
 import { Application, Container, Graphics, Text } from 'pixi.js'
 
 import { Scene } from './scene'
+import { BeamScene } from './beamScene'
 import { hslToRgbInt } from './color'
 
 /**
@@ -56,6 +58,13 @@ export class PixiBackend implements RenderBackend {
   private edgeLayer: Container | null = null
   private nodeLayer: Container | null = null
 
+  /**
+   * The world container for the retained beam/particle and actor layer (issue
+   * #6). Added above the forest layers so the activity glow reads on top of the
+   * wood. The {@link BeamScene} this backend hands out parents its graphics here.
+   */
+  private beamLayer: Container | null = null
+
   public async init(options: RenderBackendInitOptions): Promise<void> {
     if (this.application) {
       console.debug('runewood: PixiBackend.init called twice, ignoring the second call')
@@ -91,10 +100,16 @@ export class PixiBackend implements RenderBackend {
     world.addChild(edgeLayer)
     world.addChild(nodeLayer)
 
+    // The beam/actor glow sits above the forest, so it is added last (drawn on
+    // top of both the branches and the node discs).
+    const beamLayer = new Container()
+    world.addChild(beamLayer)
+
     this.application = application
     this.world = world
     this.edgeLayer = edgeLayer
     this.nodeLayer = nodeLayer
+    this.beamLayer = beamLayer
   }
 
   /**
@@ -110,6 +125,22 @@ export class PixiBackend implements RenderBackend {
       return null
     }
     return new Scene(this.edgeLayer, this.nodeLayer, options)
+  }
+
+  /**
+   * Creates a retained {@link BeamScene} parented into this backend's beam layer,
+   * which sits above the forest. The controller (#9) holds the returned scene,
+   * spawns beams/pulses on it as the timeline crosses events, and calls
+   * `beamScene.update(...)` each frame after the forest scene so the activity
+   * glow layers on top. Returns `null` if called before {@link init}, since the
+   * layer does not exist yet.
+   */
+  public createBeamScene(options?: BeamSceneOptions): BeamScene | null {
+    if (!this.beamLayer) {
+      console.debug('runewood: PixiBackend.createBeamScene called before init, returning null')
+      return null
+    }
+    return new BeamScene(this.beamLayer, options)
   }
 
   public resize(width: number, height: number): void {
@@ -228,5 +259,6 @@ export class PixiBackend implements RenderBackend {
     this.world = null
     this.edgeLayer = null
     this.nodeLayer = null
+    this.beamLayer = null
   }
 }
