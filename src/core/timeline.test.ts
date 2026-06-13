@@ -1,0 +1,261 @@
+// Copyright © 2026 Jalapeno Labs
+
+import type { RunewoodEvent } from '../types'
+
+// Core
+import { describe, expect, it } from 'vitest'
+
+import { Timeline } from './timeline'
+
+function event(overrides: Partial<RunewoodEvent>): RunewoodEvent {
+  return {
+    at: 1000,
+    actor: 'agent-1',
+    action: 'modify',
+    path: 'repo/src/main.rs',
+    ...overrides,
+  }
+}
+
+/** A small, deliberately out-of-order log to prove the constructor sorts. */
+function sampleLog(): RunewoodEvent[] {
+  return [
+    event({ at: 3000, path: 'repo/c.ts' }),
+    event({ at: 1000, path: 'repo/a.ts' }),
+    event({ at: 2000, path: 'repo/b.ts' }),
+  ]
+}
+
+describe('Timeline construction', () => {
+  it('sorts the initial log by time and parks the playhead on the first event', () => {
+    const timeline = new Timeline(sampleLog())
+
+    expect(timeline.firstEventTime).toBe(1000)
+    expect(timeline.lastEventTime).toBe(3000)
+    expect(timeline.time).toBe(1000)
+    expect(timeline.getEvents().map((entry) => entry.at)).toEqual([ 1000, 2000, 3000 ])
+  })
+
+  it('copies the input log so later caller mutations do not leak in', () => {
+    const log = sampleLog()
+    const timeline = new Timeline(log)
+    log.push(event({ at: 9999 }))
+
+    expect(timeline.lastEventTime).toBe(3000)
+  })
+
+  it('parks at zero with no first/last bounds when the log is empty', () => {
+    const timeline = new Timeline()
+
+    expect(timeline.time).toBe(0)
+    expect(timeline.firstEventTime).toBeNull()
+    expect(timeline.lastEventTime).toBeNull()
+    expect(timeline.duration()).toBe(0)
+    expect(timeline.progress()).toBe(0)
+  })
+})
+
+describe('Timeline.advance', () => {
+  it('does not move while paused', () => {
+    const timeline = new Timeline(sampleLog())
+    const result = timeline.advance(5000)
+
+    expect(result.playhead).toBe(1000)
+    expect(result.crossed).toEqual([])
+  })
+
+  it('crosses exactly the events within the forward step, in time order', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.play()
+
+    // From 1000, a 1500ms step lands at 2500, crossing the event at 2000 only.
+    const result = timeline.advance(1500)
+
+    expect(result.playhead).toBe(2500)
+    expect(result.crossed.map((entry) => entry.at)).toEqual([ 2000 ])
+    expect(result.rebuild).toBe(false)
+  })
+
+  it('treats the interval as half-open: the starting event is not re-crossed', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.play()
+
+    // Starting exactly on the 1000 event, stepping to 2000 should cross 2000 but
+    // not re-cross the 1000 the playhead already sits on.
+    const result = timeline.advance(1000)
+
+    expect(result.crossed.map((entry) => entry.at)).toEqual([ 2000 ])
+  })
+
+  it('scales the step by speed', () => {
+    const fast = new Timeline(sampleLog())
+    fast.play()
+    fast.setSpeed(2)
+
+    // 800ms of wall time at 2x covers 1600ms, 1000 -> 2600, crossing only 2000.
+    const fastResult = fast.advance(800)
+    expect(fastResult.playhead).toBe(2600)
+    expect(fastResult.crossed.map((entry) => entry.at)).toEqual([ 2000 ])
+
+    const slow = new Timeline(sampleLog())
+    slow.play()
+    slow.setSpeed(0.5)
+
+    // 800ms at 0.5x covers 400ms, 1000 -> 1400, crossing nothing.
+    const slowResult = slow.advance(800)
+    expect(slowResult.playhead).toBe(1400)
+    expect(slowResult.crossed).toEqual([])
+  })
+
+  it('clamps to the last event so playback stops at the end of the log', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.play()
+
+    const result = timeline.advance(999999)
+
+    expect(result.playhead).toBe(3000)
+    expect(result.crossed.map((entry) => entry.at)).toEqual([ 2000, 3000 ])
+
+    // A further step past the end crosses nothing and holds at the bound.
+    const again = timeline.advance(5000)
+    expect(again.playhead).toBe(3000)
+    expect(again.crossed).toEqual([])
+  })
+
+  it('rejects a negative delta without moving the playhead', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.play()
+    timeline.advance(1500)
+
+    const result = timeline.advance(-500)
+
+    expect(result.playhead).toBe(2500)
+    expect(result.crossed).toEqual([])
+    expect(result.rebuild).toBe(false)
+  })
+})
+
+describe('Timeline.setSpeed', () => {
+  it('keeps the current speed when given a non-positive or non-finite value', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.setSpeed(3)
+    expect(timeline.speed).toBe(3)
+
+    timeline.setSpeed(0)
+    timeline.setSpeed(-2)
+    timeline.setSpeed(Number.POSITIVE_INFINITY)
+    timeline.setSpeed(Number.NaN)
+
+    expect(timeline.speed).toBe(3)
+  })
+})
+
+describe('Timeline.seek', () => {
+  it('clamps a forward seek to the last event and does not signal a rebuild', () => {
+    const timeline = new Timeline(sampleLog())
+
+    const result = timeline.seek(50000)
+
+    expect(timeline.time).toBe(3000)
+    expect(result.rebuild).toBe(false)
+  })
+
+  it('clamps a seek before the first event up to the first bound', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.seek(2500)
+
+    const result = timeline.seek(-1000)
+
+    expect(timeline.time).toBe(1000)
+    expect(result.rebuild).toBe(true)
+  })
+
+  it('signals a rebuild only when the playhead actually moves backward', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.seek(2500)
+
+    const backward = timeline.seek(1200)
+    expect(timeline.time).toBe(1200)
+    expect(backward.rebuild).toBe(true)
+
+    const forward = timeline.seek(2800)
+    expect(timeline.time).toBe(2800)
+    expect(forward.rebuild).toBe(false)
+  })
+
+  it('detaches from live follow', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.followLive(true)
+    expect(timeline.live).toBe(true)
+
+    timeline.seek(1500)
+    expect(timeline.live).toBe(false)
+  })
+})
+
+describe('Timeline.append and live follow', () => {
+  it('keeps the log time-sorted when an out-of-order event arrives', () => {
+    const timeline = new Timeline(sampleLog())
+
+    timeline.append(event({ at: 2500, path: 'repo/late.ts' }))
+
+    expect(timeline.getEvents().map((entry) => entry.at)).toEqual([ 1000, 2000, 2500, 3000 ])
+  })
+
+  it('tracks the newest event while following live', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.followLive(true)
+    expect(timeline.time).toBe(3000)
+
+    timeline.append(event({ at: 4000, path: 'repo/d.ts' }))
+    expect(timeline.time).toBe(4000)
+    expect(timeline.lastEventTime).toBe(4000)
+  })
+
+  it('leaves the playhead parked after a manual seek detaches it from live', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.followLive(true)
+
+    // The user scrubs back: this detaches from live.
+    timeline.seek(1500)
+    expect(timeline.live).toBe(false)
+
+    // A live event arrives, but the parked playhead must not jump to it.
+    timeline.append(event({ at: 4000, path: 'repo/d.ts' }))
+    expect(timeline.time).toBe(1500)
+
+    // Re-enabling follow snaps the playhead back to the newest event.
+    timeline.followLive(true)
+    expect(timeline.time).toBe(4000)
+  })
+
+  it('does not drag the playhead backward when a late event is older than it', () => {
+    const timeline = new Timeline(sampleLog())
+    timeline.followLive(true)
+    expect(timeline.time).toBe(3000)
+
+    timeline.append(event({ at: 2500, path: 'repo/straggler.ts' }))
+    expect(timeline.time).toBe(3000)
+  })
+})
+
+describe('Timeline.progress and duration', () => {
+  it('reports the span and the elapsed fraction', () => {
+    const timeline = new Timeline(sampleLog())
+    expect(timeline.duration()).toBe(2000)
+    expect(timeline.progress()).toBe(0)
+
+    timeline.seek(2000)
+    expect(timeline.progress()).toBe(0.5)
+
+    timeline.seek(3000)
+    expect(timeline.progress()).toBe(1)
+  })
+
+  it('returns zero progress for a single-event log with no span', () => {
+    const timeline = new Timeline([ event({ at: 5000 }) ])
+
+    expect(timeline.duration()).toBe(0)
+    expect(timeline.progress()).toBe(0)
+  })
+})
