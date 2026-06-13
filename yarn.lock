@@ -6908,6 +6908,7 @@ __metadata:
     release-it: "npm:^20.2.0"
     tsup: "npm:^8.5.1"
     typescript: "npm:^6.0.3"
+    vite: "npm:^7.3.5"
     vitest: "npm:^4.1.8"
   languageName: unknown
   linkType: soft
@@ -8023,7 +8024,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.0.5":
+"vite@npm:^5.0.0 || ^6.0.0 || ^7.0.0-0, vite@npm:^7.0.5, vite@npm:^7.3.5":
   version: 7.3.5
   resolution: "vite@npm:7.3.5"
   dependencies:

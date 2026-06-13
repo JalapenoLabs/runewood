@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>runewood playground</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #05060a;
+      }
+
+      #canvas-host {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      #panel {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        width: 280px;
+        padding: 16px;
+        border: 1px solid rgba(180, 160, 255, 0.25);
+        border-radius: 12px;
+        background: rgba(12, 10, 24, 0.82);
+        backdrop-filter: blur(8px);
+        color: #e7e2ff;
+        font-size: 13px;
+      }
+
+      #panel-restore {
+        position: fixed;
+        top: 16px;
+        left: 16px;
+        z-index: 11;
+      }
+
+      #panel h1 {
+        margin: 0;
+        font-size: 15px;
+        letter-spacing: 0.06em;
+        color: #b9a8ff;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .row label {
+        flex: 0 0 auto;
+      }
+
+      button {
+        cursor: pointer;
+        padding: 6px 10px;
+        border: 1px solid rgba(180, 160, 255, 0.4);
+        border-radius: 8px;
+        background: rgba(60, 48, 110, 0.6);
+        color: #efeaff;
+        font: inherit;
+      }
+
+      button:hover {
+        background: rgba(80, 64, 140, 0.7);
+      }
+
+      select,
+      input[type="range"] {
+        font: inherit;
+        color: inherit;
+      }
+
+      select {
+        padding: 4px 6px;
+        border-radius: 6px;
+        background: rgba(30, 24, 56, 0.9);
+        border: 1px solid rgba(180, 160, 255, 0.35);
+      }
+
+      .button-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .button-row button {
+        flex: 1 1 auto;
+      }
+
+      #state-readout {
+        margin: 0;
+        padding: 8px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.45);
+        color: #9fd2ff;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+      }
+
+      .hint {
+        margin: 0;
+        font-size: 11px;
+        color: #8b82b8;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas-host"></div>
+
+    <button id="panel-restore" type="button" hidden>Show controls</button>
+
+    <div id="panel">
+      <h1>runewood playground</h1>
+
+      <div class="button-row">
+        <button id="start-stop" type="button">Stop stream</button>
+        <button id="play-pause" type="button">Pause</button>
+      </div>
+
+      <div class="button-row">
+        <button id="burst" type="button">Burst</button>
+      </div>
+
+      <div class="row">
+        <label for="rate">Rate</label>
+        <input id="rate" type="range" min="0" max="120" step="1" value="14" />
+        <span id="rate-value">14/s</span>
+      </div>
+
+      <div class="row">
+        <label for="theme">Theme</label>
+        <select id="theme">
+          <option value="dusk" selected>dusk</option>
+          <option value="void">void</option>
+          <option value="parchment">parchment</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="bloom">Bloom</label>
+        <select id="bloom">
+          <option value="off">off</option>
+          <option value="low">low</option>
+          <option value="high" selected>high</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="labels">Labels</label>
+        <input id="labels" type="checkbox" checked />
+      </div>
+
+      <div class="row">
+        <label for="controls">Show panel</label>
+        <input id="controls" type="checkbox" checked />
+      </div>
+
+      <pre id="state-readout">{}</pre>
+
+      <p class="hint">nodeClick / actorClick log to the console.</p>
+    </div>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

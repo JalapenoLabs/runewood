@@ -82,6 +82,30 @@ Branches: `develop` is the integration branch for in-progress work; `main` is
 stable and every push to it cuts a patch release to npm. Promote `develop` into
 `main` as it stabilizes.
 
+## Playground
+
+A local dev playground (a Vite app under `playground/`) drives the real engine
+live with a synthetic event stream, so the renderer and controls can be developed
+and demoed without any host. It imports the library straight from `src`, so it
+also serves as an end-to-end integration check.
+
+```bash
+yarn playground         # dev server with hot reload
+yarn playground:build   # production bundle of the playground (integration proof)
+```
+
+The page fills the viewport with the runewood canvas and shows a small control
+panel: start/stop the synthetic stream, fire a burst, change the emission rate,
+toggle play/pause, and switch theme (dusk/void/parchment), bloom (off/low/high),
+and labels. A live `getState()` readout sits in the panel, and `nodeClick` /
+`actorClick` log to the console. The synthetic generator fakes a swarm of agents
+crawling a multi-repo forest (reads, edits, creates, deletes, cross-repo hops,
+pathless pulses) and deliberately exercises bursts, idle gaps, whole-directory
+deletes, many concurrent actors, and deep paths.
+
+The playground is dev-only: it is excluded from the published package (`files` is
+just `dist`), so it never ships to npm.
+
 ## License
 
 MIT © Jalapeno Labs
