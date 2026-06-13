@@ -11,6 +11,17 @@ import { hslToRgbInt } from './color'
 import { decideLabels } from './labels'
 
 /**
+ * The font size, in world units, every label glyph is drawn at. pixi's default
+ * {@link Text} size read too large in the playground, so labels are pinned to a
+ * deliberate base and then taken 25% smaller per direct user feedback: the text
+ * was crowding the forest. {@link LABEL_FONT_SIZE_SCALE} is the reduction factor,
+ * kept as its own constant so the "why 0.75" is documented at the call site.
+ */
+const LABEL_BASE_FONT_SIZE = 16
+const LABEL_FONT_SIZE_SCALE = 0.75
+const LABEL_FONT_SIZE = LABEL_BASE_FONT_SIZE * LABEL_FONT_SIZE_SCALE
+
+/**
  * The retained label layer that sits *above* the forest and the beams (issue #7):
  * one persistent pixi {@link Text} per label, keyed by candidate id, created when
  * a label first appears and torn down once it is culled or fully faded. It mirrors
@@ -77,7 +88,7 @@ export class LabelScene {
 
       let text = this.textById.get(decision.id)
       if (!text) {
-        text = new Text({ text: decision.text })
+        text = new Text({ text: decision.text, style: { fontSize: LABEL_FONT_SIZE }})
         this.layer.addChild(text)
         this.textById.set(decision.id, text)
       }
@@ -86,6 +97,7 @@ export class LabelScene {
       // carried by alpha (subtle roots vs full file/actor flashes).
       text.text = decision.text
       text.style.fill = hslToRgbInt(theme.label)
+      text.style.fontSize = LABEL_FONT_SIZE
       text.alpha = decision.alpha
       text.position.set(decision.position.x, decision.position.y)
     }

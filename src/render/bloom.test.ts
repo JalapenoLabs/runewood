@@ -72,8 +72,32 @@ describe('bloomParametersFor', () => {
     const veryTight = bloomParametersFor('high', 0.65, 100)
     const veryLoose = bloomParametersFor('high', 0.65, 0.01)
 
-    expect(veryTight.threshold).toBeLessThanOrEqual(0.8)
-    expect(veryLoose.threshold).toBeGreaterThanOrEqual(0.3)
+    // The band was lowered (was 0.3..0.8) so the bright pass actually catches the
+    // glowing nodes; even the tightest halo never demands a brighter-than-0.5
+    // pixel, and the loosest never drops below 0.15.
+    expect(veryTight.threshold).toBeLessThanOrEqual(0.5)
+    expect(veryLoose.threshold).toBeGreaterThanOrEqual(0.15)
+  })
+
+  it('keeps the bright-pass threshold low enough that the glow actually reads', () => {
+    // The user could not tell bloom on from off because the old threshold (up to
+    // 0.8) left almost nothing crossing the bright pass. For the built-in themes
+    // (falloff ~1.0..2.1) the threshold must now stay well below that old ceiling
+    // so the hot cores genuinely bloom.
+    const dusk = bloomParametersFor('high', 0.65, 1.4)
+    const voidTheme = bloomParametersFor('high', 0.85, 2.1)
+
+    expect(dusk.threshold).toBeLessThan(0.5)
+    expect(voidTheme.threshold).toBeLessThan(0.5)
+  })
+
+  it('makes high quality unmistakably more luminous than low, not just smoother', () => {
+    const low = bloomParametersFor('high', 0.65, 1.4)
+    const lowQuality = bloomParametersFor('low', 0.65, 1.4)
+
+    // High's composite strength is well above low's (more than a hair), so
+    // switching to high is a clear glow jump, exactly the user's ask.
+    expect(low.strength).toBeGreaterThan(lowQuality.strength * 1.5)
   })
 })
 

@@ -33,6 +33,13 @@ export type RunewoodTheme = {
   background: Hsl
   /** Color of the branches (the edges connecting tree nodes). */
   branch: Hsl
+  /**
+   * Color of a *directory* node disc: a neutral, desaturated "hub" the vividly
+   * colored file nodes hang off of. Kept deliberately low-saturation and distinct
+   * from every file hue so folder vs file reads at a glance: directories look like
+   * structural wood, files look like their language.
+   */
+  hub: Hsl
   /** Color of node labels / text. */
   label: Hsl
   /**
@@ -53,8 +60,8 @@ export type RunewoodTheme = {
  * L keeps the whole forest at one consistent vividness so two different files
  * read as "different color", never "different brightness".
  */
-const NODE_SATURATION = 0.62
-const NODE_LIGHTNESS = 0.55
+const NODE_SATURATION = 0.85
+const NODE_LIGHTNESS = 0.58
 
 /**
  * Curated hues (in degrees) for common file extensions, Gource-style. The key is
@@ -63,48 +70,53 @@ const NODE_LIGHTNESS = 0.55
  * stable, distinct color; this table just pins the languages a viewer sees most
  * so they land on a recognizable, intentional color instead of a hash lottery.
  *
- * Hues are spread around the wheel and grouped loosely by family (web/script
- * warm, systems cool, data/markup green-teal, config/ops violet) so a typical
- * repo reads as a legible palette rather than noise.
+ * The hues are deliberately spread far apart for the languages a viewer sees most
+ * (ts/py/rs/go/js and friends) so adjacent families never collide into the same
+ * color. Related variants share a recognizable hue but are nudged a few degrees
+ * apart (ts vs tsx, css vs scss, yaml vs toml) so a glance still tells them apart
+ * without losing the family resemblance. Everything is rendered at the high fixed
+ * {@link NODE_SATURATION}, so these hues read as vivid, saturated colors.
  */
 const hueByExtension = {
-  // Web + scripting
-  ts: 211, // TypeScript blue
-  tsx: 199,
-  js: 49, // JavaScript yellow
-  jsx: 39,
-  py: 220, // Python blue
-  rb: 2, // Ruby red
-  php: 262,
-  // Systems
-  rs: 18, // Rust orange-rust
-  go: 187, // Go cyan
-  c: 207,
-  cpp: 217,
-  h: 232,
-  java: 27,
-  kt: 281,
-  swift: 14,
-  cs: 124,
-  // Data + markup
-  json: 90,
-  yaml: 140,
-  yml: 140,
-  toml: 152,
-  xml: 96,
-  html: 12,
-  css: 318,
-  scss: 330,
-  md: 168,
-  sql: 175,
-  graphql: 300,
-  // Shell + ops
-  sh: 105,
-  bash: 105,
-  zsh: 110,
-  dockerfile: 197,
-  lock: 47,
-  env: 60,
+  // TypeScript / JavaScript: the blue and yellow poles, far apart on the wheel.
+  ts: 210, // TypeScript blue
+  tsx: 195, // TS + JSX, nudged toward cyan
+  js: 50, // JavaScript yellow
+  jsx: 38, // JS + JSX, nudged toward amber
+  // Python: a clearly green-leaning yellow, well clear of the TS blues.
+  py: 84, // Python yellow-green
+  // Ruby: vivid red.
+  rb: 354,
+  php: 264, // PHP indigo
+  // Systems languages, each on its own well-separated hue.
+  rs: 22, // Rust burnt orange
+  go: 184, // Go cyan
+  c: 228, // C deep blue
+  cpp: 246, // C++ blue-violet, a step off C
+  h: 213, // headers: a lighter blue sibling of C
+  java: 32, // Java orange
+  kt: 288, // Kotlin purple
+  swift: 12, // Swift orange-red
+  cs: 132, // C# green
+  // Data + markup.
+  json: 70, // JSON: gold, clear of both JS yellow and Python yellow-green
+  yaml: 156, // YAML green-teal
+  yml: 156,
+  toml: 174, // TOML teal, a step off YAML
+  xml: 108, // XML lime
+  html: 18, // HTML orange-red
+  css: 318, // CSS magenta
+  scss: 332, // SCSS pink, a step off CSS
+  md: 168, // Markdown teal-green
+  sql: 200, // SQL sky blue
+  graphql: 300, // GraphQL magenta-purple
+  // Shell + ops.
+  sh: 96, // shell green
+  bash: 96,
+  zsh: 102,
+  dockerfile: 198, // Docker blue
+  lock: 44, // lockfiles amber
+  env: 58, // dotenv amber-yellow
 } as const satisfies Record<string, number>
 
 /** The built-in themes, keyed by name so callers can resolve one by string. */
@@ -117,6 +129,9 @@ const builtInThemes = {
     name: 'dusk',
     background: { h: 240, s: 0.32, l: 0.10 },
     branch: { h: 250, s: 0.22, l: 0.42 },
+    // A pale, almost-grey lilac: clearly lighter and far less saturated than any
+    // file hue, so directories read as neutral hubs against the vivid files.
+    hub: { h: 245, s: 0.12, l: 0.70 },
     label: { h: 240, s: 0.18, l: 0.86 },
     bloomIntensity: 0.65,
     glowFalloff: 1.4,
@@ -129,6 +144,9 @@ const builtInThemes = {
     name: 'void',
     background: { h: 0, s: 0, l: 0.03 },
     branch: { h: 0, s: 0, l: 0.30 },
+    // Pure neutral grey: in the colorless void theme a directory is simply a
+    // bright grey hub, leaving all the color to the file nodes.
+    hub: { h: 0, s: 0, l: 0.62 },
     label: { h: 0, s: 0, l: 0.92 },
     bloomIntensity: 0.85,
     glowFalloff: 2.1,
@@ -141,6 +159,9 @@ const builtInThemes = {
     name: 'parchment',
     background: { h: 42, s: 0.38, l: 0.90 },
     branch: { h: 34, s: 0.30, l: 0.48 },
+    // A muted aged-ink brown, darker than the paper so a directory reads on the
+    // light background, but desaturated so it stays neutral against the files.
+    hub: { h: 34, s: 0.22, l: 0.42 },
     label: { h: 28, s: 0.45, l: 0.20 },
     bloomIntensity: 0.30,
     glowFalloff: 1.0,
@@ -230,6 +251,7 @@ export type RunewoodThemeOverrides = {
   name?: string
   background?: Partial<Hsl>
   branch?: Partial<Hsl>
+  hub?: Partial<Hsl>
   label?: Partial<Hsl>
   bloomIntensity?: number
   glowFalloff?: number
@@ -250,6 +272,7 @@ export function mergeTheme(base: RunewoodTheme, overrides: RunewoodThemeOverride
     name: overrides.name ?? base.name,
     background: { ...base.background, ...overrides.background },
     branch: { ...base.branch, ...overrides.branch },
+    hub: { ...base.hub, ...overrides.hub },
     label: { ...base.label, ...overrides.label },
     bloomIntensity: overrides.bloomIntensity ?? base.bloomIntensity,
     glowFalloff: overrides.glowFalloff ?? base.glowFalloff,

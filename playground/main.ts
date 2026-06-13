@@ -4,10 +4,39 @@ import type { ThemeName } from '../src/index'
 import type { BloomQuality } from '../src/render/bloom'
 
 // Core
-import { createRunewood } from '../src/index'
+import { createRunewood, colorForPath, themes } from '../src/index'
+
+// User interface
+import { hslToRgbInt } from '../src/render/color'
 
 // Misc
 import { createSyntheticStream, seedPaths } from './synthetic'
+
+/**
+ * The file types shown in the playground color legend, each paired with a sample
+ * path the engine's {@link colorForPath} will color. They are drawn straight from
+ * the same color logic the forest uses, so the legend can never drift from what
+ * the nodes actually render. A folder entry is appended separately from the
+ * active theme's hub color.
+ */
+const LEGEND_FILE_SAMPLES = [
+  { label: 'TypeScript', path: 'sample.ts' },
+  { label: 'React TSX', path: 'sample.tsx' },
+  { label: 'JavaScript', path: 'sample.js' },
+  { label: 'Python', path: 'sample.py' },
+  { label: 'Rust', path: 'sample.rs' },
+  { label: 'Go', path: 'sample.go' },
+  { label: 'Ruby', path: 'sample.rb' },
+  { label: 'Java', path: 'sample.java' },
+  { label: 'C++', path: 'sample.cpp' },
+  { label: 'JSON', path: 'sample.json' },
+  { label: 'YAML', path: 'sample.yaml' },
+  { label: 'Markdown', path: 'sample.md' },
+  { label: 'CSS', path: 'sample.css' },
+  { label: 'HTML', path: 'sample.html' },
+  { label: 'SQL', path: 'sample.sql' },
+  { label: 'Shell', path: 'sample.sh' },
+] as const
 
 /**
  * The runewood dev playground entry point. It mounts the real engine
@@ -35,6 +64,11 @@ function main(): void {
   const playPauseButton = requireElement<HTMLButtonElement>('play-pause')
   const panel = requireElement<HTMLDivElement>('panel')
   const panelRestore = requireElement<HTMLButtonElement>('panel-restore')
+  const legendGrid = requireElement<HTMLDivElement>('legend-grid')
+
+  // The legend mirrors the engine's own coloring, so it is built from the same
+  // theme + colorForPath the forest uses and refreshed whenever the theme changes.
+  renderLegend(legendGrid, themeSelect.value as ThemeName)
 
   // Build the engine. We start paused-following-live so the synthetic stream's
   // newest events drag the view, and pre-seed the known structure as dim nodes.
@@ -91,7 +125,10 @@ function main(): void {
   // Theme, bloom, and labels are construction-time options on the controller, so
   // changing them rebuilds it in place. We hand the fresh controller the same
   // seed and re-log clicks, then keep the stream pointed at it via `currentController`.
-  themeSelect.addEventListener('change', () => rebuild())
+  themeSelect.addEventListener('change', () => {
+    renderLegend(legendGrid, themeSelect.value as ThemeName)
+    rebuild()
+  })
   bloomSelect.addEventListener('change', () => rebuild())
   labelsToggle.addEventListener('change', () => rebuild())
 
@@ -150,6 +187,40 @@ function wireControllerLogging(controller: ReturnType<typeof createRunewood>): v
   controller.on('actorClick', (payload) => {
     console.log('[runewood] actorClick', payload.actor)
   })
+}
+
+/**
+ * Renders the color legend so the operator can read the encoding at a glance:
+ * a swatch per common file type (colored by the very same {@link colorForPath}
+ * the forest nodes use) plus a folder entry colored from the active theme's
+ * neutral hub. Rebuilt on every theme change so the folder swatch always matches
+ * what is on screen. Each swatch is a CSS `hsl()` so the playground never has to
+ * re-implement the engine's HSL math.
+ */
+function renderLegend(grid: HTMLDivElement, themeName: ThemeName): void {
+  const hub = themes[themeName].hub
+  const entries: { label: string, color: number }[] = LEGEND_FILE_SAMPLES.map((sample) => ({
+    label: sample.label,
+    color: hslToRgbInt(colorForPath(sample.path)),
+  }))
+  // The folder swatch leads so folder-vs-file is the first thing the legend shows.
+  entries.unshift({ label: 'Folder', color: hslToRgbInt(hub) })
+
+  grid.replaceChildren(...entries.map((entry) => {
+    const item = document.createElement('div')
+    item.className = 'legend-item'
+
+    const swatch = document.createElement('span')
+    swatch.className = 'legend-swatch'
+    // hslToRgbInt returns 0xRRGGBB; pad to a six-digit hex so CSS reads it right.
+    swatch.style.background = `#${entry.color.toString(16).padStart(6, '0')}`
+
+    const text = document.createElement('span')
+    text.textContent = entry.label
+
+    item.append(swatch, text)
+    return item
+  }))
 }
 
 /** Fetches an element by id, throwing loudly if the page markup is missing it. */

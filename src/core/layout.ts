@@ -382,7 +382,11 @@ export type HeatOptions = {
   coolingMs?: number
 }
 
-const DEFAULT_BASE_RADIUS = 3
-const DEFAULT_MAX_RADIUS = 18
+// Node discs were reading too small in the playground, so the cold and hot sizes
+// are both more than doubled (3 -> 7, 18 -> 38). The ratio is kept roughly the
+// same so a hot node still stands out from a cold one; everything is just bigger
+// on screen so the "connection dots" are easy to pick out.
+const DEFAULT_BASE_RADIUS = 7
+const DEFAULT_MAX_RADIUS = 38
 const DEFAULT_TOUCH_SATURATION = 4
 const DEFAULT_COOLING_MS = 10_000

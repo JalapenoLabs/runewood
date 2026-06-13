@@ -95,7 +95,7 @@ const BLUR_PASSES_BY_QUALITY = {
 const BASE_BLUR_BY_QUALITY = {
   off: 0,
   low: 4,
-  high: 8,
+  high: 12,
 } as const satisfies Record<BloomQuality, number>
 
 /**
@@ -106,7 +106,10 @@ const BASE_BLUR_BY_QUALITY = {
 const BASE_STRENGTH_BY_QUALITY = {
   off: 0,
   low: 0.7,
-  high: 1.4,
+  // Pushed well above `low` so "high" is unmistakably more luminous, not a subtle
+  // smoothness bump. Paired with the lowered threshold band below, "high" reads as
+  // a clear glow the moment it is selected, while "off" stays a true no-op.
+  high: 2.4,
 } as const satisfies Record<BloomQuality, number>
 
 /**
@@ -122,8 +125,13 @@ const BLUR_INTENSITY_SPREAD = 6
  * cores glow; a spreading halo (small falloff) lowers it so more of the forest
  * lights up. `glowFalloff` is `> 0` and typically lands around `1..2`.
  */
-const MIN_THRESHOLD = 0.3
-const MAX_THRESHOLD = 0.8
+// Lowered from 0.3..0.8 so the bright pass actually catches the glowing nodes: at
+// the old band almost nothing crossed the threshold, so "high" looked the same as
+// "off". A lower band lets the hot cores (and their halos) bloom visibly while
+// still keeping the dim background below the pass, so the scene glows without
+// washing out.
+const MIN_THRESHOLD = 0.15
+const MAX_THRESHOLD = 0.5
 
 /**
  * The `glowFalloff` value mapped to {@link MAX_THRESHOLD}; falloff at or above

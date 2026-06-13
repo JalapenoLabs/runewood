@@ -38,8 +38,12 @@ export type EdgeVisualOptions = {
   depthFalloff?: number
 }
 
-const DEFAULT_BASE_THICKNESS = 2.4
-const DEFAULT_MIN_THICKNESS = 0.5
+// Branches read a touch too thin, so every stroke gains ~1px: the trunk goes
+// 2.4 -> 3.4 and the floor 0.5 -> 1.5, which lifts even the deepest twigs to a
+// full pixel of presence rather than a hairline. The falloff is unchanged, so the
+// taper from trunk to canopy keeps its shape, just one pixel bolder throughout.
+const DEFAULT_BASE_THICKNESS = 3.4
+const DEFAULT_MIN_THICKNESS = 1.5
 const DEFAULT_BASE_ALPHA = 0.5
 const DEFAULT_MIN_ALPHA = 0.12
 const DEFAULT_DEPTH_FALLOFF = 0.72

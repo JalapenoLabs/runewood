@@ -124,6 +124,45 @@
         font-size: 11px;
         color: #8b82b8;
       }
+
+      #legend {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding-top: 4px;
+        border-top: 1px solid rgba(180, 160, 255, 0.18);
+      }
+
+      #legend h2 {
+        margin: 0 0 2px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #9b8fd6;
+      }
+
+      .legend-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 3px 10px;
+      }
+
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: #cfc8f5;
+      }
+
+      .legend-swatch {
+        flex: 0 0 auto;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        box-shadow: 0 0 4px rgba(255, 255, 255, 0.25);
+      }
     </style>
   </head>
   <body>
@@ -175,6 +214,11 @@
       <div class="row">
         <label for="controls">Show panel</label>
         <input id="controls" type="checkbox" checked />
+      </div>
+
+      <div id="legend">
+        <h2>Color legend</h2>
+        <div id="legend-grid" class="legend-grid"></div>
       </div>
 
       <pre id="state-readout">{}</pre>

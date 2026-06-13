@@ -24,7 +24,7 @@ import { colorForPath } from '../core/theme'
 export type NodeVisual = {
   /** Radius in world units, derived from the node's heat. */
   radius: number
-  /** Base color: file hue from its extension, or the theme branch color for a directory. */
+  /** Base color: vivid file hue from its extension, or the neutral theme hub color for a directory. */
   color: Hsl
   /** Presence opacity, `0..1`. Seeded nodes are dim; deleted nodes fade toward 0. */
   alpha: number
@@ -81,9 +81,9 @@ const HEAT_BRIGHTNESS_WEIGHT = 0.6
  * The mapping:
  * - **radius** comes straight from {@link nodeHeat} (touch count + recency), so
  *   sizing logic lives in one place.
- * - **color** is the file's extension hue ({@link colorForPath}) for a leaf, or
- *   the theme's branch color for a directory, so directories read as structural
- *   wood and files as their language.
+ * - **color** is the file's vivid extension hue ({@link colorForPath}) for a leaf,
+ *   or the theme's neutral hub color for a directory, so directories read as
+ *   structural wood and files as their language.
  * - **alpha** is driven by {@link NodeStatus}: a seeded node is dimmed to
  *   `seededAlpha`, a discovered node is fully present, and a deleted node fades
  *   from full to 0 over `deleteFadeMs` since its delete.
@@ -103,11 +103,12 @@ export function nodeVisualFor(
 
   const { heat, radius } = nodeHeat(node, now, options.heat)
 
-  // Directories carry no language, so they take the theme's branch hue and read
-  // as the structural wood the files hang from. Files take their extension color.
+  // Directories carry no language, so they take the theme's neutral, desaturated
+  // hub color and read as the structural wood the files hang from. Files take
+  // their vivid extension color, so folder vs file is obvious at a glance.
   const color = node.isFile
     ? colorForPath(node.path)
-    : { ...theme.branch }
+    : { ...theme.hub }
 
   const alpha = alphaForStatus(node.status, node.lastTouchedAt, now, seededAlpha, deleteFadeMs)
 

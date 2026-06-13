@@ -25,20 +25,26 @@ describe('edgeVisualFor', () => {
   })
 
   it('floors thickness and alpha so a very deep branch never vanishes entirely', () => {
+    // With the explicit overrides a very deep branch sits exactly on the floors.
     const veryDeep = edgeVisualFor(40, defaultTheme, {
-      minThickness: 0.5,
+      minThickness: 1.5,
       minAlpha: 0.12,
     })
-    expect(veryDeep.thickness).toBe(0.5)
+    expect(veryDeep.thickness).toBe(1.5)
     expect(veryDeep.alpha).toBe(0.12)
   })
 
-  it('keeps the depth-1 branch at the base thickness and alpha', () => {
-    const visual = edgeVisualFor(1, defaultTheme, {
-      baseThickness: 2.4,
-      baseAlpha: 0.5,
-    })
-    expect(visual.thickness).toBeCloseTo(2.4, 5)
+  it('floors a deep branch at the bolder default minimum thickness', () => {
+    // The default floor was raised by ~1px (0.5 -> 1.5) so even the deepest twigs
+    // read as a full pixel. A very deep branch with no overrides must land there.
+    const veryDeep = edgeVisualFor(40, defaultTheme)
+    expect(veryDeep.thickness).toBe(1.5)
+  })
+
+  it('keeps the depth-1 branch at the bolder default base thickness and alpha', () => {
+    // Defaults, not overrides: the trunk gained ~1px (2.4 -> 3.4); alpha is unchanged.
+    const visual = edgeVisualFor(1, defaultTheme)
+    expect(visual.thickness).toBeCloseTo(3.4, 5)
     expect(visual.alpha).toBeCloseTo(0.5, 5)
   })
 

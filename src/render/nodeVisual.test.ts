@@ -125,12 +125,27 @@ describe('nodeVisualFor', () => {
       expect(visual.color).toEqual(colorForPath('repo/src/main.ts'))
     })
 
-    it('colors a directory from the theme branch color, not its path', () => {
+    it('colors a directory from the neutral theme hub color, not its path', () => {
       const directory = makeNode({ isFile: false, path: 'repo/src', name: 'src' })
       const visual = nodeVisualFor(directory, 1000, defaultTheme)
 
-      expect(visual.color).toEqual(defaultTheme.branch)
+      expect(visual.color).toEqual(defaultTheme.hub)
       expect(visual.color).not.toEqual(colorForPath('repo/src'))
+    })
+
+    it('makes a directory visually distinct from a same-named file', () => {
+      // The whole point of the hub color: a folder and a file must never render
+      // the same. A directory takes the neutral hub; a file takes its vivid
+      // extension hue, so the two are clearly different colors.
+      const directory = makeNode({ isFile: false, path: 'repo/src', name: 'src' })
+      const file = makeNode({ isFile: true, path: 'repo/src/main.ts', name: 'main.ts' })
+
+      const directoryVisual = nodeVisualFor(directory, 1000, defaultTheme)
+      const fileVisual = nodeVisualFor(file, 1000, defaultTheme)
+
+      expect(directoryVisual.color).not.toEqual(fileVisual.color)
+      // And the directory reads as the desaturated hub, not a vivid file hue.
+      expect(directoryVisual.color.s).toBeLessThan(fileVisual.color.s)
     })
   })
 

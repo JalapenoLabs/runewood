@@ -15,8 +15,8 @@ import {
 } from './theme'
 
 /** The fixed saturation/lightness every generated node/actor hue is rendered at. */
-const EXPECTED_NODE_SATURATION = 0.62
-const EXPECTED_NODE_LIGHTNESS = 0.55
+const EXPECTED_NODE_SATURATION = 0.85
+const EXPECTED_NODE_LIGHTNESS = 0.58
 
 function expectValidHue(color: Hsl): void {
   expect(color.h).toBeGreaterThanOrEqual(0)
@@ -26,10 +26,39 @@ function expectValidHue(color: Hsl): void {
 
 describe('colorForPath', () => {
   it('maps a curated extension to its intentional hue', () => {
-    // TypeScript is pinned to blue (211) in the curated table, regardless of
+    // TypeScript is pinned to blue (210) in the curated table, regardless of
     // how deep the path is.
-    expect(colorForPath('seraphim/api/src/main.ts').h).toBe(211)
-    expect(colorForPath('index.ts').h).toBe(211)
+    expect(colorForPath('seraphim/api/src/main.ts').h).toBe(210)
+    expect(colorForPath('index.ts').h).toBe(210)
+  })
+
+  it('keeps the common languages on vivid, well-separated hues', () => {
+    // The curated palette must keep the languages a viewer sees most far enough
+    // apart that neighbors never collapse into one indistinguishable color. We
+    // assert a real minimum spacing between every pair of the headline extensions
+    // rather than just "they differ", so a future retune cannot quietly crowd two
+    // of them back together.
+    const headlineExtensions = [ 'ts', 'js', 'py', 'rs', 'go', 'rb', 'json', 'css', 'md', 'sh' ]
+    const headlinePaths = headlineExtensions.map((extension) => `sample.${extension}`)
+    const hues = headlinePaths.map((samplePath) => colorForPath(samplePath).h)
+
+    const minSeparationDegrees = 12
+    for (let outer = 0; outer < hues.length; outer++) {
+      for (let inner = outer + 1; inner < hues.length; inner++) {
+        // Compare around the wheel, so 350 and 5 read as 15 degrees apart, not 345.
+        const rawDelta = Math.abs(hues[outer] - hues[inner])
+        const wheelDelta = Math.min(rawDelta, 360 - rawDelta)
+        expect(wheelDelta).toBeGreaterThanOrEqual(minSeparationDegrees)
+      }
+    }
+  })
+
+  it('renders curated file colors at the high, vivid saturation', () => {
+    // The bump to a vivid palette must actually reach the file colors, not just
+    // the constant: a curated language should come back fully saturated.
+    const typescript = colorForPath('src/main.ts')
+    expect(typescript.s).toBe(EXPECTED_NODE_SATURATION)
+    expect(typescript.l).toBe(EXPECTED_NODE_LIGHTNESS)
   })
 
   it('maps every distinct curated extension to a distinct, fixed-vividness color', () => {
@@ -80,8 +109,8 @@ describe('colorForPath', () => {
   })
 
   it('treats a leading-dot dotfile as its own extension', () => {
-    // `.env` is curated (hue 60); the dotfile name itself is the extension.
-    expect(colorForPath('.env').h).toBe(60)
+    // `.env` is curated (hue 58); the dotfile name itself is the extension.
+    expect(colorForPath('.env').h).toBe(58)
     expect(colorForPath('config/.env')).toEqual(colorForPath('.env'))
   })
 
@@ -132,6 +161,16 @@ describe('built-in themes', () => {
   it('defaults to dusk', () => {
     expect(defaultTheme).toBe(themes.dusk)
   })
+
+  it('gives every theme a neutral hub clearly less saturated than its files', () => {
+    // The hub (directory) color is the folder-vs-file cue: it must stay
+    // desaturated so a directory never competes with the vivid file nodes. We
+    // assert it against the file saturation rather than a hard-coded number so the
+    // contract survives a future palette retune.
+    for (const theme of Object.values(themes)) {
+      expect(theme.hub.s).toBeLessThan(EXPECTED_NODE_SATURATION)
+    }
+  })
 })
 
 describe('mergeTheme', () => {
@@ -155,6 +194,14 @@ describe('mergeTheme', () => {
     // Saturation and lightness fall through from the base background.
     expect(merged.background.s).toBe(themes.dusk.background.s)
     expect(merged.background.l).toBe(themes.dusk.background.l)
+  })
+
+  it('merges a partial hub override per channel like the other colors', () => {
+    const merged = mergeTheme(themes.dusk, { hub: { h: 120 }})
+    expect(merged.hub.h).toBe(120)
+    // The untouched hub channels fall through from the base.
+    expect(merged.hub.s).toBe(themes.dusk.hub.s)
+    expect(merged.hub.l).toBe(themes.dusk.hub.l)
   })
 
   it('does not mutate the base theme', () => {
