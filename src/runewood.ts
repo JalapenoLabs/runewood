@@ -14,6 +14,7 @@ import type { LabelLodOptions } from './render/labels'
 import type { Scene } from './render/scene'
 import type { BeamScene } from './render/beamScene'
 import type { LabelScene } from './render/labelScene'
+import type { PickCandidate } from './core/picking'
 
 // Core
 import { Timeline } from './core/timeline'
@@ -21,6 +22,8 @@ import { computeTargets, stepSprings } from './core/layout'
 import { defaultTheme, mergeTheme, themes } from './core/theme'
 import { createFrameState, stepFrame } from './core/frameStep'
 import { seedTree } from './core/tree'
+import { Emitter } from './core/emitter'
+import { nearestWithinRadius } from './core/picking'
 
 // Render
 import { Camera, autoFrame } from './render/camera'
@@ -75,11 +78,90 @@ export type RunewoodController = {
    */
   resize: () => void
   /**
+   * Subscribe `handler` to a controller `event` and get back an unsubscribe
+   * function. The payload type is inferred from the event name (see
+   * {@link RunewoodEventMap}), so handling the wrong shape is a compile error.
+   * Use this to react to playback (`play`/`pause`/`seek`/`reachedLiveEdge`) or to
+   * deep-link off a click (`nodeClick`/`actorClick`).
+   */
+  on: <Name extends keyof RunewoodEventMap>(
+    event: Name,
+    handler: (payload: RunewoodEventMap[Name]) => void,
+  ) => () => void
+  /** Remove a handler previously registered with {@link on}. */
+  off: <Name extends keyof RunewoodEventMap>(
+    event: Name,
+    handler: (payload: RunewoodEventMap[Name]) => void,
+  ) => void
+  /**
+   * A snapshot of the current playback state, read from the timeline. Lets an
+   * overlay (the #11 transport) or a host render controls without reaching into
+   * the controller's internals.
+   */
+  getState: () => RunewoodPlaybackState
+  /**
    * Tear everything down: stop the RAF loop, disconnect the observer and media
-   * query, dispose every scene and the backend (releasing all GPU resources), and
-   * remove the canvas from the container. Idempotent and leak-free.
+   * query, drop every event subscriber, dispose every scene and the backend
+   * (releasing all GPU resources), and remove the canvas from the container.
+   * Idempotent and leak-free.
    */
   destroy: () => void
+}
+
+/** Payload for the `seek` event: where the playhead landed, as time and fraction. */
+export type RunewoodSeekPayload = {
+  /** The new playhead time in epoch milliseconds. */
+  time: number
+  /** Fraction of the timeline elapsed at that time, `0..1`. */
+  progress: number
+}
+
+/** Payload for the `nodeClick` event: the path of the node the click resolved to. */
+export type RunewoodNodeClickPayload = {
+  /** The clicked node's full slash-joined path, e.g. `seraphim/api/src/main.rs`. */
+  path: string
+}
+
+/** Payload for the `actorClick` event: the id of the actor the click resolved to. */
+export type RunewoodActorClickPayload = {
+  /** The clicked actor's stable id. */
+  actor: string
+}
+
+/**
+ * The controller's typed event surface (issue #10): each key is an event name and
+ * its value is that event's payload type. Drives {@link RunewoodController.on} /
+ * {@link RunewoodController.off} so subscribing is fully type-checked.
+ *
+ * - `play` / `pause`: emitted from the matching methods (and from autoplay).
+ * - `seek`: emitted on every seek with the resulting time + progress.
+ * - `reachedLiveEdge`: emitted when the playhead catches up to the newest event
+ *   while following live, so a host can light up a "live" indicator.
+ * - `nodeClick` / `actorClick`: emitted when a click resolves to a node / actor.
+ */
+export type RunewoodEventMap = {
+  play: void
+  pause: void
+  seek: RunewoodSeekPayload
+  reachedLiveEdge: void
+  nodeClick: RunewoodNodeClickPayload
+  actorClick: RunewoodActorClickPayload
+}
+
+/** The snapshot {@link RunewoodController.getState} returns. */
+export type RunewoodPlaybackState = {
+  /** Whether the clock is currently advancing. */
+  playing: boolean
+  /** The current playhead time in epoch milliseconds. */
+  time: number
+  /** Total span of the loaded log in milliseconds (`last - first`), `0` when empty. */
+  duration: number
+  /** Fraction of the timeline elapsed, `0..1`. */
+  progress: number
+  /** The current playback rate (`1` real time, `2` double, `0.5` half). */
+  speed: number
+  /** Whether the playhead is pinned to the newest event (following live). */
+  following: boolean
 }
 
 /** Construction options for {@link createRunewood}; every field has a sensible default. */
@@ -100,10 +182,45 @@ export type RunewoodOptions = {
    * Defaults to `true`; equivalent to calling `follow(true)` immediately.
    */
   follow?: boolean
+  /**
+   * Whether the playhead starts pinned to the newest event, so live-appended
+   * events drag the view to the latest activity and the `reachedLiveEdge` event
+   * fires as it catches up. Defaults to `true` for a live feed; a host replaying a
+   * fixed log from the start will usually pass `false`. A manual `seek` detaches
+   * live-follow until the host opts back in.
+   */
+  followLive?: boolean
   /** Initial playback speed multiplier. Defaults to `1`. */
   speed?: number
   /** Start playing immediately on init, rather than waiting for `play()`. Defaults to `false`. */
   autoplay?: boolean
+  /**
+   * Force the reduced-motion behavior on (`true`) or off (`false`), overriding the
+   * platform `prefers-reduced-motion` media query. Left unset, the controller
+   * honors the media query (the default). A host that has its own motion toggle
+   * passes the resolved value here so the library never fights it.
+   */
+  reducedMotion?: boolean
+  /**
+   * Whether node / actor labels are drawn at all. `false` suppresses the label
+   * scene entirely (the LOD policy in {@link labels} only governs *which* labels
+   * show when they are enabled). Defaults to `true`.
+   */
+  showLabels?: boolean
+  /**
+   * Cap on how many events the timeline retains. Older events past this many are
+   * dropped on ingest so a long-running live feed does not grow without bound;
+   * the retained window still folds exactly. Omit (the default) to retain every
+   * event, which is what a bounded replay log wants.
+   */
+  maxEvents?: number
+  /**
+   * Click hit slop in screen pixels: how far from a node / actor a click may land
+   * and still resolve to it. Converted to world units via the camera zoom at click
+   * time, so the slop stays constant on screen regardless of zoom. Defaults to
+   * {@link DEFAULT_HIT_RADIUS_PX}.
+   */
+  hitRadius?: number
   /**
    * A coarse "this is a weak GPU / low-power device" hint that caps bloom at
    * `low`. The reduced-motion downgrade is read from the platform media query
@@ -188,8 +305,33 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // first frame; toggled by `follow`.
   let following = options.follow ?? true
 
-  /** Reads the live reduced-motion preference, guarding for non-browser hosts. */
+  // The typed event surface (issue #10). Dependency-free; cleared on destroy.
+  const emitter = new Emitter<RunewoodEventMap>()
+
+  // Whether labels are drawn at all (the LOD policy still governs which show). A
+  // host can suppress the whole label scene without touching the LOD knobs.
+  const showLabels = options.showLabels ?? true
+
+  // Click hit slop in screen pixels, converted to world units per click via zoom.
+  const hitRadiusPx = options.hitRadius ?? DEFAULT_HIT_RADIUS_PX
+
+  // The pointer listener, kept so destroy can detach it. Created on init once the
+  // canvas exists; null before init and after teardown.
+  let pointerListener: ((pointerEvent: PointerEvent) => void) | null = null
+
+  // Whether the playhead was sitting exactly on the newest event on the previous
+  // tick, so `reachedLiveEdge` fires once on the transition rather than every frame.
+  let wasAtLiveEdge = false
+
+  /**
+   * Reads the effective reduced-motion preference: the explicit option override
+   * when the host supplied one, otherwise the live platform media query (guarded
+   * for non-browser hosts, where it is absent).
+   */
   function prefersReducedMotion(): boolean {
+    if (options.reducedMotion !== undefined) {
+      return options.reducedMotion
+    }
     return reducedMotionQuery?.matches ?? false
   }
 
@@ -227,6 +369,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const step = stepFrame(frameState, advance, advance.crossed.length > 0 ? timeline.getEvents() : EMPTY_LOG)
     frameState = step.state
     const now = frameState.playhead
+
+    // Fire `reachedLiveEdge` on the transition into "caught up to the newest event
+    // while following live", not every frame we sit there. A host lights its live
+    // indicator off this.
+    emitLiveEdgeTransition()
 
     // A backward seek landed since the last tick only via `seek()`, which handles
     // its own rebuild; a forward advance never rebuilds, so `step.clearParticles`
@@ -278,10 +425,26 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const activities = buildActorActivities()
     beamScene.update(activities, now, theme)
 
-    const candidates = buildLabelCandidates(now, activities)
+    // Labels can be suppressed wholesale; when off, the scene gets an empty
+    // candidate set so it tears its retained text down rather than holding stale.
+    const candidates = showLabels ? buildLabelCandidates(now, activities) : EMPTY_LABELS
     labelScene.update(candidates, camera.zoom, now, theme)
 
     backend.endFrame()
+  }
+
+  /**
+   * Emits `reachedLiveEdge` exactly when the playhead first catches up to the
+   * newest event while following live. Tracking the previous-frame state means it
+   * fires on the transition, not continuously while parked at the edge.
+   */
+  function emitLiveEdgeTransition(): void {
+    const lastEventTime = timeline.lastEventTime
+    const atLiveEdge = timeline.live && lastEventTime !== null && timeline.time >= lastEventTime
+    if (atLiveEdge && !wasAtLiveEdge) {
+      emitter.emit('reachedLiveEdge', undefined)
+    }
+    wasAtLiveEdge = atLiveEdge
   }
 
   /** Spawns the reducer's beams / pulses, resolving each path to its live spring position. */
@@ -536,6 +699,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       resizeObserver.observe(container)
     }
 
+    // Wire pointer hit-testing on the live canvas. The listener stays a thin shell:
+    // it converts the screen point to world space via the camera and hands the pure
+    // picking math the live node / actor positions; see `handlePointer`.
+    const canvas = backend.canvas
+    if (canvas) {
+      pointerListener = (pointerEvent: PointerEvent): void => handlePointer(pointerEvent, canvas)
+      canvas.addEventListener('pointerdown', pointerListener)
+    }
+
     ready = true
     for (const action of pendingActions) {
       action()
@@ -547,11 +719,63 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     if (options.speed !== undefined) {
       timeline.setSpeed(options.speed)
     }
+    // Live-follow defaults on: pin the playhead to the newest event so the view
+    // tracks live activity. Enabling jumps to the latest event immediately.
+    timeline.followLive(options.followLive ?? true)
     if (options.autoplay) {
       timeline.play()
     }
 
     rafHandle = requestAnimationFrame(frame)
+  }
+
+  /**
+   * Resolves one pointer event to the nearest node and actor and emits
+   * `nodeClick` / `actorClick`. The screen point is taken relative to the canvas
+   * (so an offset / scrolled host still hits correctly), unprojected to world
+   * space by the camera, and matched against the live spring positions (nodes) and
+   * the actor orb centroids (actors) by the pure {@link nearestWithinRadius}. The
+   * screen-pixel hit slop is divided by the live zoom so the radius is constant on
+   * screen at any zoom.
+   */
+  function handlePointer(pointerEvent: PointerEvent, canvas: HTMLCanvasElement): void {
+    const rect = canvas.getBoundingClientRect()
+    const screenPoint = { x: pointerEvent.clientX - rect.left, y: pointerEvent.clientY - rect.top }
+    const worldPoint = camera.screenToWorld(screenPoint)
+    const worldRadius = hitRadiusPx / camera.zoom
+
+    const nodePath = nearestWithinRadius(worldPoint, nodeCandidates(), worldRadius)
+    if (nodePath !== null) {
+      emitter.emit('nodeClick', { path: nodePath })
+    }
+
+    const actorId = nearestWithinRadius(worldPoint, actorCandidates(), worldRadius)
+    if (actorId !== null) {
+      emitter.emit('actorClick', { actor: actorId })
+    }
+  }
+
+  /** The live node pick candidates: every spring-tracked node at its drawn position. */
+  function nodeCandidates(): PickCandidate[] {
+    const candidates: PickCandidate[] = []
+    for (const [ path, physics ] of springs) {
+      candidates.push({ id: path, position: physics.position })
+    }
+    return candidates
+  }
+
+  /** The live actor pick candidates: each tracked actor at the centroid of its touched files. */
+  function actorCandidates(): PickCandidate[] {
+    const candidates: PickCandidate[] = []
+    for (const track of frameState.actors.values()) {
+      const position = track.touchedPaths.length > 0
+        ? centroidOfPaths(track.touchedPaths)
+        : track.lastCentroid
+      if (position) {
+        candidates.push({ id: track.actor, position })
+      }
+    }
+    return candidates
   }
 
   /** The container's current logical size, never zero so the renderer always has a surface. */
@@ -578,6 +802,12 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       const run = (): void => {
         for (const event of batch) {
           timeline.append(event)
+        }
+        // Bound a long-running live feed: drop history beyond the retention cap
+        // after appending so the log never grows without limit. A no-op when the
+        // host left `maxEvents` unset.
+        if (options.maxEvents !== undefined) {
+          timeline.trimToCount(options.maxEvents)
         }
       }
       if (ready) {
@@ -606,9 +836,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     },
     play(): void {
       timeline.play()
+      emitter.emit('play', undefined)
     },
     pause(): void {
       timeline.pause()
+      emitter.emit('pause', undefined)
     },
     seek(time: number): void {
       if (ready) {
@@ -617,12 +849,32 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       else {
         pendingActions.push(() => applySeek(time))
       }
+      // Emit the resulting playhead + progress regardless of ready state: before
+      // init the timeline still clamps and reports the sought time, so a host's
+      // scrubber stays in sync from the very first interaction.
+      emitter.emit('seek', { time: timeline.time, progress: timeline.progress() })
     },
     setSpeed(multiplier: number): void {
       timeline.setSpeed(multiplier)
     },
     follow(shouldFollow: boolean): void {
       following = shouldFollow
+    },
+    on(event, handler) {
+      return emitter.on(event, handler)
+    },
+    off(event, handler) {
+      emitter.off(event, handler)
+    },
+    getState(): RunewoodPlaybackState {
+      return {
+        playing: timeline.playing,
+        time: timeline.time,
+        duration: timeline.duration(),
+        progress: timeline.progress(),
+        speed: timeline.speed,
+        following: timeline.live,
+      }
     },
     resize(): void {
       if (ready) {
@@ -642,6 +894,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       resizeObserver?.disconnect()
       resizeObserver = null
       reducedMotionQuery = null
+
+      // Detach the pointer listener before the backend (and its canvas) go away,
+      // and drop every event subscriber so the controller leaves nothing behind.
+      const canvas = backend.canvas
+      if (pointerListener && canvas) {
+        canvas.removeEventListener('pointerdown', pointerListener)
+      }
+      pointerListener = null
+      emitter.clear()
 
       scene?.clear()
       beamScene?.dispose()
@@ -665,8 +926,18 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
 /** The empty log passed to the reducer on a still / no-events-crossed frame, avoiding a needless copy. */
 const EMPTY_LOG: RunewoodEvent[] = []
 
+/** The empty candidate set handed to the label scene when labels are suppressed. */
+const EMPTY_LABELS: LabelCandidate[] = []
+
 /** How long an actor label takes to fade after its last activity, matching the actor orb's default. */
 const ACTOR_LABEL_FADE_MS = 3_000
+
+/**
+ * Default click hit slop in screen pixels: how far from a node / actor a click may
+ * land and still resolve to it. A few pixels of forgiveness so tapping near a
+ * small node still selects it, without grabbing unrelated neighbors.
+ */
+const DEFAULT_HIT_RADIUS_PX = 16
 
 /**
  * Resolves the option's loose theme input (a built-in name, a full theme, or a

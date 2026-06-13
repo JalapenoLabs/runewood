@@ -206,6 +206,33 @@ export class Timeline {
     return this.events[this.events.length - 1].at - this.events[0].at
   }
 
+  /**
+   * Drop the oldest events so at most `maxEvents` remain, for a long-running live
+   * feed that would otherwise grow without bound. The retained window is still a
+   * contiguous, time-sorted tail of the log, so the fold over it stays exact; only
+   * history older than the window is forgotten. The playhead is nudged forward to
+   * the new earliest event if trimming dropped the event it was sitting on, so it
+   * never points before the retained log.
+   *
+   * A non-positive or non-finite cap is rejected (warn, no change): "retain at
+   * most zero events" is never a real intent and would throw the log away.
+   */
+  trimToCount(maxEvents: number): void {
+    if (!Number.isFinite(maxEvents) || maxEvents <= 0) {
+      console.debug('runewood: ignoring invalid timeline retention cap, keeping full log', maxEvents)
+      return
+    }
+    const excess = this.events.length - maxEvents
+    if (excess <= 0) {
+      return
+    }
+    this.events.splice(0, excess)
+    const earliest = this.events[0].at
+    if (this.playhead < earliest) {
+      this.playhead = earliest
+    }
+  }
+
   /** A defensive copy of the sorted log, for callers that re-fold on a rebuild. */
   getEvents(): RunewoodEvent[] {
     return [ ...this.events ]

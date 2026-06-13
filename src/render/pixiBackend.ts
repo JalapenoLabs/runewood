@@ -49,6 +49,16 @@ export class PixiBackend implements RenderBackend {
   private application: Application | null = null
 
   /**
+   * The canvas pixi renders into, or `null` before {@link init} / after
+   * {@link dispose}. Exposed (off the concrete backend, not the pixi-free
+   * {@link RenderBackend} interface) so the controller can attach its pointer
+   * listener for click picking (#10) to the actual draw surface.
+   */
+  public get canvas(): HTMLCanvasElement | null {
+    return this.application?.canvas ?? null
+  }
+
+  /**
    * The world-space scene container. The camera transform is applied to this
    * single container (position + uniform scale), so every child is authored in
    * plain world coordinates and projected for free.
