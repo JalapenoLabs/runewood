@@ -1,0 +1,52 @@
+name: CI
+
+# Test every pull request and every push to the long-lived branches.
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+# Don't pile up redundant runs for the same ref; a newer push supersedes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint, typecheck, test, build
+    runs-on: [self-hosted, Linux, X64, fedora]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The repo pins Yarn Berry via the `packageManager` field; Corepack ships
+      # with Node and provisions that exact version.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install
+        run: yarn install --immutable
+
+      # No fail-fast across checks: a lint failure should still let tests and the
+      # build run and report, mirroring the Seraphim CI convention.
+      - name: Lint
+        if: ${{ !cancelled() }}
+        run: yarn lint
+
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        run: yarn typecheck
+
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: yarn test
+
+      - name: Build
+        if: ${{ !cancelled() }}
+        run: yarn build

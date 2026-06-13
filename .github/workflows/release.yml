@@ -1,0 +1,57 @@
+name: Release
+
+# Every push to main cuts a patch release: bump the version, tag it, publish to
+# npm, and open a GitHub Release. The release commit carries "[skip ci]" so it
+# does not retrigger this workflow (and pushes made with GITHUB_TOKEN do not
+# start new runs anyway, a second guard against loops).
+on:
+  push:
+    branches: [main]
+
+# Never run two releases at once; serialize them so versions can't collide.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: Patch release to npm
+    runs-on: [self-hosted, Linux, X64, fedora]
+    # Skip the run entirely for the release bot's own commit, belt-and-suspenders
+    # with [skip ci].
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-it needs full history and tags to compute the next version.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install
+        run: yarn install --immutable
+
+      - name: Build
+        run: yarn build
+
+      - name: Configure git identity
+        run: |
+          git config user.name "jalapeno-release-bot"
+          git config user.email "release-bot@jalapenolabs.io"
+
+      - name: Release
+        run: yarn release patch --ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
