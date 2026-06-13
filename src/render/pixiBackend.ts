@@ -10,9 +10,13 @@ import type {
   LabelDrawCommand,
 } from './backend'
 import type { Hsl } from '../core/theme'
+import type { SceneOptions } from './scene'
 
 // Core
 import { Application, Container, Graphics, Text } from 'pixi.js'
+
+import { Scene } from './scene'
+import { hslToRgbInt } from './color'
 
 /**
  * The concrete {@link RenderBackend} for v1, built on pixi.js v8. This is the
@@ -43,10 +47,14 @@ export class PixiBackend implements RenderBackend {
   private world: Container | null = null
 
   /**
-   * A reusable placeholder primitive, drawn once to prove the pipeline. Later
-   * issues replace this with real node/edge/beam graphics.
+   * The retained-scene layers, both children of {@link world} so the camera
+   * transform applies once. Branches are added under nodes so the glowing discs
+   * always sit on top of the wood that connects them. Beams and labels (drawn by
+   * the immediate-mode methods below) are added straight to {@link world}, over
+   * both, so an activity beam reads above the forest.
    */
-  private placeholder: Graphics | null = null
+  private edgeLayer: Container | null = null
+  private nodeLayer: Container | null = null
 
   public async init(options: RenderBackendInitOptions): Promise<void> {
     if (this.application) {
@@ -75,17 +83,33 @@ export class PixiBackend implements RenderBackend {
     const world = new Container()
     application.stage.addChild(world)
 
-    // A simple placeholder so the very first frame visibly proves the pipeline:
-    // a unit-ish marker at the world origin. Replaced by real geometry in #5+.
-    const placeholder = new Graphics()
-    placeholder
-      .circle(0, 0, 24)
-      .fill({ color: 0xffffff, alpha: 0.9 })
-    world.addChild(placeholder)
+    // Two retained layers for the forest: branches under nodes so the glowing
+    // discs sit on top of the wood. The {@link Scene} this backend hands out
+    // parents its per-node and per-edge graphics into these.
+    const edgeLayer = new Container()
+    const nodeLayer = new Container()
+    world.addChild(edgeLayer)
+    world.addChild(nodeLayer)
 
     this.application = application
     this.world = world
-    this.placeholder = placeholder
+    this.edgeLayer = edgeLayer
+    this.nodeLayer = nodeLayer
+  }
+
+  /**
+   * Creates a retained {@link Scene} parented into this backend's forest layers.
+   * The controller (#9) holds the returned scene and calls `scene.update(...)`
+   * each frame between {@link beginFrame} and {@link endFrame} to draw the
+   * glowing nodes and branches. Returns `null` if called before {@link init},
+   * since the layers do not exist yet.
+   */
+  public createScene(options?: SceneOptions): Scene | null {
+    if (!this.edgeLayer || !this.nodeLayer) {
+      console.debug('runewood: PixiBackend.createScene called before init, returning null')
+      return null
+    }
+    return new Scene(this.edgeLayer, this.nodeLayer, options)
   }
 
   public resize(width: number, height: number): void {
@@ -202,67 +226,7 @@ export class PixiBackend implements RenderBackend {
     this.application.destroy(true, { children: true })
     this.application = null
     this.world = null
-    this.placeholder = null
+    this.edgeLayer = null
+    this.nodeLayer = null
   }
-}
-
-/**
- * Converts the engine's canonical {@link Hsl} (hue in degrees, S/L as `0..1`
- * fractions) to the packed `0xRRGGBB` integer pixi wants. Kept here, not in the
- * theme module, because "what a color integer is" is a pixi/WebGL concern and
- * must not leak above this backend. Pure and self-contained so there is no
- * dependency on pixi/colord's particular HSL parsing rules.
- */
-function hslToRgbInt(color: Hsl): number {
-  const hue = ((color.h % 360) + 360) % 360
-  const saturation = clamp01(color.s)
-  const lightness = clamp01(color.l)
-
-  // Standard HSL -> RGB. `chroma` is the color's intensity, `secondary` the
-  // intermediate component, and `match` the lightness offset that lifts both to
-  // the requested lightness.
-  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation
-  const huePrime = hue / 60
-  const secondary = chroma * (1 - Math.abs((huePrime % 2) - 1))
-  const match = lightness - chroma / 2
-
-  const rgb = rgbForHueSextant(huePrime, chroma, secondary)
-
-  const red = Math.round((rgb.r + match) * 255)
-  const green = Math.round((rgb.g + match) * 255)
-  const blue = Math.round((rgb.b + match) * 255)
-
-  return (red << 16) | (green << 8) | blue
-}
-
-/**
- * The un-offset RGB components for a hue, picked by which 60-degree sextant of
- * the color wheel it falls in. The caller adds the lightness `match` to all
- * three. A lookup over sextants keeps this branch-light and obvious.
- */
-function rgbForHueSextant(huePrime: number, chroma: number, secondary: number): Vec2RGB {
-  if (huePrime < 1) {
-    return { r: chroma, g: secondary, b: 0 }
-  }
-  if (huePrime < 2) {
-    return { r: secondary, g: chroma, b: 0 }
-  }
-  if (huePrime < 3) {
-    return { r: 0, g: chroma, b: secondary }
-  }
-  if (huePrime < 4) {
-    return { r: 0, g: secondary, b: chroma }
-  }
-  if (huePrime < 5) {
-    return { r: secondary, g: 0, b: chroma }
-  }
-  return { r: chroma, g: 0, b: secondary }
-}
-
-/** A plain RGB triple in `0..1`, internal to the HSL conversion. */
-type Vec2RGB = { r: number, g: number, b: number }
-
-/** Clamps a fraction to `[0, 1]`. */
-function clamp01(value: number): number {
-  return Math.min(Math.max(value, 0), 1)
 }
