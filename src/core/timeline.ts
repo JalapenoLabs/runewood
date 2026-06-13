@@ -188,6 +188,21 @@ export class Timeline {
     return { playhead: target, crossed, rebuild: false }
   }
 
+  /**
+   * Events in the half-open interval `(afterExclusive, throughInclusive]`, in time
+   * order. Unlike `advance`, this neither moves the playhead nor depends on the
+   * `playing` flag: it is how the controller folds the tree up to the current
+   * playhead no matter how the playhead got there, whether a forward `play` moved
+   * it or a live `append` pinned it to the newest event. Returns an empty array
+   * when the interval is empty or inverted.
+   */
+  crossedBetween(afterExclusive: number, throughInclusive: number): RunewoodEvent[] {
+    if (throughInclusive <= afterExclusive) {
+      return []
+    }
+    return this.events.filter((event) => event.at > afterExclusive && event.at <= throughInclusive)
+  }
+
   /** Fraction of the timeline elapsed, 0..1. Returns 0 for an empty or zero-length log. */
   progress(): number {
     const span = this.duration()

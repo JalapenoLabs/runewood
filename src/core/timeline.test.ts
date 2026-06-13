@@ -259,3 +259,46 @@ describe('Timeline.progress and duration', () => {
     expect(timeline.progress()).toBe(0)
   })
 })
+
+describe('Timeline.crossedBetween', () => {
+  it('returns events in the half-open interval (after, through], regardless of play state', () => {
+    const timeline = new Timeline(sampleLog())
+
+    // Never played, so the playhead never moved; crossedBetween must still report
+    // events purely from the interval. This is the live-follow folding path: the
+    // playhead is moved by append, not advance, and the controller folds the gap.
+    const crossed = timeline.crossedBetween(1000, 3000)
+
+    expect(crossed.map((entry) => entry.at)).toEqual([ 2000, 3000 ])
+  })
+
+  it('excludes the lower bound and includes the upper bound', () => {
+    const timeline = new Timeline(sampleLog())
+
+    expect(timeline.crossedBetween(2000, 2000)).toEqual([])
+    expect(timeline.crossedBetween(1999, 2000).map((entry) => entry.at)).toEqual([ 2000 ])
+    expect(timeline.crossedBetween(0, 1000).map((entry) => entry.at)).toEqual([ 1000 ])
+  })
+
+  it('returns an empty array for an inverted or empty interval', () => {
+    const timeline = new Timeline(sampleLog())
+
+    expect(timeline.crossedBetween(3000, 1000)).toEqual([])
+    expect(timeline.crossedBetween(5000, 9000)).toEqual([])
+  })
+
+  it('folds a live-appended event the moment the playhead pins to it', () => {
+    // The exact frozen-canvas scenario: an empty, following timeline gets a live
+    // append, which jumps the playhead to the new event. The controller folds
+    // (lastFolded, now] and must see that event even though nothing ever "played".
+    const timeline = new Timeline()
+    timeline.followLive(true)
+
+    const lastFolded = timeline.time
+    timeline.append(event({ at: 4000, path: 'repo/live.ts' }))
+
+    expect(timeline.time).toBe(4000)
+    const crossed = timeline.crossedBetween(lastFolded, timeline.time)
+    expect(crossed.map((entry) => entry.path)).toEqual([ 'repo/live.ts' ])
+  })
+})

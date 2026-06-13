@@ -293,6 +293,12 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   let destroyed = false
   let rafHandle: number | null = null
   let lastFrameTime: number | null = null
+  // The playhead position the tree was last folded to. Each frame we fold the
+  // events in (lastFoldedPlayhead, timeline.time], so the tree tracks the playhead
+  // however it moved: forward `play` (advance) OR a live `append` that pinned the
+  // playhead to the newest event. Without this, live-follow appends move the clock
+  // but never fold, leaving the canvas frozen while playback state still updates.
+  let lastFoldedPlayhead = 0
   let resizeObserver: ResizeObserver | null = null
   let reducedMotionQuery: MediaQueryList | null = null
   let appliedBloom: BloomQuality | null = null
@@ -364,11 +370,29 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       return
     }
 
-    // 1. Advance the playhead and fold the logical state (pure reducer).
-    const advance = timeline.advance(deltaMs)
-    const step = stepFrame(frameState, advance, advance.crossed.length > 0 ? timeline.getEvents() : EMPTY_LOG)
+    // 1. Advance the clock when playing (forward play crosses events here), then
+    //    fold the tree up to wherever the playhead now sits regardless of how it
+    //    got there. Forward play moves it via `advance`; live-follow moves it via
+    //    `append` (the playhead jumps to each newest event). Folding by the
+    //    (lastFolded, now] interval handles both, so live events actually appear.
+    timeline.advance(deltaMs)
+    const now = timeline.time
+    let step
+    if (now < lastFoldedPlayhead) {
+      // The playhead moved backward (e.g. a retention trim dropped the event it
+      // sat on); re-fold from scratch to stay exact.
+      step = stepFrame(frameState, { playhead: now, rebuild: true, crossed: []}, timeline.getEvents())
+    }
+    else {
+      const crossed = timeline.crossedBetween(lastFoldedPlayhead, now)
+      step = stepFrame(
+        frameState,
+        { playhead: now, rebuild: false, crossed },
+        crossed.length > 0 ? timeline.getEvents() : EMPTY_LOG,
+      )
+    }
+    lastFoldedPlayhead = now
     frameState = step.state
-    const now = frameState.playhead
 
     // Fire `reachedLiveEdge` on the transition into "caught up to the newest event
     // while following live", not every frame we sit there. A host lights its live
@@ -665,6 +689,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       timeline.getEvents(),
     )
     frameState = step.state
+    // The seek already folded the tree to the sought time, so keep the loop's
+    // fold cursor in sync: without this the next tick would re-cross everything
+    // between a stale cursor and the new playhead (a forward seek) or fight the
+    // rebuild (a backward seek).
+    lastFoldedPlayhead = timeline.time
     if (step.clearParticles && beamScene) {
       // Backward seek: drop transient particles rather than reverse them.
       beamScene.clear()
