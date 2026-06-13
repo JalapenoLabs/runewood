@@ -17,3 +17,7 @@ export { applyEvent, createTree, seedTree } from './core/tree'
 export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
+
+// The public controller: the single entry point a host mounts against a div.
+export { createRunewood } from './runewood'
+export type { RunewoodController, RunewoodOptions } from './runewood'
