@@ -12,12 +12,14 @@ import type {
 import type { Hsl } from '../core/theme'
 import type { SceneOptions } from './scene'
 import type { BeamSceneOptions } from './beamScene'
+import type { LabelLodOptions } from './labels'
 
 // Core
 import { Application, Container, Graphics, Text } from 'pixi.js'
 
 import { Scene } from './scene'
 import { BeamScene } from './beamScene'
+import { LabelScene } from './labelScene'
 import { hslToRgbInt } from './color'
 
 /**
@@ -65,6 +67,13 @@ export class PixiBackend implements RenderBackend {
    */
   private beamLayer: Container | null = null
 
+  /**
+   * The world container for the retained label layer (issue #7). Added above the
+   * forest and beam layers so label text reads on top of everything. The
+   * {@link LabelScene} this backend hands out parents its glyphs here.
+   */
+  private labelLayer: Container | null = null
+
   public async init(options: RenderBackendInitOptions): Promise<void> {
     if (this.application) {
       console.debug('runewood: PixiBackend.init called twice, ignoring the second call')
@@ -100,16 +109,22 @@ export class PixiBackend implements RenderBackend {
     world.addChild(edgeLayer)
     world.addChild(nodeLayer)
 
-    // The beam/actor glow sits above the forest, so it is added last (drawn on
-    // top of both the branches and the node discs).
+    // The beam/actor glow sits above the forest, so it is added over both the
+    // branches and the node discs.
     const beamLayer = new Container()
     world.addChild(beamLayer)
+
+    // Labels sit above everything else, so they are added last and read on top of
+    // the forest and the activity glow.
+    const labelLayer = new Container()
+    world.addChild(labelLayer)
 
     this.application = application
     this.world = world
     this.edgeLayer = edgeLayer
     this.nodeLayer = nodeLayer
     this.beamLayer = beamLayer
+    this.labelLayer = labelLayer
   }
 
   /**
@@ -141,6 +156,22 @@ export class PixiBackend implements RenderBackend {
       return null
     }
     return new BeamScene(this.beamLayer, options)
+  }
+
+  /**
+   * Creates a retained {@link LabelScene} parented into this backend's label
+   * layer, which sits above the forest and the beams. The controller (#9) holds
+   * the returned scene, assembles the label candidates (files, repo roots, actors)
+   * each frame, and calls `labelScene.update(...)` after the forest and beam
+   * scenes so the text layers on top. Returns `null` if called before {@link init},
+   * since the layer does not exist yet.
+   */
+  public createLabelScene(options?: LabelLodOptions): LabelScene | null {
+    if (!this.labelLayer) {
+      console.debug('runewood: PixiBackend.createLabelScene called before init, returning null')
+      return null
+    }
+    return new LabelScene(this.labelLayer, options)
   }
 
   public resize(width: number, height: number): void {
@@ -260,5 +291,6 @@ export class PixiBackend implements RenderBackend {
     this.edgeLayer = null
     this.nodeLayer = null
     this.beamLayer = null
+    this.labelLayer = null
   }
 }
