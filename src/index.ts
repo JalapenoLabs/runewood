@@ -11,7 +11,9 @@ export type {
   SpringParams,
   HeatOptions,
 } from './core/layout'
+export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
 
 export { applyEvent, createTree, seedTree } from './core/tree'
 export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
+export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
