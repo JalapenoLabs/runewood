@@ -10,15 +10,30 @@ import { colorForActor } from '../core/theme'
  * The signature "vis" effect: a brief tapered beam of light flung from an actor to
  * the file it just touched. This module is the pure, forward-only *visual* model
  * behind that effect. It owns a fixed pool of beams and, given spawns and a
- * playhead time, reports exactly which beams are alive, where their endpoints are,
- * how wide and bright they are right now, and what color. A backend draws each as
- * a soft additive tapered triangle (wide and bright at the actor, narrowing to the
- * file); nothing here touches pixi, the DOM, the clock, or randomness.
+ * playhead time, reports exactly which beams are alive, how wide and bright they are
+ * right now, and what color. A backend draws each as a soft additive tapered triangle
+ * (wide and bright at the actor, narrowing to the file); nothing here touches pixi,
+ * the DOM, the clock, or randomness.
  *
- * The redesign (issue: "beams are little bullets"): the old model streamed a
- * handful of dot particles along an arc, which read as a spray of bullets. Gource
- * instead flashes a brief flashlight / tractor-beam pulse: a whole soft beam that
- * appears on the event and quickly fades. So a spawn is now ONE beam, not a cloud
+ * ### Live endpoints (the "beams point at the middle and miss" fix)
+ *
+ * A beam no longer stores frozen endpoints. It stores a *reference*: the **actor** it
+ * was flung from and the **target node path** it reaches. The actual endpoints are
+ * resolved LIVE every frame the beam is drawn, via a {@link BeamEndpointResolver} the
+ * caller supplies from the live positions:
+ * - the SOURCE is the actor's live orb position (its eased, drawn position), not a
+ *   stale centroid that averages to the screen center, and
+ * - the TARGET is the node's live physics position, looked up by path each frame, so
+ *   the beam follows the node as the force sim migrates it outward instead of pointing
+ *   at where the node briefly was at spawn.
+ *
+ * A beam whose target node no longer resolves (its path was rewound / collapsed away)
+ * ends gracefully: it is simply dropped from the active set rather than drawn to a
+ * stale point. A `pulse` (path-less actor-local flash) has no node target; its target
+ * is a short, deterministic nudge off its own live source, so it reads as a quick
+ * local flicker on the orb wherever the orb currently is.
+ *
+ * The redesign (issue: "beams are little bullets"): a spawn is ONE beam, not a cloud
  * of particles. It is bright and wide at birth and thins + fades to nothing over a
  * short lifetime, then frees its slot.
  *
@@ -29,8 +44,9 @@ import { colorForActor } from '../core/theme'
  *
  * Determinism: per the issue, transient effects are not rewound. On a backward
  * seek the controller calls {@link BeamField.clear} and the active set empties;
- * replaying forward respawns them. Every value a beam reports is a pure function of
- * its spawn parameters and `now`, so no wall clock or RNG ever leaks in.
+ * replaying forward respawns them. The lifetime fade a beam reports is a pure
+ * function of its spawn time and `now`; only the endpoints come from live positions
+ * (which are themselves forward-only by design).
  */
 export class BeamField {
   /** The fixed beam pool. Slots are reused; the array length never changes. */
@@ -61,11 +77,11 @@ export class BeamField {
   }
 
   /**
-   * Spawns one beam from `source` (the actor) to `target` (the touched node), born
-   * at `at` and colored by the action blended with the actor's identity color. A
-   * {@link spawnPulse}-style spawn (no target) is expressed by passing
-   * `target: null`, which fires a short actor-local flash instead of reaching for a
-   * node.
+   * Spawns one beam from the `actor` (resolved live to its orb position) to the node
+   * at `targetPath` (resolved live to its physics position), born at `at` and colored
+   * by the action blended with the actor's identity color. A {@link spawnPulse}-style
+   * spawn (no node target) is expressed by passing `targetPath: null`, which fires a
+   * short actor-local flash instead of reaching for a node.
    *
    * Returns `1` (always one beam per spawn now), so a caller can still assert that
    * a spawn placed a beam.
@@ -79,28 +95,31 @@ export class BeamField {
 
   /**
    * Spawns an actor-local flash for a `pulse` event (activity with no file target).
-   * Modeled as a tiny beam whose target is a short hashed nudge off the actor, so a
-   * path-less event reads as a quick local flicker on the orb rather than a beam
-   * reaching anywhere. A thin convenience over {@link spawn} with `target: null`.
+   * Modeled as a tiny beam whose target is a short hashed nudge off the actor's live
+   * source, so a path-less event reads as a quick local flicker on the orb rather than
+   * a beam reaching anywhere. A thin convenience over {@link spawn} with
+   * `targetPath: null`.
    */
   spawnPulse(spawn: PulseSpawn): number {
-    return this.spawn({ ...spawn, target: null })
+    return this.spawn({ ...spawn, targetPath: null })
   }
 
   /**
-   * The beams currently alive at playhead time `now`, as fresh read-only snapshots
-   * a backend can draw. A beam is alive while `now` is within
-   * `[bornAt, bornAt + lifetimeMs)`; outside that window it is treated as a free
-   * slot and skipped. Each snapshot carries the (fixed) endpoints plus the
-   * width + alpha already faded for the moment.
+   * The beams currently alive at playhead time `now`, as fresh read-only snapshots a
+   * backend can draw. A beam is alive while `now` is within
+   * `[bornAt, bornAt + lifetimeMs)`; outside that window it is treated as a free slot
+   * and skipped. Each live beam's endpoints are resolved THIS frame through `resolve`:
+   * the source from the actor's live orb position and the target from the node's live
+   * position. A beam whose target node no longer resolves (rewound / collapsed away)
+   * is dropped so it ends gracefully rather than drawing to a stale point.
    *
-   * This neither mutates the pool nor allocates beyond the returned snapshots, so
-   * it is safe to call many times for one frame.
+   * This neither mutates the pool nor allocates beyond the returned snapshots, so it
+   * is safe to call many times for one frame.
    */
-  activeBeams(now: number): ActiveBeam[] {
+  activeBeams(now: number, resolve: BeamEndpointResolver): ActiveBeam[] {
     const active: ActiveBeam[] = []
     for (const beam of this.pool) {
-      const sample = sampleBeam(beam, now)
+      const sample = sampleBeam(beam, now, resolve, this.options)
       if (sample) {
         active.push(sample)
       }
@@ -110,11 +129,11 @@ export class BeamField {
 
   /**
    * Convenience alias matching the issue's `step(now)` naming: advancing the field
-   * is stateless (every value derives from `now`), so stepping is just reading the
-   * active set at the new time.
+   * is stateless (every value derives from `now` + the live resolver), so stepping is
+   * just reading the active set at the new time.
    */
-  step(now: number): ActiveBeam[] {
-    return this.activeBeams(now)
+  step(now: number, resolve: BeamEndpointResolver): ActiveBeam[] {
+    return this.activeBeams(now, resolve)
   }
 
   /**
@@ -164,19 +183,92 @@ export class BeamField {
 }
 
 /**
+ * Resolves a beam's live endpoints each frame. The scene/controller supplies this
+ * from the live positions it owns:
+ * - `actorSource(actor)` returns the actor's live orb (drawn, eased) position, or
+ *   `null` if the actor is no longer present.
+ * - `nodePosition(path)` returns the node's live physics position, or `null` if the
+ *   node no longer exists (rewound / collapsed away).
+ *
+ * Returning `null` from either ends the beam gracefully (it is dropped from the
+ * active set) rather than drawing it to a stale or origin point.
+ */
+export type BeamEndpointResolver = {
+  /** The actor's live orb (drawn) position, or `null` when the actor is gone. */
+  actorSource: (actor: string) => Vec2 | null
+  /** The node's live physics position, or `null` when the node no longer exists. */
+  nodePosition: (path: string) => Vec2 | null
+}
+
+/**
+ * Resolves one beam's live endpoints from a {@link BeamEndpointResolver}: the source
+ * from the actor and the target from either the node path (a real beam) or a
+ * deterministic short nudge off the live source (a pulse). Returns `null` when the
+ * source actor is gone or a real beam's target node no longer exists, so the caller
+ * drops the beam gracefully.
+ *
+ * Kept pure and exported so the live-endpoint resolution is unit-testable in
+ * isolation from the pool and the pixi scene.
+ */
+export function resolveBeamEndpoints(
+  beam: BeamEndpointReference,
+  resolve: BeamEndpointResolver,
+  pulseRadius: number,
+): { source: Vec2, target: Vec2 } | null {
+  const source = resolve.actorSource(beam.actor)
+  if (!source) {
+    // The actor's orb is gone (faded out / dropped): nothing to fling a beam from.
+    return null
+  }
+
+  if (beam.targetPath === null) {
+    // Pulse: a short flash off the live source in a stable hashed direction, so it
+    // flickers on the orb wherever the orb currently is.
+    const angle = pulseAngleFor(beam.actor, beam.action)
+    return {
+      source,
+      target: {
+        x: source.x + Math.cos(angle) * pulseRadius,
+        y: source.y + Math.sin(angle) * pulseRadius,
+      },
+    }
+  }
+
+  const target = resolve.nodePosition(beam.targetPath)
+  if (!target) {
+    // The target node was rewound / collapsed away: end the beam gracefully.
+    return null
+  }
+  return { source, target }
+}
+
+/** The reference fields a beam carries for live endpoint resolution: who, and what it reaches. */
+export type BeamEndpointReference = {
+  /** Stable actor id; the live source is the actor's orb position. */
+  actor: string
+  /** The action that fired; drives the deterministic pulse direction for a path-less beam. */
+  action: RunewoodAction
+  /** The touched node's path the beam reaches, or `null` for an actor-local pulse. */
+  targetPath: string | null
+}
+
+/**
  * One pooled beam. This is the engine's mutable slot, written on spawn and sampled
- * (never mutated) on read, so a single slot is reused across its whole life.
- * Endpoints are layout-space; `lifetimeMs` is how long it lives from `bornAt`. A
- * dead slot has `lifetimeMs === 0` so `now >= bornAt + 0` is always true and it
- * reads as free.
+ * (never mutated) on read, so a single slot is reused across its whole life. It holds
+ * the *reference* (actor + target path) the endpoints are resolved from live each
+ * frame, never frozen coordinates; `lifetimeMs` is how long it lives from `bornAt`. A
+ * dead slot has `lifetimeMs === 0` so `now >= bornAt + 0` is always true and it reads
+ * as free.
  */
 type Beam = {
   bornAt: number
   lifetimeMs: number
-  /** The actor end: wide + bright. */
-  source: Vec2
-  /** The touched-file end: the beam narrows to a point here. */
-  target: Vec2
+  /** Stable actor id; the live source is the actor's orb position. */
+  actor: string
+  /** The action that fired; tints the color and drives the pulse direction. */
+  action: RunewoodAction
+  /** The touched-file path the beam reaches, or `null` for an actor-local pulse. */
+  targetPath: string | null
   color: Hsl
   /** Peak width at the source end, in layout units, before the lifetime fade. */
   width: number
@@ -184,14 +276,14 @@ type Beam = {
 
 /**
  * A read-only snapshot of a live beam at a given time, in the plain shape a backend
- * draws: the two layout-space endpoints, the current `width` at the source end, an
- * `alpha` already faded for the moment, and the blended `color`. Returned by
- * {@link BeamField.activeBeams}.
+ * draws: the two live layout-space endpoints (resolved this frame), the current
+ * `width` at the source end, an `alpha` already faded for the moment, and the blended
+ * `color`. Returned by {@link BeamField.activeBeams}.
  */
 export type ActiveBeam = {
-  /** The actor end of the beam (wide). */
+  /** The actor end of the beam (wide), the actor's live orb position. */
   source: Vec2
-  /** The touched-file end of the beam (the taper's point). */
+  /** The touched-file end of the beam (the taper's point), the node's live position. */
   target: Vec2
   /** Presence opacity, `0..1`, fading to 0 by end of life. */
   alpha: number
@@ -200,22 +292,20 @@ export type ActiveBeam = {
   color: Hsl
 }
 
-/** A beam spawn: an actor reaching a file, or (with `target: null`) a local pulse flash. */
+/** A beam spawn: an actor reaching a file by path, or (with `targetPath: null`) a local pulse flash. */
 export type BeamSpawn = {
   /** Event time in epoch ms; the beam is born here. */
   at: number
-  /** Stable actor id; drives the actor color and the per-pulse hash. */
+  /** Stable actor id; drives the actor color, the live source, and the pulse hash. */
   actor: string
   /** The action that fired, which tints the beam toward an action color. */
   action: RunewoodAction
-  /** Layout-space actor position the beam starts from. */
-  source: Vec2
-  /** Layout-space touched-node position the beam reaches, or `null` for a pulse. */
-  target: Vec2 | null
+  /** The touched-node path the beam reaches (resolved live), or `null` for a pulse. */
+  targetPath: string | null
 }
 
-/** A pulse spawn: actor-local activity with no file target. {@link BeamSpawn.target} is implied `null`. */
-export type PulseSpawn = Omit<BeamSpawn, 'target'>
+/** A pulse spawn: actor-local activity with no file target. {@link BeamSpawn.targetPath} is implied `null`. */
+export type PulseSpawn = Omit<BeamSpawn, 'targetPath'>
 
 /** Construction tuning for a {@link BeamField}. Every field has a default. */
 export type BeamFieldOptions = {
@@ -304,8 +394,9 @@ function makeDeadBeam(): Beam {
   return {
     bornAt: 0,
     lifetimeMs: 0,
-    source: { x: 0, y: 0 },
-    target: { x: 0, y: 0 },
+    actor: '',
+    action: 'pulse',
+    targetPath: null,
     color: { h: 0, s: 0, l: 0 },
     width: 0,
   }
@@ -317,42 +408,43 @@ function killBeam(beam: Beam): void {
 }
 
 /**
- * Writes a freshly spawned beam into a pooled slot in place. A real beam runs from
- * the actor to the touched node. A pulse (`target === null`) has no node to reach,
- * so its target is a short, deterministic nudge off the actor (hashed from the
- * actor id, never randomness) and it draws as a tiny actor-local flash.
+ * Writes a freshly spawned beam into a pooled slot in place. The slot stores the
+ * *reference* (actor + target path) the live resolver reads each frame, never frozen
+ * coordinates: a real beam reaches `spawn.targetPath`; a pulse (`targetPath === null`)
+ * has no node and flashes a short nudge off its own live source at draw time.
  */
 function writeBeam(beam: Beam, spawn: BeamSpawn, color: Hsl, options: ResolvedBeamOptions): void {
   beam.bornAt = spawn.at
   beam.lifetimeMs = options.lifetimeMs
-  beam.source = { x: spawn.source.x, y: spawn.source.y }
+  beam.actor = spawn.actor
+  beam.action = spawn.action
+  beam.targetPath = spawn.targetPath
   beam.color = color
   beam.width = options.beamWidth
-
-  if (spawn.target === null) {
-    // Pulse: a short flash off the actor in a stable hashed direction.
-    const hash = hashString(`${spawn.actor}|${spawn.action}|pulse`)
-    const angle = ((hash & 0xffff) / 0xffff) * Math.PI * 2
-    beam.target = {
-      x: spawn.source.x + Math.cos(angle) * options.pulseRadius,
-      y: spawn.source.y + Math.sin(angle) * options.pulseRadius,
-    }
-    return
-  }
-
-  beam.target = { x: spawn.target.x, y: spawn.target.y }
 }
 
 /**
- * Samples one pool slot at `now`, returning a drawable snapshot if it is alive or
- * `null` if it is a free/expired slot. The endpoints are fixed for the beam's life
- * (a flashlight does not travel; it just flashes and fades). The width and alpha
- * both fall to nothing by end of life: the beam is wide and bright at birth and
- * thins + fades to a point as it dies.
+ * Samples one pool slot at `now`, resolving its live endpoints, and returning a
+ * drawable snapshot if it is alive and its endpoints resolve, or `null` if it is a
+ * free/expired slot OR its endpoints no longer resolve (the actor faded out, or the
+ * target node was rewound away). The width and alpha both fall to nothing by end of
+ * life: the beam is wide and bright at birth and thins + fades to a point as it dies,
+ * while its endpoints track the live actor orb and node every frame.
  */
-function sampleBeam(beam: Beam, now: number): ActiveBeam | null {
+function sampleBeam(
+  beam: Beam,
+  now: number,
+  resolve: BeamEndpointResolver,
+  options: ResolvedBeamOptions,
+): ActiveBeam | null {
   const elapsed = now - beam.bornAt
   if (elapsed < 0 || elapsed >= beam.lifetimeMs) {
+    return null
+  }
+
+  const endpoints = resolveBeamEndpoints(beam, resolve, options.pulseRadius)
+  if (!endpoints) {
+    // The actor or target node is gone this frame: end the beam gracefully.
     return null
   }
 
@@ -362,12 +454,22 @@ function sampleBeam(beam: Beam, now: number): ActiveBeam | null {
   const fade = 1 - life
 
   return {
-    source: beam.source,
-    target: beam.target,
+    source: endpoints.source,
+    target: endpoints.target,
     alpha: fade,
     width: beam.width * fade,
     color: beam.color,
   }
+}
+
+/**
+ * The deterministic flash direction for a pulse, in radians: a stable hashed angle
+ * off the actor + action, so a path-less event always flickers the same way on the
+ * orb (never randomly), wherever the orb currently is.
+ */
+function pulseAngleFor(actor: string, action: RunewoodAction): number {
+  const hash = hashString(`${actor}|${action}|pulse`)
+  return ((hash & 0xffff) / 0xffff) * Math.PI * 2
 }
 
 /**

@@ -773,7 +773,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     scene.update(frameState.tree, bodies, now, theme, zoom, visibleByPath, highlights, highlightClockMs)
 
     const activities = buildActorActivities()
-    beamScene.update(activities, now, theme, zoom)
+    // The beams resolve their endpoints live every frame: the source from the firing
+    // actor's orb (held inside the beam scene) and the target from the node's live
+    // physics position, looked up by path here so a beam follows the node as the sim
+    // migrates it. A path with no body (rewound / collapsed away, or not yet spawned)
+    // returns null, ending that beam gracefully. The orb glide + opacity ramp is driven
+    // by the real frame `deltaMs`, like the node sim's step.
+    const nodePosition = (path: string): Vec2 | null => bodies.get(path)?.position ?? null
+    beamScene.update(activities, now, deltaMs, nodePosition, theme, zoom)
 
     // Labels can be suppressed wholesale; when off, the scene gets an empty
     // candidate set so it tears its retained text down rather than holding stale.
@@ -797,39 +804,30 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     wasAtLiveEdge = atLiveEdge
   }
 
-  /** Spawns the reducer's beams / pulses, resolving each path to its live spring position. */
+  /**
+   * Spawns the reducer's beams / pulses as LIVE references, not frozen coordinates:
+   * a beam carries its target node's path (the beam scene resolves both endpoints
+   * live every frame, the source from the firing actor's orb and the target from the
+   * node's live position), and a pulse carries just its actor. The old centroid source
+   * and spawn-time target position are gone (they were the "beam points at the middle /
+   * misses the node" bug): the centroid averaged to the screen center, and the frozen
+   * target pointed at where a freshly-spawned node briefly was before it migrated out.
+   *
+   * A beam is spawned even if its target node has no physics body yet (it was added
+   * this same frame): the live resolver simply draws nothing until the body appears,
+   * rather than the beam pointing at the origin, and the file still lights up via its
+   * node flash in the meantime.
+   */
   function spawnEffects(beams: BeamSpawnRequest[], pulses: PulseSpawnRequest[]): void {
     if (!beamScene) {
       return
     }
     for (const beam of beams) {
-      const target = bodies.get(beam.path)
-      if (!target) {
-        // The node has no physics body yet (it is added this same frame); skip the
-        // beam rather than point it at the origin. It is a single transient effect;
-        // the file still lights up via its node flash.
-        continue
-      }
-      const source = actorSourceFor(beam.actor)
-      beamScene.spawn({ at: beam.at, actor: beam.actor, action: beam.action, source, target: target.position })
+      beamScene.spawn({ at: beam.at, actor: beam.actor, action: beam.action, targetPath: beam.path })
     }
     for (const pulse of pulses) {
-      const source = actorSourceFor(pulse.actor)
-      beamScene.spawnPulse({ at: pulse.at, actor: pulse.actor, action: pulse.action, source })
+      beamScene.spawnPulse({ at: pulse.at, actor: pulse.actor, action: pulse.action })
     }
-  }
-
-  /**
-   * Where an actor's beams originate: the centroid of the files it is currently
-   * touching (its orb position), so a beam visibly flies from the actor to the
-   * file. Falls back to the origin for an actor with no tracked files yet.
-   */
-  function actorSourceFor(actor: string): Vec2 {
-    const track = frameState.actors.get(actor)
-    if (!track || track.touchedPaths.length === 0) {
-      return { x: 0, y: 0 }
-    }
-    return centroidOfPaths(track.touchedPaths)
   }
 
   /** Mean of the live physics positions of a set of paths; the origin if none are tracked yet. */

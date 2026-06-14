@@ -1,9 +1,11 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { Container } from 'pixi.js'
+import type { Vec2 } from '../core/layout'
 import type { RunewoodTheme } from '../core/theme'
-import type { BeamFieldOptions, ActiveBeam } from './beams'
+import type { BeamFieldOptions, ActiveBeam, BeamEndpointResolver } from './beams'
 import type { ActorActivity, ActorVisualOptions } from './actors'
+import type { ActorMotionOptions } from './actorMotion'
 
 // Core
 import { Graphics } from 'pixi.js'
@@ -11,6 +13,7 @@ import { Graphics } from 'pixi.js'
 import { hslToRgbInt } from './color'
 import { BeamField } from './beams'
 import { actorVisualFor } from './actors'
+import { ActorMotion } from './actorMotion'
 
 /**
  * The retained beam/particle layer that sits *above* the forest (issue #6, and as
@@ -19,39 +22,61 @@ import { actorVisualFor } from './actors'
  * persistent pixi {@link Graphics} parented into a single world container the
  * backend hands it, redraws them in place every frame, and is the only place
  * besides the backend allowed to know about pixi. The pure simulation
- * ({@link BeamField}) and the pure actor model ({@link actorVisualFor}) decide
- * *what* to draw; this class only translates that onto pixi objects.
+ * ({@link BeamField}), the pure actor placement model ({@link actorVisualFor}), and
+ * the pure actor motion model ({@link ActorMotion}) decide *what* to draw; this class
+ * only translates that onto pixi objects.
  *
  * Two kinds of thing live here, both additively blended for a glow that reads
  * above the forest:
  * - **beams**: the brief tapered flashlight pulses flung from actors to touched
  *   files, drawn from the {@link BeamField}'s active set into one pooled `Graphics`
- *   cleared and refilled each frame (the live beam count is volatile, so one
- *   batched graphic beats one persistent object per beam). Each is a *stack* of
- *   additive tapered triangles (see {@link BEAM_GLOW_LAYERS}): a bright thin core
- *   over a couple of wider, dimmer layers, so the beam reads as a soft glow of light
- *   rather than a hard-edged wedge. Wide and bright at the actor, narrowing to the
- *   file, fading over its short lifetime.
+ *   cleared and refilled each frame. Each beam's endpoints are resolved LIVE every
+ *   frame (see below): its source is the firing actor's live eased orb position and
+ *   its target is the touched node's live physics position, so the beam flies from the
+ *   contributor's orb to the actual file node and tracks it as the sim migrates it.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
- *   when an actor first appears and culled once it has fully faded out.
+ *   when an actor first appears and culled once it has fully faded out. The orb does
+ *   not snap to its computed placement; it **swoops in** from the open space and
+ *   **glides** to rest there via a retained {@link ActorMotion} (the Gource-style
+ *   arrival), then stays put until it acts again.
+ *
+ * ### Actor motion (the "actors teleport and freeze" fix)
+ *
+ * The placement model ({@link actorVisualFor}) gives each actor the *target* it wants
+ * to rest at (the outward recency anchor) plus its presence (lingering fade + idle
+ * breath). Rather than snapping the orb there every frame, each actor carries an
+ * {@link ActorMotion} that eases its drawn position toward that target with an
+ * ease-out and ramps its opacity in on appearance. So an orb fades in fast, glides
+ * inward from the open space, comes gently to rest, and then holds (the idle breath
+ * still plays on top). The motion is driven by the real frame delta, like the
+ * force-directed node sim it rides above.
  *
  * The controller (#9) owns the playhead and the active event window; it spawns
- * beams via {@link spawn}/{@link spawnPulse}, supplies actor activity each frame,
- * and calls {@link clear} on a backward seek so transient particles are dropped
- * rather than reversed.
+ * beams via {@link spawn}/{@link spawnPulse}, supplies actor activity + the live node
+ * position lookup + the frame delta each frame, and calls {@link clear} on a backward
+ * seek so transient particles are dropped rather than reversed.
  */
 export class BeamScene {
   /** The world container all beam/actor glow is parented into, above the forest. */
   private readonly layer: Container
   /** The pure particle simulation. This class never re-implements its math. */
   private readonly field: BeamField
-  /** Tuning for the actor visual model, forwarded verbatim each frame. */
+  /** Tuning for the actor placement model, forwarded verbatim each frame. */
   private readonly actorOptions: ActorVisualOptions
+  /** Tuning for the actor motion (glide + opacity ramp + swoop), forwarded to each {@link ActorMotion}. */
+  private readonly motionOptions: ActorMotionOptions
 
   /** One batched graphic holding every live beam this frame, cleared and refilled. */
   private readonly beamGraphics: Graphics
   /** Retained actor orb graphics, keyed by actor id. */
   private readonly actorGraphics: Map<string, Graphics>
+  /**
+   * Retained per-actor motion state (the eased drawn position + opacity ramp), keyed
+   * by actor id. Holds the orb's live position so a beam fired by this actor can
+   * resolve its source from where the orb actually is, and so the orb glides rather
+   * than teleporting. Culled in lockstep with {@link actorGraphics}.
+   */
+  private readonly actorMotion: Map<string, ActorMotion>
 
   /**
    * @param layer the world container for beams/actors, added above the forest
@@ -61,6 +86,7 @@ export class BeamScene {
     this.layer = layer
     this.field = new BeamField(options.beams)
     this.actorOptions = options.actors ?? {}
+    this.motionOptions = options.motion ?? {}
 
     this.beamGraphics = new Graphics()
     // Additive blend so overlapping beams build toward white, the way real bloom
@@ -69,9 +95,10 @@ export class BeamScene {
     this.layer.addChild(this.beamGraphics)
 
     this.actorGraphics = new Map()
+    this.actorMotion = new Map()
   }
 
-  /** Spawns a beam from an actor to a touched file. See {@link BeamField.spawn}. */
+  /** Spawns a beam from an actor to a touched file (by path; resolved live). See {@link BeamField.spawn}. */
   public spawn(spawn: Parameters<BeamField['spawn']>[0]): void {
     this.field.spawn(spawn)
   }
@@ -86,17 +113,46 @@ export class BeamScene {
    * frame between the backend's `beginFrame` and `endFrame`, after the forest
    * scene's own update so the beams layer on top.
    *
-   * Beams are drawn into a single cleared graphic (their count swings every frame,
-   * so one batched object is cheaper than churning a graphic per beam). Actors are
-   * retained per id and culled once fully faded.
+   * Actors are advanced FIRST so their orbs have a current drawn position this frame,
+   * then the beams are drawn resolving each source from that live orb position and
+   * each target from the live `nodePosition` lookup. Beams are drawn into a single
+   * cleared graphic (their count swings every frame, so one batched object is cheaper
+   * than churning a graphic per beam). Actors are retained per id and culled once
+   * fully faded.
    *
-   * @param zoom the live camera zoom (world-units-to-pixels), used to floor the
-   *   actor orb radius at a constant on-screen size so an actor never shrinks to an
+   * @param activities the actor activity this frame (drives each orb's target + presence).
+   * @param now the playhead time, for the pure placement/presence model.
+   * @param deltaMs the real elapsed wall time for the frame, driving the orb glide +
+   *   opacity ramp (forward-only motion), like the node sim's step.
+   * @param nodePosition the live node position lookup by path, so a beam's target
+   *   follows the node as the force sim migrates it; returns `null` for a node that no
+   *   longer exists (the beam then ends gracefully).
+   * @param theme the active theme (bloom intensity).
+   * @param zoom the live camera zoom (world-units-to-pixels), used to floor the actor
+   *   orb radius at a constant on-screen size so an actor never shrinks to an
    *   unreadable dot as the forest grows and the camera pulls out.
    */
-  public update(activities: ActorActivity[], now: number, theme: RunewoodTheme, zoom: number): void {
-    this.drawBeams(this.field.activeBeams(now), theme)
-    this.drawActors(activities, now, theme, zoom)
+  public update(
+    activities: ActorActivity[],
+    now: number,
+    deltaMs: number,
+    nodePosition: (path: string) => Vec2 | null,
+    theme: RunewoodTheme,
+    zoom: number,
+  ): void {
+    // Advance + draw the actor orbs first so their live drawn positions exist for the
+    // beams to fire from this same frame.
+    this.drawActors(activities, now, deltaMs, theme, zoom)
+
+    // Resolve each beam's source from the actor's live orb position and its target
+    // from the live node lookup, so beams fly from the orb to the actual node and
+    // track it. An actor with no live orb (faded out) or a missing target node ends
+    // the beam gracefully (the resolver returns null and the field drops it).
+    const resolver: BeamEndpointResolver = {
+      actorSource: (actor) => this.actorMotion.get(actor)?.drawnPosition ?? null,
+      nodePosition,
+    }
+    this.drawBeams(this.field.activeBeams(now, resolver), theme)
   }
 
   /**
@@ -166,12 +222,24 @@ export class BeamScene {
   }
 
   /**
-   * Reconciles the retained actor orbs with the supplied activity: redraws each
-   * actor's orb at its modeled position/alpha, and culls any retained actor no
-   * longer present in `activities` or fully faded so the layer never keeps a dead
-   * orb around.
+   * Reconciles the retained actor orbs with the supplied activity: glides each orb
+   * toward its modeled target (rather than snapping it there), draws it at its eased
+   * position and ramped-in opacity, and culls any retained actor no longer present in
+   * `activities` or fully faded so the layer never keeps a dead orb around.
+   *
+   * The placement model gives the orb its *target* (the outward recency anchor) and
+   * presence (lingering fade + idle breath); the retained {@link ActorMotion} eases
+   * the drawn position toward that target and ramps opacity in on appearance, so the
+   * orb swoops in and glides to rest rather than teleporting. A reappearing actor
+   * (its motion was culled when it fully faded) starts a fresh swoop.
    */
-  private drawActors(activities: ActorActivity[], now: number, theme: RunewoodTheme, zoom: number): void {
+  private drawActors(
+    activities: ActorActivity[],
+    now: number,
+    deltaMs: number,
+    theme: RunewoodTheme,
+    zoom: number,
+  ): void {
     const present = new Set<string>()
 
     // Floor the orb radius at a constant on-screen size. Orbs are drawn in world
@@ -188,11 +256,28 @@ export class BeamScene {
     for (const activity of activities) {
       const visual = actorVisualFor(activity, now, this.actorOptions)
       if (visual.alpha <= 0) {
-        // Fully faded: cull it rather than draw an invisible orb.
+        // Fully faded: cull it (and its motion) rather than draw an invisible orb. A
+        // later reappearance starts a fresh swoop from the open space.
         this.removeActor(activity.actor)
         continue
       }
       present.add(activity.actor)
+
+      // The target the orb wants to rest at this frame (the placement model's outward
+      // recency position). The retained motion eases the drawn position toward it.
+      const target = visual.position
+      let motion = this.actorMotion.get(activity.actor)
+      if (!motion) {
+        // First appearance (or a reappearance after a full fade): start OUT in the
+        // open space and swoop in.
+        motion = new ActorMotion(target, this.motionOptions)
+        this.actorMotion.set(activity.actor, motion)
+      }
+      // Glide the drawn position toward the target and ramp opacity in. The ramp
+      // multiplies the modeled presence so the orb fades in as it swoops, then rides
+      // the model's lingering fade + idle breath once arrived.
+      const rampAlpha = motion.advance(target, deltaMs)
+      const drawn = motion.drawnPosition
 
       let graphics = this.actorGraphics.get(activity.actor)
       if (!graphics) {
@@ -207,8 +292,8 @@ export class BeamScene {
       graphics.clear()
       graphics
         .circle(0, 0, radius)
-        .fill({ color, alpha: visual.alpha * theme.bloomIntensity })
-      graphics.position.set(visual.position.x, visual.position.y)
+        .fill({ color, alpha: visual.alpha * rampAlpha * theme.bloomIntensity })
+      graphics.position.set(drawn.x, drawn.y)
     }
 
     // Cull retained actors the controller no longer reports at all (their window
@@ -220,13 +305,16 @@ export class BeamScene {
     }
   }
 
-  /** Tears down one actor's retained orb graphic. */
+  /** Tears down one actor's retained orb graphic and its motion state. */
   private removeActor(actor: string): void {
     const graphics = this.actorGraphics.get(actor)
     if (graphics) {
       graphics.destroy()
       this.actorGraphics.delete(actor)
     }
+    // Drop the motion too so a reappearance swoops in fresh rather than resuming from
+    // a stale drawn position.
+    this.actorMotion.delete(actor)
   }
 }
 
@@ -257,4 +345,6 @@ const BEAM_GLOW_LAYERS = [
 export type BeamSceneOptions = {
   beams?: BeamFieldOptions
   actors?: ActorVisualOptions
+  /** Tuning for the actor swoop-in / glide / ease-to-rest motion. See {@link ActorMotionOptions}. */
+  motion?: ActorMotionOptions
 }
