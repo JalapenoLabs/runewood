@@ -938,17 +938,20 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
 
     for (const activity of activities) {
-      // The actor label rides on the same anchor and presence as the orb: the
-      // centroid of its touched files (or its parked last-centroid while quiet),
-      // and exactly the orb's fade alpha so the two appear and vanish together.
-      const anchor = activity.touched.length > 0
-        ? meanOf(activity.touched)
-        : activity.lastCentroid ?? { x: 0, y: 0 }
+      // The actor label rides EXACTLY on its orb: anchor it on the orb's live eased
+      // drawn position (read straight off the beam scene's retained motion, the same
+      // position the orb is drawn at this frame), so the label sits on the orb instead
+      // of drifting off to the touched-files centroid the orb has glided away from.
+      // Before the orb has a live motion (its very first frame, or while fully faded)
+      // fall back to the placement model's target so the label still has a sensible
+      // anchor for that one frame.
+      const orbPosition = beamScene?.actorOrbPosition(activity.actor)
+        ?? actorVisualFor(activity, now, actorVisualOptions).position
       candidates.push({
         kind: 'actor',
         id: activity.actor,
         text: activity.actor,
-        position: anchor,
+        position: orbPosition,
         // Drive the label's presence from the very same actor visual model the orb
         // uses (lingering fade + idle breath), so the label lingers and breathes in
         // exact lockstep with its orb rather than fading on its own short timer.
@@ -957,20 +960,6 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
 
     return candidates
-  }
-
-  /** Mean of a list of already-resolved positions; the origin when empty. */
-  function meanOf(positions: Vec2[]): Vec2 {
-    if (positions.length === 0) {
-      return { x: 0, y: 0 }
-    }
-    let sumX = 0
-    let sumY = 0
-    for (const position of positions) {
-      sumX += position.x
-      sumY += position.y
-    }
-    return { x: sumX / positions.length, y: sumY / positions.length }
   }
 
   /**

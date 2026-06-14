@@ -27,10 +27,9 @@ describe('actorVisualFor', () => {
 
       // The raw centroid of the three points.
       const expectedCentroid = { x: 50, y: 50 }
-      // With no drift and no outward margin, the actor sits exactly on the centroid
-      // (the cluster's own outer radius still pushes it out, but along the centroid's
-      // ray; here we assert the anchor by disabling the margin and reading the angle).
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 0 })
+      // With no drift and no outward offset, the actor sits exactly on the centroid;
+      // here we assert the anchor direction by reading the angle.
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
 
       // Anchor angle is the centroid's angle from the origin.
       const expectedAngle = Math.atan2(expectedCentroid.y, expectedCentroid.x)
@@ -46,7 +45,7 @@ describe('actorVisualFor', () => {
       const recent = { x: 300, y: 0 }
       const spread = makeActivity({ actor: 'agent-1', touched, recent })
 
-      const visual = actorVisualFor(spread, 1000, { drift: 0, outwardMargin: 0 })
+      const visual = actorVisualFor(spread, 1000, { drift: 0, outwardOffset: 0 })
 
       // The centroid of the four points is the origin, so the old behavior would put
       // the actor at the center. Anchoring on the recent file pushes it out to the
@@ -60,20 +59,20 @@ describe('actorVisualFor', () => {
       const recent = { x: 400, y: 0 }
       const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
 
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 30 })
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 30 })
 
       const distanceFromOrigin = Math.hypot(visual.position.x, visual.position.y)
       const distanceFromRecentFile = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
 
       // Far from the origin (out where the work is)...
       expect(distanceFromOrigin).toBeGreaterThan(400)
-      // ...and near its recent file (just the small outward margin past it).
+      // ...and right next to its recent file (just the short fixed offset past it).
       expect(distanceFromRecentFile).toBeCloseTo(30, 5)
     })
 
     it('holds at the last centroid when the actor is touching nothing', () => {
       const quiet = makeActivity({ touched: [], recent: undefined, lastCentroid: { x: 200, y: 90 }})
-      const visual = actorVisualFor(quiet, 1000, { drift: 0, outwardMargin: 0 })
+      const visual = actorVisualFor(quiet, 1000, { drift: 0, outwardOffset: 0 })
 
       // No touched cluster, so the push reduces to the anchor (the parked centroid).
       expect(visual.position.x).toBeCloseTo(200, 5)
@@ -96,48 +95,71 @@ describe('actorVisualFor', () => {
     })
   })
 
-  describe('actor floats outward past its work, scaled to the tree', () => {
-    it('sits strictly farther from the origin than its recent file', () => {
-      // The Gource-style placement: a contributor orbits the outside near its work,
-      // not the dense middle. The orb must land beyond the file it is editing.
+  describe('actor floats a SHORT fixed offset just outside its file (hugs its work)', () => {
+    it('sits a short fixed distance past its recent file, with a short beam between', () => {
+      // The Gource-style placement: a contributor hugs the file it is editing with a
+      // short beam, not flung to the periphery. The orb lands exactly `offset` past the
+      // file along the file's outward ray, so the orb-to-file gap IS that short offset.
       const recent = { x: 320, y: 40 }
       const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      // Disable drift so the only displacement off the anchor is the outward push.
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 90 })
+      // Disable drift so the only displacement off the anchor is the outward offset.
+      const offset = 60
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: offset })
 
       const recentDistance = Math.hypot(recent.x, recent.y)
       const actorDistance = Math.hypot(visual.position.x, visual.position.y)
+      const orbToFile = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
 
+      // Strictly farther out than the file (it stepped outward)...
       expect(actorDistance).toBeGreaterThan(recentDistance)
-      // It floats exactly the margin past the cluster's outer radius (the recent
-      // file is the only file, so that radius is the recent file's own radius).
-      expect(actorDistance).toBeCloseTo(recentDistance + 90, 5)
+      // ...by exactly the short fixed offset, so the beam is short.
+      expect(actorDistance).toBeCloseTo(recentDistance + offset, 5)
+      expect(orbToFile).toBeCloseTo(offset, 5)
     })
 
-    it('scales the push to the tree: a larger cluster pushes the actor farther out', () => {
-      // The fix for "actors buried in a large tree": the push clears the whole
-      // touched cluster, so as the tree grows the orb floats correspondingly farther
-      // out, not stranded at a tiny fixed offset.
-      const recent = { x: 100, y: 0 }
-      // Same anchor and margin; only the cluster's outer radius differs.
-      const small = makeActivity({ actor: 'agent-1', touched: [ recent, { x: 150, y: 0 }], recent })
-      const large = makeActivity({ actor: 'agent-1', touched: [ recent, { x: 900, y: 0 }], recent })
+    it('does NOT scale to the tree: the orb-to-file beam stays short however far out the work is', () => {
+      // The bug it fixes: the old tree-scaled push flung the orb to the periphery (a
+      // huge beam) when the file sat far from center. A fixed offset keeps the orb a
+      // constant short step off its file at any distance from the origin.
+      const offset = 60
+      const nearCenter = { x: 80, y: 0 }
+      const farOut = { x: 4_000, y: 0 }
+      const near = makeActivity({ actor: 'agent-1', touched: [ nearCenter ], recent: nearCenter })
+      const far = makeActivity({ actor: 'agent-1', touched: [ farOut ], recent: farOut })
 
-      const smallVisual = actorVisualFor(small, 1000, { drift: 0, outwardMargin: 40 })
-      const largeVisual = actorVisualFor(large, 1000, { drift: 0, outwardMargin: 40 })
+      const nearVisual = actorVisualFor(near, 1000, { drift: 0, outwardOffset: offset })
+      const farVisual = actorVisualFor(far, 1000, { drift: 0, outwardOffset: offset })
 
-      const smallDistance = Math.hypot(smallVisual.position.x, smallVisual.position.y)
-      const largeDistance = Math.hypot(largeVisual.position.x, largeVisual.position.y)
-      // The bigger cluster floats the actor much farther out, past its farthest file.
-      expect(largeDistance).toBeGreaterThan(smallDistance + 700)
+      const nearBeam = Math.hypot(nearVisual.position.x - nearCenter.x, nearVisual.position.y - nearCenter.y)
+      const farBeam = Math.hypot(farVisual.position.x - farOut.x, farVisual.position.y - farOut.y)
+
+      // Both beams are the same short length regardless of how far the file is from center.
+      expect(nearBeam).toBeCloseTo(offset, 5)
+      expect(farBeam).toBeCloseTo(offset, 5)
     })
 
-    it('pushes farther out for a larger margin', () => {
+    it('keeps the orb-to-file distance bounded and small (never flung to a huge global radius)', () => {
+      // A spread-out cluster used to throw the orb out past its FARTHEST file (a long
+      // beam). Now the orb hugs its RECENT file by the short offset no matter the spread.
+      const recent = { x: 200, y: 0 }
+      const spreadCluster = [ recent, { x: 1_500, y: 0 }, { x: 0, y: 1_500 }, { x: -1_500, y: 0 }]
+      const activity = makeActivity({ actor: 'agent-1', touched: spreadCluster, recent })
+      const offset = 60
+
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: offset })
+
+      const orbToRecent = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
+      // The orb sits just outside its recent file, NOT pushed out past the 1500-unit
+      // farthest file. The beam is short, a small multiple of the offset, never huge.
+      expect(orbToRecent).toBeLessThan(offset * 2)
+    })
+
+    it('steps farther out for a larger offset', () => {
       const recent = { x: 200, y: 200 }
       const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
 
-      const near = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 40 })
-      const far = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 160 })
+      const near = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 40 })
+      const far = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 160 })
 
       const nearDistance = Math.hypot(near.position.x, near.position.y)
       const farDistance = Math.hypot(far.position.x, far.position.y)
@@ -145,11 +167,11 @@ describe('actorVisualFor', () => {
     })
 
     it('keeps the actor on the same outward ray as its anchor', () => {
-      // The push is purely radial, so the actor's direction from the origin matches
-      // its anchor's direction (it just sits farther along the same line).
+      // The offset is purely radial, so the actor's direction from the origin matches
+      // its anchor's direction (it just sits a short step farther along the same line).
       const recent = { x: 100, y: 50 }
       const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 70 })
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 70 })
 
       const anchorAngle = Math.atan2(50, 100)
       const actorAngle = Math.atan2(visual.position.y, visual.position.x)
@@ -158,23 +180,23 @@ describe('actorVisualFor', () => {
 
     it('still escapes the origin when the anchor is dead-center', () => {
       // A contributor whose anchor is the tree center has no outward ray; it must not
-      // stay pinned at the origin. The hashed fallback direction pushes it out by the
-      // full margin deterministically.
+      // stay pinned at the origin. The hashed fallback direction steps it out by the
+      // short offset deterministically.
       const activity = makeActivity({ actor: 'agent-1', touched: [{ x: 0, y: 0 }], recent: { x: 0, y: 0 }})
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 90 })
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 90 })
 
       const distance = Math.hypot(visual.position.x, visual.position.y)
       expect(distance).toBeCloseTo(90, 5)
     })
 
-    it('respects a custom origin the actor is pushed away from', () => {
-      // The push is measured from the supplied origin, not a hardcoded (0,0).
+    it('respects a custom origin the actor steps away from', () => {
+      // The outward direction is measured from the supplied origin, not a hardcoded (0,0).
       const origin = { x: 500, y: 500 }
       const recent = { x: 600, y: 500 }
       const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardMargin: 50, origin })
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 50, origin })
 
-      // The recent file is 100 to the right of the origin; pushing 50 further out
+      // The recent file is 100 to the right of the origin; stepping 50 further out
       // lands 150 to the right of the origin along the same ray.
       expect(visual.position.x).toBeCloseTo(650, 5)
       expect(visual.position.y).toBeCloseTo(500, 5)
@@ -257,15 +279,15 @@ describe('actorVisualFor', () => {
       }
     })
 
-    it('parks at its last centroid while lingering quiet, pushed just outside it', () => {
+    it('parks at its last centroid while lingering quiet, stepped just outside it', () => {
       // After the recency window clears the touched files, a lingering actor falls
-      // back to its parked last-centroid (still pushed outward by the margin), so it
-      // stays floating outside its last work rather than snapping to the origin.
+      // back to its parked last-centroid (still stepped outward by the short offset), so
+      // it stays floating just outside its last work rather than snapping to the origin.
       const quiet = makeActivity({ touched: [], recent: undefined, lastCentroid: { x: 300, y: 0 }})
-      const visual = actorVisualFor(quiet, 1_000, { drift: 0, outwardMargin: 40, lingerMs: 60_000 })
+      const visual = actorVisualFor(quiet, 1_000, { drift: 0, outwardOffset: 40, lingerMs: 60_000 })
 
       const distanceFromOrigin = Math.hypot(visual.position.x, visual.position.y)
-      // Parked outside its last centroid: the centroid radius (300) plus the margin.
+      // Parked just outside its last centroid: the centroid radius (300) plus the offset.
       expect(distanceFromOrigin).toBeCloseTo(340, 5)
     })
   })

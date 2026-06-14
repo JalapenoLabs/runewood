@@ -98,6 +98,18 @@ export class BeamScene {
     this.actorMotion = new Map()
   }
 
+  /**
+   * The live, eased drawn position of an actor's orb this frame, or `null` if the actor
+   * has no live orb (it has not appeared yet or has fully faded). This is the EXACT
+   * position the orb is drawn at, read straight off the same retained {@link ActorMotion}
+   * the draw uses, so a caller anchoring the actor's label here lands it precisely on the
+   * orb rather than on the touched-files centroid (which the orb glides away from). It is
+   * valid only after {@link update} has advanced the motion this frame.
+   */
+  public actorOrbPosition(actor: string): Vec2 | null {
+    return this.actorMotion.get(actor)?.drawnPosition ?? null
+  }
+
   /** Spawns a beam from an actor to a touched file (by path; resolved live). See {@link BeamField.spawn}. */
   public spawn(spawn: Parameters<BeamField['spawn']>[0]): void {
     this.field.spawn(spawn)

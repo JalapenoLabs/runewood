@@ -328,7 +328,11 @@ const DEFAULT_CAPACITY = 512
 // ~0.8s lands in the user's requested 0.6-1s window: a brief flashlight pulse that
 // is gone quickly, not a lingering stream.
 const DEFAULT_LIFETIME_MS = 800
-const DEFAULT_BEAM_WIDTH = 14
+// Now that actors rest just outside their files, a beam is SHORT (orb to adjacent
+// file). The old wider 14 read as a fat wedge over that short span (and the additive
+// glow layers widen it further still), so the source-end width is trimmed to a slimmer
+// value that reads as a crisp light pulse narrowing onto the file rather than a bar.
+const DEFAULT_BEAM_WIDTH = 8
 const DEFAULT_PULSE_RADIUS = 26
 const DEFAULT_ACTION_TINT = 0.5
 

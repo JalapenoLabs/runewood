@@ -91,10 +91,12 @@ const DEFAULT_RAMP_MS = 250
 
 /**
  * Default swoop distance, in layout units: how far beyond its target an orb starts so
- * it flies inward from the open space. Comfortably larger than a node's spacing so
- * the inward glide reads clearly, a judgment call worth tuning to taste.
+ * it flies inward from the open space. Kept short now that actors rest just outside
+ * their files (a short beam, not the far periphery): the orb glides in from a little
+ * past its resting place, a brief Gource-style swoop rather than a flight across the
+ * whole canvas. A judgment call worth tuning to taste.
  */
-const DEFAULT_SWOOP_DISTANCE = 220
+const DEFAULT_SWOOP_DISTANCE = 70
 
 /**
  * Eases the drawn position one frame toward `target` with an ease-out, returning the

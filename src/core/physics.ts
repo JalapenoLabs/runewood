@@ -15,9 +15,14 @@ import type { VisibleNode } from './collapse'
  * Forces (see {@link ForceLayout.step}):
  * - **Edge spring:** each node is pulled toward its display-parent to a rest length,
  *   so children hang off their parent and the tree skeleton holds together.
- * - **Repulsion:** sibling nodes (those sharing a display-parent) push each other
- *   apart so a fan of children spreads instead of stacking. This is deliberately
- *   LOCAL, not a naive all-pairs pass; see the complexity note below.
+ * - **Repulsion:** *every* node pushes apart from every *nearby* node, regardless of
+ *   parentage, so different branches separate and the tree stops crossing over itself.
+ *   This is the fix for the tangled forest: when repulsion was sibling-local only,
+ *   two children of different parents had nothing keeping them apart and their
+ *   sub-trees overlapped. Now the repulsion is global-but-local-in-space (see the
+ *   complexity note below): it is computed over a uniform spatial grid so only nodes
+ *   within a cutoff radius interact, which separates crossing branches without the
+ *   cost of a naive all-pairs pass.
  * - **Damping:** velocity decays each step so the system loses kinetic energy and
  *   settles, like a ball easing to rest on a table. Tuned lively, not sluggish: a new
  *   node's disturbance propagates and eases out over roughly one to two seconds.
@@ -31,17 +36,21 @@ import type { VisibleNode } from './collapse'
  * sim, which re-settles rather than reproducing pixel-exact prior positions. The data
  * fold stays replayable and seek-exact; the layout no longer is.
  *
- * ### Repulsion complexity
+ * ### Repulsion complexity (uniform spatial grid)
  *
- * Repulsion runs only *within* each display-parent's sibling group, never across the
- * whole forest. For a parent with `k` visible children it is `O(k^2)`; summed over all
- * groups the per-frame cost is `O(sum of k_i^2)`, which for a typical wide-and-shallow
- * file tree is far below the naive `O(n^2)` over all `n` nodes (a fan of 8 siblings is
- * 64 pairs, not 64 against every other node in the forest). The forest stays readable
- * because the edge springs already separate different branches radially, so siblings
- * are the only pairs that realistically overlap and need pushing apart. This keeps the
- * frame budget small even as the forest grows, which matters because the user watches
- * the FPS.
+ * Repulsion now acts between ALL nodes, not just siblings, because sibling-only
+ * repulsion let different branches cross and tangle. A naive all-pairs pass would be
+ * `O(n^2)` per frame, which would not stay smooth on a large Seraphim forest. Instead
+ * the repulsion uses a **uniform-bucket spatial grid** ({@link buildSpatialGrid}): each
+ * frame every body is hashed into a square cell of side {@link cutoffRadius}, and a body
+ * only computes repulsion against bodies in its own cell and the eight neighboring cells.
+ * Because the force is an inverse-square that has fallen off to a negligible amount past
+ * one cell, ignoring far-away cells changes the result imperceptibly while bounding the
+ * work: with bodies spread roughly evenly the per-frame cost is `O(n)` (each body sees a
+ * constant handful of neighbors), degrading to `O(n^2)` only in the pathological case of
+ * every node piled into one cell, which the springs prevent. Building the grid is `O(n)`.
+ * So the forest separates branch-from-branch yet stays cheap as it grows, which matters
+ * because the user watches the FPS.
  */
 export class ForceLayout {
   /** Live per-node physics, keyed by the node's real (full) path. The public read surface. */
@@ -56,14 +65,6 @@ export class ForceLayout {
   private readonly displayParentByPath: Map<string, string>
 
   /**
-   * Visible nodes grouped by their display-parent path, rebuilt on each {@link sync}.
-   * Drives the local repulsion pass: every value is one sibling group whose members
-   * push each other apart. Keyed by display-parent path; repo roots all share the `''`
-   * group so the top-level repos spread around the center too.
-   */
-  private readonly siblingsByParent: Map<string, string[]>
-
-  /**
    * The path of the pinned forest root (`''`) when one is shown, else `null`. A pinned
    * body is held at the center with zero velocity and skipped by the integrator, so
    * everything else hangs and settles around it.
@@ -75,7 +76,6 @@ export class ForceLayout {
   constructor(options: ForceLayoutOptions = {}) {
     this.bodies = new Map()
     this.displayParentByPath = new Map()
-    this.siblingsByParent = new Map()
     this.pinnedPath = null
     this.options = {
       center: options.center ?? { x: 0, y: 0 },
@@ -84,6 +84,7 @@ export class ForceLayout {
       springStiffness: options.springStiffness ?? DEFAULT_SPRING_STIFFNESS,
       repulsionStrength: options.repulsionStrength ?? DEFAULT_REPULSION_STRENGTH,
       repulsionMinDistance: options.repulsionMinDistance ?? DEFAULT_REPULSION_MIN_DISTANCE,
+      repulsionCutoff: options.repulsionCutoff ?? DEFAULT_REPULSION_CUTOFF,
       damping: options.damping ?? DEFAULT_DAMPING,
       maxStepMs: options.maxStepMs ?? DEFAULT_MAX_STEP_MS,
       spawnOffset: options.spawnOffset ?? DEFAULT_SPAWN_OFFSET,
@@ -115,13 +116,13 @@ export class ForceLayout {
    * - The forest root (when present, flagged `isForestRoot`) is **pinned** at the
    *   center: its body is held fixed so the forest settles around a stable trunk.
    *
-   * The display-parent and sibling-group indexes are rebuilt here too, so the next
-   * {@link step} springs and repels against the current structure without re-walking
-   * the tree.
+   * The display-parent index is rebuilt here too, so the next {@link step} springs
+   * each node toward the current structure without re-walking the tree. Repulsion no
+   * longer needs an index: it is computed over a spatial grid of the live positions
+   * each frame, so it always sees the current bodies.
    */
   public sync(visibleNodes: VisibleNode[]): void {
     this.displayParentByPath.clear()
-    this.siblingsByParent.clear()
     this.pinnedPath = null
 
     const livePaths = new Set<string>()
@@ -149,13 +150,6 @@ export class ForceLayout {
       }
 
       this.displayParentByPath.set(path, visible.displayParentPath)
-      const siblings = this.siblingsByParent.get(visible.displayParentPath)
-      if (siblings) {
-        siblings.push(path)
-      }
-      else {
-        this.siblingsByParent.set(visible.displayParentPath, [ path ])
-      }
 
       if (!this.bodies.has(path)) {
         this.bodies.set(path, {
@@ -183,7 +177,6 @@ export class ForceLayout {
   public reset(): void {
     this.bodies.clear()
     this.displayParentByPath.clear()
-    this.siblingsByParent.clear()
     this.pinnedPath = null
   }
 
@@ -221,7 +214,7 @@ export class ForceLayout {
     }
 
     this.applyEdgeSprings(forces)
-    this.applySiblingRepulsion(forces)
+    this.applyRepulsion(forces)
     this.integrate(forces, deltaSeconds)
   }
 
@@ -260,53 +253,78 @@ export class ForceLayout {
   }
 
   /**
-   * Local repulsion: within each display-parent's sibling group, every pair of nodes
-   * pushes apart with an inverse-square-ish falloff, so a fan of children spreads out
-   * and does not stack on one point. Capped at a minimum distance so two coincident
-   * spawns (siblings born on the same frame at nearly the same point) get a strong but
-   * finite shove rather than an infinite one.
+   * Global-but-local repulsion: every node pushes apart from every *nearby* node
+   * (within {@link ForceLayoutOptions.repulsionCutoff}), no matter their parentage, so
+   * branches from different parents separate and the tree stops crossing over itself.
+   * This replaces the old sibling-only pass, whose blindness across branches was the
+   * cause of the tangle.
    *
-   * Deliberately scoped to siblings only; see the class-level complexity note for why
-   * this stays far cheaper than an all-pairs pass while still keeping the forest
-   * readable.
+   * To stay cheap it does NOT test every pair: it bins the live positions into a
+   * uniform {@link buildSpatialGrid} of cell side `cutoff`, then for each body sums the
+   * push only from bodies in its own cell and the eight neighbors. Past one cell the
+   * inverse-square force has fallen off to a negligible amount, so skipping far cells is
+   * visually free while bounding the cost to roughly `O(n)` (see the class complexity
+   * note). The pinned root is included as a repulsion *source* (so nodes do not pile
+   * onto the center) but, being absent from `forces`, receives none itself.
+   *
+   * Each pair is visited once (only neighbors with a strictly greater iteration index,
+   * an order built into {@link buildSpatialGrid}'s flat cell lists) and the equal-and-
+   * opposite push applied to both, so the work is halved and the forces stay symmetric.
    */
-  private applySiblingRepulsion(forces: Map<string, Vec2>): void {
-    for (const siblings of this.siblingsByParent.values()) {
-      for (let leftIndex = 0; leftIndex < siblings.length; leftIndex++) {
-        for (let rightIndex = leftIndex + 1; rightIndex < siblings.length; rightIndex++) {
-          const leftPath = siblings[leftIndex]
-          const rightPath = siblings[rightIndex]
-          const leftBody = this.bodies.get(leftPath)!
-          const rightBody = this.bodies.get(rightPath)!
+  private applyRepulsion(forces: Map<string, Vec2>): void {
+    const cutoff = this.options.repulsionCutoff
+    const grid = buildSpatialGrid(this.bodies, cutoff)
+    const cutoffSquared = cutoff * cutoff
 
-          let offsetX = leftBody.position.x - rightBody.position.x
-          let offsetY = leftBody.position.y - rightBody.position.y
-          let distance = Math.hypot(offsetX, offsetY)
-          if (distance < this.options.repulsionMinDistance) {
-            // Two near-coincident siblings: nudge them onto a deterministic axis from a
-            // hash of the pair so they separate the same way every run, never randomly,
-            // then clamp the distance so the inverse-square force stays finite.
-            const nudge = pairNudge(leftPath, rightPath)
-            offsetX = nudge.x
-            offsetY = nudge.y
-            distance = this.options.repulsionMinDistance
-          }
+    for (const cell of grid.cells.values()) {
+      for (const neighborCell of grid.neighborhoodOf(cell.cellX, cell.cellY)) {
+        // Within a single cell, only test each unordered pair once (right index past
+        // left); across two distinct cells, test every cross pair exactly once because
+        // `neighborhoodOf` yields each neighbor cell only on the lower-keyed side.
+        const sameCell = neighborCell === cell
+        for (let leftIndex = 0; leftIndex < cell.members.length; leftIndex++) {
+          const startRight = sameCell ? leftIndex + 1 : 0
+          for (let rightIndex = startRight; rightIndex < neighborCell.members.length; rightIndex++) {
+            const left = cell.members[leftIndex]
+            const right = neighborCell.members[rightIndex]
 
-          // Inverse-square magnitude so close siblings shove hard and distant ones barely
-          // interact, which keeps the repulsion local without an explicit cutoff radius.
-          const magnitude = this.options.repulsionStrength / (distance * distance)
-          const pushX = (offsetX / distance) * magnitude
-          const pushY = (offsetY / distance) * magnitude
+            let offsetX = left.position.x - right.position.x
+            let offsetY = left.position.y - right.position.y
+            let distanceSquared = offsetX * offsetX + offsetY * offsetY
+            if (distanceSquared > cutoffSquared) {
+              // Beyond the cutoff the inverse-square force is negligible; skip it so a
+              // body only ever feels its genuine near neighbors (the whole point of the grid).
+              continue
+            }
 
-          const leftForce = forces.get(leftPath)
-          const rightForce = forces.get(rightPath)
-          if (leftForce) {
-            leftForce.x += pushX
-            leftForce.y += pushY
-          }
-          if (rightForce) {
-            rightForce.x -= pushX
-            rightForce.y -= pushY
+            let distance = Math.sqrt(distanceSquared)
+            if (distance < this.options.repulsionMinDistance) {
+              // Two near-coincident nodes: nudge them onto a deterministic axis from a
+              // hash of the pair so they separate the same way every run, never randomly,
+              // then clamp the distance so the inverse-square force stays finite.
+              const nudge = pairNudge(left.path, right.path)
+              offsetX = nudge.x
+              offsetY = nudge.y
+              distance = this.options.repulsionMinDistance
+              distanceSquared = distance * distance
+            }
+
+            // Inverse-square magnitude so close nodes shove hard and ones near the cutoff
+            // barely interact, blending smoothly into the hard cutoff with no visible seam.
+            const magnitude = this.options.repulsionStrength / distanceSquared
+            const pushX = (offsetX / distance) * magnitude
+            const pushY = (offsetY / distance) * magnitude
+
+            const leftForce = forces.get(left.path)
+            const rightForce = forces.get(right.path)
+            if (leftForce) {
+              leftForce.x += pushX
+              leftForce.y += pushY
+            }
+            if (rightForce) {
+              rightForce.x -= pushX
+              rightForce.y -= pushY
+            }
           }
         }
       }
@@ -376,16 +394,27 @@ export type ForceLayoutOptions = {
   /** Edge-spring stiffness: how hard a node is pulled to its rest length from its parent. */
   springStiffness?: number
   /**
-   * Repulsion strength: the numerator of the inverse-square push between siblings. Larger
-   * spreads a fan of children wider before the edge springs rein them back in.
+   * Repulsion strength: the numerator of the inverse-square push between any two nearby
+   * nodes (within {@link repulsionCutoff}). Larger spreads the forest wider, separating
+   * branches more, before the edge springs rein them back in.
    */
   repulsionStrength?: number
   /**
-   * The closest two siblings are treated as being for the repulsion force, in layout
+   * The closest two nodes are treated as being for the repulsion force, in layout
    * units. Clamps the inverse-square magnitude so near-coincident spawns get a strong but
    * finite shove apart rather than an infinite one.
    */
   repulsionMinDistance?: number
+  /**
+   * The cutoff radius of the repulsion, in layout units: two nodes farther apart than
+   * this exert no repulsion on each other. It is also the spatial grid's cell side, so a
+   * body only ever tests the bodies in its own and the eight neighboring cells. Sized a
+   * few rest-lengths wide so a node pushes apart from the neighbors that would otherwise
+   * cross or overlap it, while still letting distant branches ignore each other (which is
+   * both correct, the force is negligible there, and what keeps the grid cheap). Raising
+   * it spreads the forest more but widens each body's neighbor scan.
+   */
+  repulsionCutoff?: number
   /**
    * Per-second velocity damping in `[0, 1)`: the fraction of a body's speed bled off each
    * second. Higher settles faster (sluggish at the extreme); lower stays livelier and
@@ -420,27 +449,41 @@ const DEFAULT_REST_LENGTH = 120
 const DEFAULT_REST_LENGTH_DEPTH_SCALE = 0.35
 
 /**
- * Default edge-spring stiffness. Firm enough that the tree skeleton holds, soft enough
- * to settle without ringing hard.
+ * Default edge-spring stiffness. Raised from the old sibling-only era (18) because the
+ * now-global repulsion pushes every nearby node, not just siblings, so a firmer skeleton
+ * is needed to hold branches together against that broader outward pressure and keep the
+ * tree from blowing apart. Still soft enough to settle without ringing hard.
  */
-const DEFAULT_SPRING_STIFFNESS = 18
+const DEFAULT_SPRING_STIFFNESS = 26
 
 /**
- * Default repulsion strength (the inverse-square numerator). Sized against the rest
- * length so a typical sibling fan spreads to a comfortable spacing before the springs
- * pull it back; the user can raise it for an airier forest or lower it for a denser one.
+ * Default repulsion strength (the inverse-square numerator). Lowered from the old
+ * sibling-only value (90_000) because repulsion now acts between ALL nearby nodes rather
+ * than only siblings: a node feels many more neighbors, so a gentler per-pair push sums to
+ * the right total spread. Sized so different branches separate cleanly and stop crossing
+ * while the springs still rein the tree in; raise it for an airier forest, lower for denser.
  */
-const DEFAULT_REPULSION_STRENGTH = 90_000
+const DEFAULT_REPULSION_STRENGTH = 38_000
 
 /** Default minimum repulsion distance, so two near-coincident spawns shove apart finitely. */
 const DEFAULT_REPULSION_MIN_DISTANCE = 8
 
 /**
- * Default per-second damping: a body bleeds ~88% of its speed per second (retaining
- * ~12%), which lands a disturbance's settle in the one-to-two-second range the user
- * asked for: lively, not sluggish, and without a long ringing tail.
+ * Default repulsion cutoff / grid cell side, in layout units. About two-and-a-half
+ * depth-1 rest-lengths wide, so a node repels the neighbors close enough to cross or
+ * overlap it (the tangle) yet ignores branches that are comfortably far (where the force
+ * is negligible anyway). Doubles as the spatial grid's cell size, bounding each body's
+ * neighbor scan to a constant handful of cells.
  */
-const DEFAULT_DAMPING = 0.88
+const DEFAULT_REPULSION_CUTOFF = 300
+
+/**
+ * Default per-second damping: a body bleeds ~90% of its speed per second (retaining
+ * ~10%), a touch firmer than the old sibling-only 0.88 so the busier global-repulsion
+ * field still settles in the one-to-two-second range the user asked for: lively, not
+ * sluggish, and without a long ringing tail.
+ */
+const DEFAULT_DAMPING = 0.90
 
 /** Default integration-step clamp: ~3 frames at 60fps, enough to smooth a hitch without stalling the sim. */
 const DEFAULT_MAX_STEP_MS = 50
@@ -471,8 +514,8 @@ function pathDepth(path: string): number {
 const SLASH_CHAR_CODE = '/'.charCodeAt(0)
 
 /**
- * A deterministic unit-ish separation axis for two coincident siblings, from a hash of
- * their combined paths. So two siblings spawned on the exact same point always push apart
+ * A deterministic unit-ish separation axis for two coincident nodes, from a hash of
+ * their combined paths. So two nodes landing on the exact same point always push apart
  * along the same direction (never a random one), keeping a re-sync after a rewind
  * reproducible. Order-independent so the pair yields the same axis whichever way it is
  * iterated.
@@ -493,3 +536,111 @@ function hashPath(path: string): number {
   }
   return hash >>> 0
 }
+
+/** One body in the spatial grid: its path (for the deterministic coincident-nudge) and live position. */
+export type GridBody = {
+  path: string
+  position: Vec2
+}
+
+/**
+ * One occupied cell of the {@link SpatialGrid}: its integer grid coordinates and the
+ * bodies that hashed into it. Empty cells are never materialized, so the grid's size is
+ * bounded by the number of *occupied* cells, not the (possibly vast) span of the forest.
+ */
+export type GridCell = {
+  cellX: number
+  cellY: number
+  members: GridBody[]
+}
+
+/**
+ * A uniform-bucket spatial index over the live bodies, the backbone of the `O(n)`
+ * repulsion. Every body is binned into a square cell of side `cellSize` (the repulsion
+ * cutoff), so two bodies that could repel each other (within the cutoff) are guaranteed
+ * to share a cell or sit in adjacent cells. The repulsion then only has to test a body
+ * against the bodies in its own and the eight neighboring cells.
+ *
+ * {@link neighborhoodOf} is the careful part: it yields, for a given cell, that cell
+ * itself plus only the neighbor cells on the "greater" side, so iterating every cell and
+ * its neighborhood visits each unordered cell-pair exactly once. That lets the caller
+ * apply the equal-and-opposite repulsion to both bodies of a pair without ever
+ * double-counting a force.
+ */
+export type SpatialGrid = {
+  /** The occupied cells, keyed by a packed `cellX,cellY` string. */
+  cells: Map<string, GridCell>
+  /**
+   * The cell itself plus its forward-side neighbors, chosen so iterating all cells and
+   * each one's neighborhood touches every unordered cell-pair exactly once. The own cell
+   * is yielded first so the caller can special-case the within-cell pairing.
+   */
+  neighborhoodOf: (cellX: number, cellY: number) => GridCell[]
+}
+
+/**
+ * Bins `bodies` into a uniform spatial grid of cell side `cellSize` for the repulsion
+ * pass. Pure (no time, no randomness, no mutation of the inputs) and so directly unit-
+ * testable: the same bodies + cell size always yield the same buckets and neighborhoods.
+ *
+ * A non-finite or non-positive `cellSize` is a programming error upstream; we log and
+ * floor it to `1` rather than divide by it and scatter every body into nonsense cells.
+ *
+ * The eight forward neighbor offsets are chosen so that, combined with the own cell,
+ * iterating every cell's neighborhood enumerates each unordered cell-pair once (the
+ * lower-keyed cell of a pair owns the edge to the higher-keyed one). See
+ * {@link FORWARD_NEIGHBOR_OFFSETS}.
+ */
+export function buildSpatialGrid(bodies: Map<string, NodePhysics>, cellSize: number): SpatialGrid {
+  let size = cellSize
+  if (!Number.isFinite(size) || size <= 0) {
+    console.debug('runewood: spatial grid got a non-positive cell size, flooring to 1', cellSize)
+    size = 1
+  }
+
+  const cells = new Map<string, GridCell>()
+  for (const [ path, body ] of bodies) {
+    const cellX = Math.floor(body.position.x / size)
+    const cellY = Math.floor(body.position.y / size)
+    const key = `${cellX},${cellY}`
+    const existing = cells.get(key)
+    if (existing) {
+      existing.members.push({ path, position: body.position })
+    }
+    else {
+      cells.set(key, { cellX, cellY, members: [{ path, position: body.position }]})
+    }
+  }
+
+  const neighborhoodOf = (cellX: number, cellY: number): GridCell[] => {
+    const ownKey = `${cellX},${cellY}`
+    const own = cells.get(ownKey)
+    // The own cell is always present when called from the repulsion loop (we iterate the
+    // grid's own cells), but guard anyway so a stray coordinate never throws.
+    const neighborhood: GridCell[] = own ? [ own ] : []
+    for (const offset of FORWARD_NEIGHBOR_OFFSETS) {
+      const neighbor = cells.get(`${cellX + offset.x},${cellY + offset.y}`)
+      if (neighbor) {
+        neighborhood.push(neighbor)
+      }
+    }
+    return neighborhood
+  }
+
+  return { cells, neighborhoodOf }
+}
+
+/**
+ * The four forward neighbor offsets that, paired with each cell's own bucket, let a sweep
+ * over every cell's neighborhood visit each adjacent cell-pair exactly once. Of the eight
+ * surrounding cells we take only the four on the "greater" side (right, and the three on
+ * the row above): the opposite four are covered when *those* cells are the iteration's
+ * current cell. This halves the cross-cell work and keeps each repulsion force counted
+ * a single time.
+ */
+const FORWARD_NEIGHBOR_OFFSETS = [
+  { x: 1, y: 0 },
+  { x: -1, y: 1 },
+  { x: 0, y: 1 },
+  { x: 1, y: 1 },
+] as const

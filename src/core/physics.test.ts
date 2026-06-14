@@ -2,11 +2,12 @@
 
 import type { VisibleNode } from './collapse'
 import type { TreeNode } from './tree'
+import type { Vec2, NodePhysics } from './layout'
 
 // Core
 import { describe, expect, it } from 'vitest'
 
-import { ForceLayout } from './physics'
+import { ForceLayout, buildSpatialGrid } from './physics'
 
 /**
  * Builds a minimal {@link TreeNode} for a path. The sim only ever reads `path` off
@@ -146,6 +147,56 @@ describe('ForceLayout', () => {
 
       // The repulsion must have pushed the siblings further apart than they spawned.
       expect(separationAfter).toBeGreaterThan(separationBefore)
+    })
+
+    it('repels nodes from DIFFERENT parents so branches separate and stop crossing', () => {
+      // The tangle fix: the old sibling-only repulsion let two children of different
+      // parents overlap and cross. Now repulsion is global-but-local, so two nodes that
+      // belong to different branches but sit close together must still push apart.
+      const layout = new ForceLayout({ repulsionCutoff: 1_000 })
+      layout.sync([
+        visible('repoA', '', 1),
+        visible('repoB', '', 1),
+        visible('repoA/leaf.ts', 'repoA', 2),
+        visible('repoB/leaf.ts', 'repoB', 2),
+      ])
+
+      // Force the two cross-branch leaves to start nearly coincident (they belong to
+      // different parents, the case the old sibling-only pass ignored entirely).
+      layout.state.get('repoA/leaf.ts')!.position = { x: 100, y: 0 }
+      layout.state.get('repoB/leaf.ts')!.position = { x: 104, y: 0 }
+      const separationBefore = Math.hypot(
+        layout.state.get('repoA/leaf.ts')!.position.x - layout.state.get('repoB/leaf.ts')!.position.x,
+        layout.state.get('repoA/leaf.ts')!.position.y - layout.state.get('repoB/leaf.ts')!.position.y,
+      )
+
+      stepTimes(layout, FIXED_DELTA_MS, 30)
+
+      const separationAfter = Math.hypot(
+        layout.state.get('repoA/leaf.ts')!.position.x - layout.state.get('repoB/leaf.ts')!.position.x,
+        layout.state.get('repoA/leaf.ts')!.position.y - layout.state.get('repoB/leaf.ts')!.position.y,
+      )
+      // The cross-branch pair was pushed apart, the whole point of broadening repulsion.
+      expect(separationAfter).toBeGreaterThan(separationBefore)
+    })
+
+    it('does NOT repel nodes farther apart than the cutoff (keeps the grid local and cheap)', () => {
+      // Past the cutoff the force is dropped entirely, so two distant nodes never
+      // interact. With both pinned far apart and the springs disabled, neither moves.
+      const layout = new ForceLayout({ repulsionCutoff: 100, springStiffness: 0 })
+      layout.sync([
+        visible('repoA', '', 1),
+        visible('repoB', '', 1),
+      ])
+      // Place the two repo roots well beyond the 100-unit cutoff.
+      layout.state.get('repoA')!.position = { x: 0, y: 0 }
+      layout.state.get('repoB')!.position = { x: 500, y: 0 }
+
+      stepTimes(layout, FIXED_DELTA_MS, 40)
+
+      // Neither moved: out of cutoff range, and the spring is off, so no force at all.
+      expect(layout.state.get('repoA')!.position).toEqual({ x: 0, y: 0 })
+      expect(layout.state.get('repoB')!.position).toEqual({ x: 500, y: 0 })
     })
 
     it('loses kinetic energy under damping and settles a single edge fully to rest', () => {
@@ -295,5 +346,92 @@ describe('ForceLayout', () => {
       expect(layout.state.has('other')).toBe(true)
       expect(layout.state.has('repo')).toBe(false)
     })
+  })
+})
+
+/** A bodies map of the shape {@link buildSpatialGrid} consumes, from path -> position pairs. */
+function bodiesFrom(entries: Array<[ string, Vec2 ]>): Map<string, NodePhysics> {
+  const bodies = new Map<string, NodePhysics>()
+  for (const [ path, position ] of entries) {
+    bodies.set(path, { position, velocity: { x: 0, y: 0 }})
+  }
+  return bodies
+}
+
+/** All paths in a grid cell, for order-independent membership assertions. */
+function pathsIn(cell: { members: Array<{ path: string }> } | undefined): string[] {
+  return (cell?.members ?? []).map((member) => member.path).sort()
+}
+
+describe('buildSpatialGrid', () => {
+  it('bins bodies into cells of the given side by floor-dividing their position', () => {
+    // Cell side 100: (10,10) and (90,90) share cell (0,0); (150,10) is cell (1,0).
+    const grid = buildSpatialGrid(bodiesFrom([
+      [ 'a', { x: 10, y: 10 }],
+      [ 'b', { x: 90, y: 90 }],
+      [ 'c', { x: 150, y: 10 }],
+    ]), 100)
+
+    expect(pathsIn(grid.cells.get('0,0'))).toEqual([ 'a', 'b' ])
+    expect(pathsIn(grid.cells.get('1,0'))).toEqual([ 'c' ])
+    // No empty cells are materialized.
+    expect(grid.cells.size).toBe(2)
+  })
+
+  it('handles negative coordinates by flooring toward negative infinity', () => {
+    // Math.floor(-1/100) is -1, so a node at (-1,-1) lands in cell (-1,-1), not (0,0).
+    const grid = buildSpatialGrid(bodiesFrom([
+      [ 'neg', { x: -1, y: -1 }],
+      [ 'pos', { x: 1, y: 1 }],
+    ]), 100)
+
+    expect(pathsIn(grid.cells.get('-1,-1'))).toEqual([ 'neg' ])
+    expect(pathsIn(grid.cells.get('0,0'))).toEqual([ 'pos' ])
+  })
+
+  it('neighborhoodOf yields each adjacent cell-pair exactly once across a full sweep', () => {
+    // A 3x3 block of occupied cells, one body each. Sweeping every cell's neighborhood
+    // must enumerate every UNORDERED pair of touching cells exactly once (the property
+    // that lets the repulsion apply an equal-and-opposite force without double-counting).
+    const entries: Array<[ string, Vec2 ]> = []
+    for (let cellX = 0; cellX < 3; cellX++) {
+      for (let cellY = 0; cellY < 3; cellY++) {
+        // Center each body in its 100-unit cell so it bins unambiguously.
+        entries.push([ `${cellX},${cellY}`, { x: cellX * 100 + 50, y: cellY * 100 + 50 }])
+      }
+    }
+    const grid = buildSpatialGrid(bodiesFrom(entries), 100)
+
+    const seenPairs = new Set<string>()
+    for (const cell of grid.cells.values()) {
+      const neighborhood = grid.neighborhoodOf(cell.cellX, cell.cellY)
+      // The own cell is always first.
+      expect(neighborhood[0]).toBe(cell)
+      for (let index = 1; index < neighborhood.length; index++) {
+        const neighbor = neighborhood[index]
+        const key = [ `${cell.cellX},${cell.cellY}`, `${neighbor.cellX},${neighbor.cellY}` ].sort().join('|')
+        // A given unordered cell-pair must never be produced twice.
+        expect(seenPairs.has(key)).toBe(false)
+        seenPairs.add(key)
+        // Neighbors are genuinely adjacent (within one cell on each axis).
+        expect(Math.abs(neighbor.cellX - cell.cellX)).toBeLessThanOrEqual(1)
+        expect(Math.abs(neighbor.cellY - cell.cellY)).toBeLessThanOrEqual(1)
+      }
+    }
+
+    // A 3x3 grid has 12 horizontal/vertical + 8 diagonal = 20 adjacent unordered pairs.
+    expect(seenPairs.size).toBe(20)
+  })
+
+  it('floors a non-positive cell size to 1 rather than scattering bodies into nonsense cells', () => {
+    // A zero cell size would divide-by-zero every coordinate; the guard floors it to 1,
+    // so each integer coordinate still lands in its own sensible cell.
+    const grid = buildSpatialGrid(bodiesFrom([
+      [ 'a', { x: 3, y: 4 }],
+      [ 'b', { x: 3, y: 5 }],
+    ]), 0)
+
+    expect(pathsIn(grid.cells.get('3,4'))).toEqual([ 'a' ])
+    expect(pathsIn(grid.cells.get('3,5'))).toEqual([ 'b' ])
   })
 })
