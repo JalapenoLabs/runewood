@@ -706,9 +706,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       if (touched.length > 0) {
         track.lastCentroid = lastCentroid
       }
+      // Resolve the actor's most-recently-touched file to its live spring position
+      // so the orb can anchor on where the work is *now* (out at the leaves), not
+      // the centroid of everything it has touched. Undefined until the path has a
+      // spring entry, or once the actor has gone quiet (the window cleared it).
+      const recent = track.recentPath ? springs.get(track.recentPath)?.position : undefined
       activities.push({
         actor: track.actor,
         touched,
+        recent,
         lastActiveAt: track.lastActiveAt,
         lastCentroid,
       })

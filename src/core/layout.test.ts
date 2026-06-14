@@ -278,7 +278,7 @@ describe('stepSprings', () => {
 })
 
 describe('nodeHeat', () => {
-  it('grows the radius with touch count', () => {
+  it('grows heat (for glow/brightness) with touch count', () => {
     const root = createTree()
     applyEvent(root, { at: 1000, actor: 'a', action: 'modify', path: 'repo/cold.ts' })
     for (let touch = 0; touch < 20; touch++) {
@@ -291,8 +291,35 @@ describe('nodeHeat', () => {
     const coldHeat = nodeHeat(cold, 1100)
     const hotHeat = nodeHeat(hot, 1100)
 
+    // Heat (which drives the glow + brightness) still rises with activity.
     expect(hotHeat.heat).toBeGreaterThan(coldHeat.heat)
-    expect(hotHeat.radius).toBeGreaterThan(coldHeat.radius)
+  })
+
+  it('does NOT keep growing the baseline radius with cumulative touch count', () => {
+    // The fix for "each modification permanently grows the node": the baseline size
+    // is bounded by a *saturating* importance bump, never a runaway cumulative swell.
+    // Two heavily-touched nodes, one edited 5x as much as the other, rest at nearly
+    // the same size because the bump has plateaued.
+    const root = createTree()
+    for (let touch = 0; touch < 20; touch++) {
+      applyEvent(root, { at: 1000 + touch, actor: 'a', action: 'modify', path: 'repo/busy.ts' })
+    }
+    for (let touch = 0; touch < 100; touch++) {
+      applyEvent(root, { at: 1000 + touch, actor: 'a', action: 'modify', path: 'repo/frantic.ts' })
+    }
+
+    const busy = root.children.get('repo')!.children.get('busy.ts')!
+    const frantic = root.children.get('repo')!.children.get('frantic.ts')!
+
+    const busyRadius = nodeHeat(busy, 1200).radius
+    const franticRadius = nodeHeat(frantic, 1200).radius
+
+    // 5x the edits past the knee changes the resting size by a hair: the bump has
+    // saturated, so the radius is not a cumulative function of touch count. And the
+    // total bump over a never-touched node is hard-capped at the importance bump.
+    expect(Math.abs(franticRadius - busyRadius)).toBeLessThan(0.5)
+    const baseline = nodeHeat(createTree(), 1200).radius
+    expect(franticRadius - baseline).toBeLessThanOrEqual(5)
   })
 
   it('cools off as time passes since the last touch', () => {
@@ -304,6 +331,19 @@ describe('nodeHeat', () => {
     const longCold = nodeHeat(node, 1000 + 60_000, { coolingMs: 10_000 })
 
     expect(longCold.heat).toBeLessThan(justTouched.heat)
+  })
+
+  it('keeps the baseline radius steady as a node cools (only the pulse animates size)', () => {
+    // The resting size must not breathe with recency; only the touch pulse (in the
+    // visual model) animates it. So heat can fall while the baseline radius holds.
+    const root = createTree()
+    applyEvent(root, { at: 1000, actor: 'a', action: 'modify', path: 'repo/file.ts' })
+    const node = root.children.get('repo')!.children.get('file.ts')!
+
+    const justTouched = nodeHeat(node, 1000, { coolingMs: 10_000 })
+    const longCold = nodeHeat(node, 1000 + 60_000, { coolingMs: 10_000 })
+
+    expect(longCold.radius).toBeCloseTo(justTouched.radius, 9)
   })
 
   it('gives a never-touched node the base radius and zero heat', () => {

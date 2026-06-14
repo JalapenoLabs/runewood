@@ -114,6 +114,50 @@ describe('stepFrame', () => {
       expect(track?.touchedPaths.sort()).toEqual([ 'repo/a.ts', 'repo/b.ts' ])
     })
 
+    it('tracks the most-recently-touched path so the orb can anchor on current work', () => {
+      const state = createFrameState()
+      const events = [
+        event({ at: 1000, actor: 'agent-1', action: 'modify', path: 'repo/a.ts' }),
+        event({ at: 1200, actor: 'agent-1', action: 'modify', path: 'repo/b.ts' }),
+        event({ at: 1300, actor: 'agent-1', action: 'modify', path: 'repo/c.ts' }),
+      ]
+
+      const step = stepFrame(state, forward(1300, events), events)
+
+      // The anchor follows the latest touch, not the centroid of all three files.
+      expect(step.state.actors.get('agent-1')?.recentPath).toBe('repo/c.ts')
+    })
+
+    it('leaves recentPath untouched on a pathless pulse (a pulse points at no file)', () => {
+      const state = createFrameState()
+      const events = [
+        event({ at: 1000, actor: 'agent-1', action: 'modify', path: 'repo/a.ts' }),
+        event({ at: 1100, actor: 'agent-1', action: 'pulse', path: undefined }),
+      ]
+
+      const step = stepFrame(state, forward(1100, events), events)
+
+      // The pulse refreshed activity but must not move the anchor off the real file.
+      expect(step.state.actors.get('agent-1')?.recentPath).toBe('repo/a.ts')
+      expect(step.state.actors.get('agent-1')?.lastActiveAt).toBe(1100)
+    })
+
+    it('clears recentPath once the actor has been quiet past the window', () => {
+      const state = createFrameState()
+      const first = stepFrame(
+        state,
+        forward(1000, [ event({ at: 1000, actor: 'agent-1', path: 'repo/a.ts' }) ]),
+        [],
+        { activityWindowMs: 2000 },
+      )
+      expect(first.state.actors.get('agent-1')?.recentPath).toBe('repo/a.ts')
+
+      // Long quiet: the window elapses, so the anchor file is forgotten and the
+      // fading orb falls back to its parked last-centroid instead of a stale file.
+      const second = stepFrame(first.state, forward(9000, []), [], { activityWindowMs: 2000 })
+      expect(second.state.actors.get('agent-1')?.recentPath).toBeNull()
+    })
+
     it('tracks each actor separately', () => {
       const state = createFrameState()
       const events = [

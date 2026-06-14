@@ -47,6 +47,16 @@ export type ActorTrack = {
    * {@link lastActiveAt}.
    */
   touchedPaths: string[]
+  /**
+   * The single most-recently-touched path: the file the actor is working on
+   * *right now*. The shell anchors the actor's orb here (with a recency-weighted
+   * blend over the rest of {@link touchedPaths}) so a contributor floats out by
+   * its current work near the leaves, rather than at the centroid of everything
+   * it has ever touched (which averages back to the dense tree center). `null`
+   * until the actor's first path-targeting event, or after the window is pruned
+   * (a pathless pulse never sets it). Updated on every path-targeting event.
+   */
+  recentPath: string | null
   /** Epoch ms of this actor's most recent event, for the inactivity fade. */
   lastActiveAt: number
   /**
@@ -302,14 +312,19 @@ function rebuildToPlayhead(
 function accumulateActor(actors: Map<string, ActorTrack>, event: RunewoodEvent, node: TreeNode | null): void {
   let track = actors.get(event.actor)
   if (!track) {
-    track = { actor: event.actor, touchedPaths: [], lastActiveAt: event.at }
+    track = { actor: event.actor, touchedPaths: [], recentPath: null, lastActiveAt: event.at }
     actors.set(event.actor, track)
   }
 
   track.lastActiveAt = Math.max(track.lastActiveAt, event.at)
 
-  if (node && !track.touchedPaths.includes(node.path)) {
-    track.touchedPaths.push(node.path)
+  if (node) {
+    if (!track.touchedPaths.includes(node.path)) {
+      track.touchedPaths.push(node.path)
+    }
+    // The file the actor is touching this instant becomes its anchor, so the orb
+    // tracks where the work moved to, not the average of everywhere it has been.
+    track.recentPath = node.path
   }
 }
 
@@ -330,6 +345,10 @@ function pruneActorWindow(actors: Map<string, ActorTrack>, now: number, activity
   for (const track of actors.values()) {
     if (now - track.lastActiveAt >= activityWindowMs) {
       track.touchedPaths = []
+      // The anchor file aged out with the rest of the window; drop it so a quiet
+      // actor falls back to its parked last-centroid as it fades, not to a file
+      // it touched ages ago.
+      track.recentPath = null
     }
   }
 }

@@ -375,14 +375,23 @@ function spawnPositionFor(path: string, target: Vec2, state: SpringState): Vec2 
 
 /**
  * Visual "heat" of a node, derived purely from its activity so the renderer can
- * size and brighten it. Heat is a 0..1 scalar combining how often the node has
- * been touched with how recently, and `radius` is a convenience size in layout
- * units scaled from that heat. Recency needs a reference "now" because nodes
- * carry an absolute `lastTouchedAt`; the caller passes the current playhead time.
+ * brighten and glow it. Heat is a 0..1 scalar combining how often the node has
+ * been touched with how recently; it drives the glow/brightness, never the size.
+ * Recency needs a reference "now" because nodes carry an absolute `lastTouchedAt`;
+ * the caller passes the current playhead time.
+ *
+ * `radius` here is the node's **baseline** size: a roughly constant size with only
+ * a gentle, *saturating* importance bump for a node that has been touched at all,
+ * so a heavily-edited file is a touch larger than a never-touched one but never
+ * keeps growing with every edit. This is the fix for "each modification permanently
+ * grows the node": the cumulative-touch radius is gone. The transient size *pulse*
+ * on each touch lives in the node visual model ({@link import('../render/nodeVisual')}),
+ * not here, so this stays the calm resting size.
  */
 export function nodeHeat(node: TreeNode, now: number, options: HeatOptions = {}): { heat: number, radius: number } {
   const baseRadius = options.baseRadius ?? DEFAULT_BASE_RADIUS
-  const maxRadius = options.maxRadius ?? DEFAULT_MAX_RADIUS
+  const importanceBump = options.importanceBump ?? DEFAULT_IMPORTANCE_BUMP
+  const importanceSaturation = options.importanceSaturation ?? DEFAULT_IMPORTANCE_SATURATION
   const touchSaturation = options.touchSaturation ?? DEFAULT_TOUCH_SATURATION
   const coolingMs = options.coolingMs ?? DEFAULT_COOLING_MS
 
@@ -402,28 +411,46 @@ export function nodeHeat(node: TreeNode, now: number, options: HeatOptions = {})
   // Weight touch count as the dominant factor with recency as a warm boost,
   // clamped to a clean 0..1 so the renderer can map it however it likes.
   const heat = Math.max(0, Math.min(1, touchHeat * 0.7 + recencyHeat * 0.3))
-  const radius = baseRadius + (maxRadius - baseRadius) * heat
+
+  // The baseline radius is the constant base plus a *saturating* importance bump:
+  // a node that has been edited a lot is a little larger than one never touched,
+  // but the bump plateaus (1 - e^-n) so repeated edits do NOT keep enlarging it.
+  // It is independent of recency, so the resting size does not breathe as a node
+  // cools; the touch pulse (in the visual model) is what animates the size.
+  const importance = node.touchCount <= 0
+    ? 0
+    : 1 - Math.exp(-node.touchCount / importanceSaturation)
+  const radius = baseRadius + importanceBump * importance
 
   return { heat, radius }
 }
 
 /** Tuning for {@link nodeHeat}. Defaults give a usable size range out of the box. */
 export type HeatOptions = {
-  /** Size of a cold (never-touched) node, in layout units. */
+  /** Baseline size of a node, in layout units, before its saturating importance bump. */
   baseRadius?: number
-  /** Size of a maximally hot node, in layout units. */
-  maxRadius?: number
+  /**
+   * The most a heavily-touched node's *baseline* size may exceed {@link baseRadius},
+   * in layout units. This is a saturating bump, not cumulative growth: it plateaus
+   * so repeated edits never keep enlarging the node. Keep it modest so the resting
+   * forest reads as roughly uniform discs.
+   */
+  importanceBump?: number
+  /** Touch count at which the importance bump reaches ~63% of {@link importanceBump}. */
+  importanceSaturation?: number
   /** Touch count at which touch-heat reaches ~63% of its max (the exponential's knee). */
   touchSaturation?: number
   /** How long since the last touch before recency heat fully decays, in milliseconds. */
   coolingMs?: number
 }
 
-// Node discs were reading too small in the playground, so the cold and hot sizes
-// are both more than doubled (3 -> 7, 18 -> 38). The ratio is kept roughly the
-// same so a hot node still stands out from a cold one; everything is just bigger
-// on screen so the "connection dots" are easy to pick out.
+// Node discs were reading too small in the playground, so the base size is generous.
+// The baseline no longer scales with cumulative touches (that was the "permanently
+// growing" bug); a heavily-touched node only gets a small, saturating importance
+// bump on top, so the resting forest reads as roughly uniform discs that pulse on a
+// touch rather than swelling forever.
 const DEFAULT_BASE_RADIUS = 7
-const DEFAULT_MAX_RADIUS = 38
+const DEFAULT_IMPORTANCE_BUMP = 5
+const DEFAULT_IMPORTANCE_SATURATION = 6
 const DEFAULT_TOUCH_SATURATION = 4
 const DEFAULT_COOLING_MS = 10_000

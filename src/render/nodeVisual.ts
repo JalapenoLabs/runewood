@@ -29,7 +29,12 @@ import { colorForPath } from '../core/theme'
  * to zero on an idle, cold node, so nothing leaves a lingering half-faded ring.
  */
 export type NodeVisual = {
-  /** Radius in world units, derived from the node's heat. */
+  /**
+   * Radius in world units: the node's roughly-constant baseline size scaled by a
+   * transient touch *pulse*. The baseline does not grow with cumulative touches;
+   * instead each touch briefly swells the radius and it eases back to baseline over
+   * {@link NodeVisualOptions.pulseMs}, so a busy file throbs rather than ballooning.
+   */
   radius: number
   /** Base color: vivid file hue from its extension, or the neutral theme hub color for a directory. */
   color: Hsl
@@ -72,12 +77,40 @@ export type NodeVisualOptions = {
    * decays linearly to 0 over {@link flashMs}.
    */
   flashStrength?: number
+  /**
+   * How long the transient size pulse lasts before the radius has fully eased back
+   * to baseline, in milliseconds. Within this window after `lastTouchedAt` the
+   * node's radius is briefly swelled (peaking at the touch). Kept short (~0.5-0.8s)
+   * so a touch reads as a snappy throb, not a slow swell.
+   */
+  pulseMs?: number
+  /**
+   * Peak fraction the radius swells by at the instant of a touch. `0.6` means the
+   * node grows to 1.6x its baseline on a touch, then eases back to 1x over
+   * {@link pulseMs}. This is the *pulse* the user asked for in place of the old
+   * cumulative growth.
+   */
+  pulseStrength?: number
 }
 
 const DEFAULT_SEEDED_ALPHA = 0.28
 const DEFAULT_DELETE_FADE_MS = 4_000
 const DEFAULT_FLASH_MS = 1_200
 const DEFAULT_FLASH_STRENGTH = 1
+
+/**
+ * How long the touch size-pulse takes to ease back to baseline, in milliseconds.
+ * ~0.65s lands in the user's requested 0.5-0.8s window: a quick, snappy throb on
+ * each edit rather than a lingering swell. A judgment call worth tuning to taste.
+ */
+const DEFAULT_PULSE_MS = 650
+
+/**
+ * Peak fraction the radius swells by at the instant of a touch. `0.6` grows the
+ * node to 1.6x its baseline, then eases back to 1x over {@link DEFAULT_PULSE_MS}.
+ * Big enough to read clearly as a pulse, small enough not to dominate the forest.
+ */
+const DEFAULT_PULSE_STRENGTH = 0.6
 
 /**
  * Baseline brightness (how far the core is pushed toward white) that scales with
@@ -103,8 +136,10 @@ const HEAT_GLOW_WEIGHT = 0.5
  * node identically.
  *
  * The mapping:
- * - **radius** comes straight from {@link nodeHeat} (touch count + recency), so
- *   sizing logic lives in one place.
+ * - **radius** is the node's roughly-constant baseline size from {@link nodeHeat}
+ *   scaled by a transient touch *pulse*: each touch briefly swells it and it eases
+ *   back to baseline over `pulseMs`. The baseline no longer grows with cumulative
+ *   touches, so a busy file throbs on each edit instead of permanently ballooning.
  * - **color** is the file's vivid extension hue ({@link colorForPath}) for a leaf,
  *   or the theme's neutral hub color for a directory, so directories read as
  *   structural wood and files as their language.
@@ -128,8 +163,14 @@ export function nodeVisualFor(
   const deleteFadeMs = options.deleteFadeMs ?? DEFAULT_DELETE_FADE_MS
   const flashMs = options.flashMs ?? DEFAULT_FLASH_MS
   const flashStrength = options.flashStrength ?? DEFAULT_FLASH_STRENGTH
+  const pulseMs = options.pulseMs ?? DEFAULT_PULSE_MS
+  const pulseStrength = options.pulseStrength ?? DEFAULT_PULSE_STRENGTH
 
-  const { heat, radius } = nodeHeat(node, now, options.heat)
+  // `baseRadius` is the calm resting size; it no longer grows with cumulative
+  // touches. The transient pulse swells it on a touch and eases it back, so the
+  // node throbs per edit rather than ballooning permanently.
+  const { heat, radius: baseRadius } = nodeHeat(node, now, options.heat)
+  const radius = baseRadius * (1 + touchPulse(node.lastTouchedAt, now, pulseMs, pulseStrength))
 
   // Directories carry no language, so they take the theme's neutral, desaturated
   // hub color and read as the structural wood the files hang from. Files take
@@ -208,4 +249,32 @@ function touchFlash(
   }
   const decay = 1 - elapsed / flashMs
   return flashStrength * decay
+}
+
+/**
+ * The transient size-pulse fraction from a node's most recent touch: how much to
+ * swell the radius right now, on top of its baseline. It is `pulseStrength` at the
+ * instant of the touch and eases smoothly back to 0 over `pulseMs`, so a touched
+ * node throbs out then settles to its baseline size rather than growing for good.
+ * Before the touch or after the window it contributes nothing; a node that has
+ * never been touched (`lastTouchedAt === null`) never pulses.
+ *
+ * The ease is quadratic (the linear decay squared) so the swell falls off gently
+ * near the end of the window, reading as a soft settle rather than a hard stop.
+ */
+function touchPulse(
+  lastTouchedAt: number | null,
+  now: number,
+  pulseMs: number,
+  pulseStrength: number,
+): number {
+  if (lastTouchedAt === null) {
+    return 0
+  }
+  const elapsed = now - lastTouchedAt
+  if (elapsed < 0 || elapsed >= pulseMs) {
+    return 0
+  }
+  const remaining = 1 - elapsed / pulseMs
+  return pulseStrength * remaining * remaining
 }

@@ -27,9 +27,11 @@ import { actorVisualFor } from './actors'
  * - **beams**: the brief tapered flashlight pulses flung from actors to touched
  *   files, drawn from the {@link BeamField}'s active set into one pooled `Graphics`
  *   cleared and refilled each frame (the live beam count is volatile, so one
- *   batched graphic beats one persistent object per beam). Each is a soft additive
- *   tapered triangle: wide and bright at the actor, narrowing to the file, fading
- *   over its short lifetime.
+ *   batched graphic beats one persistent object per beam). Each is a *stack* of
+ *   additive tapered triangles (see {@link BEAM_GLOW_LAYERS}): a bright thin core
+ *   over a couple of wider, dimmer layers, so the beam reads as a soft glow of light
+ *   rather than a hard-edged wedge. Wide and bright at the actor, narrowing to the
+ *   file, fading over its short lifetime.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
  *   when an actor first appears and culled once it has fully faded out.
  *
@@ -116,12 +118,18 @@ export class BeamScene {
   }
 
   /**
-   * Refills the single batched beam graphic from the active set. Each beam is a
-   * soft additive tapered triangle: two points spanning the beam's current width at
-   * the actor (source) end and one point at the touched file (target), so it reads
-   * as a flashlight cone narrowing onto the file rather than a stream of bullets.
-   * A degenerate zero-length beam (source == target, e.g. a beam to a node sitting
-   * on the actor) is skipped since it has no direction to give width.
+   * Refills the single batched beam graphic from the active set. Each beam is drawn
+   * as a *stack* of additive tapered triangles rather than one flat one, which is
+   * what turns the old hard "sharp triangle" into a glowy pulse of light: a bright,
+   * thin core triangle with a couple of progressively wider, dimmer triangles layered
+   * under it. Because the layers are additively blended, the overlap sums to a hot
+   * bright core that falls off softly to the sides, the way real light blooms, so the
+   * beam reads as snappy and polished instead of a flat wedge with a hard edge.
+   *
+   * Each triangle spans the beam's current width at the actor (source) end and
+   * narrows to the touched file (target), so the beam still reads as a flashlight
+   * cone narrowing onto the file. A degenerate zero-length beam (source == target)
+   * is skipped since it has no direction to give width.
    */
   private drawBeams(beams: ActiveBeam[], theme: RunewoodTheme): void {
     this.beamGraphics.clear()
@@ -133,23 +141,27 @@ export class BeamScene {
         continue
       }
 
-      // The unit perpendicular to the beam, to spread the wide source end across
-      // the beam's current half-width on each side.
+      // The unit perpendicular to the beam, to spread each layer's source-end width
+      // symmetrically across the beam on both sides.
       const perpendicularX = -directionY / length
       const perpendicularY = directionX / length
-      const halfWidth = beam.width / 2
-
-      const leftX = beam.source.x + perpendicularX * halfWidth
-      const leftY = beam.source.y + perpendicularY * halfWidth
-      const rightX = beam.source.x - perpendicularX * halfWidth
-      const rightY = beam.source.y - perpendicularY * halfWidth
-
       const color = hslToRgbInt(beam.color)
-      this.beamGraphics
-        .poly([ leftX, leftY, rightX, rightY, beam.target.x, beam.target.y ])
-        // Bloom scales with the theme so a restrained theme glows gently; alpha
-        // already carries the beam's own lifetime fade.
-        .fill({ color, alpha: beam.alpha * theme.bloomIntensity })
+
+      // Stack the soft layers widest-and-dimmest first so the bright thin core lands
+      // on top. The additive blend sums the overlap into a hot core with a soft
+      // falloff to the edges. The theme's bloom scales the whole stack so a restrained
+      // theme glows gently; the beam's own lifetime fade rides in `beam.alpha`.
+      for (const layer of BEAM_GLOW_LAYERS) {
+        const halfWidth = (beam.width * layer.widthScale) / 2
+        const leftX = beam.source.x + perpendicularX * halfWidth
+        const leftY = beam.source.y + perpendicularY * halfWidth
+        const rightX = beam.source.x - perpendicularX * halfWidth
+        const rightY = beam.source.y - perpendicularY * halfWidth
+
+        this.beamGraphics
+          .poly([ leftX, leftY, rightX, rightY, beam.target.x, beam.target.y ])
+          .fill({ color, alpha: beam.alpha * layer.alphaScale * theme.bloomIntensity })
+      }
     }
   }
 
@@ -225,6 +237,21 @@ export class BeamScene {
  * "who is doing what" orb readable as the forest grows around it.
  */
 const MIN_ACTOR_SCREEN_PX = 9
+
+/**
+ * The additive layers each beam is drawn from, widest-and-dimmest first so the
+ * bright thin core lands on top. Stacking these with an additive blend turns the
+ * flat "sharp triangle" into a soft glow: the wide low-alpha layers spread a haze to
+ * the sides while the narrow high-alpha core stays hot, and the sums fall off softly
+ * from the center out. `widthScale` is a multiple of the beam's current width;
+ * `alphaScale` is a multiple of its current alpha. Tuned so the core reads crisp and
+ * the halo trails off gently; a judgment call worth tuning to taste.
+ */
+const BEAM_GLOW_LAYERS = [
+  { widthScale: 2.6, alphaScale: 0.18 },
+  { widthScale: 1.7, alphaScale: 0.30 },
+  { widthScale: 1.0, alphaScale: 0.85 },
+] as const
 
 /** Construction options for a {@link BeamScene}; forwards tuning to the pure models. */
 export type BeamSceneOptions = {

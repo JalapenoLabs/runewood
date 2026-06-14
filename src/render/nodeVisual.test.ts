@@ -189,16 +189,61 @@ describe('nodeVisualFor', () => {
     })
   })
 
-  describe('radius tracks heat', () => {
-    it('grows the radius with touch count', () => {
-      const now = 10_000
-      const lightlyTouched = makeNode({ touchCount: 1, lastTouchedAt: now })
-      const heavilyTouched = makeNode({ touchCount: 20, lastTouchedAt: now })
+  describe('radius pulses on a touch instead of growing cumulatively', () => {
+    it('does NOT keep growing the resting radius with cumulative touch count', () => {
+      // The user's complaint: "each modification increases the node size; it should
+      // pulse instead." Sampled well past any pulse window, two heavily-edited files,
+      // one edited 5x as much as the other, must rest at nearly the same size: the
+      // saturating importance bump has plateaued, so the radius does not balloon.
+      const restAt = 100_000
+      const busy = makeNode({ touchCount: 20, lastTouchedAt: 0 })
+      const frantic = makeNode({ touchCount: 100, lastTouchedAt: 0 })
 
-      const small = nodeVisualFor(lightlyTouched, now, defaultTheme)
-      const large = nodeVisualFor(heavilyTouched, now, defaultTheme)
+      const busyVisual = nodeVisualFor(busy, restAt, defaultTheme)
+      const franticVisual = nodeVisualFor(frantic, restAt, defaultTheme)
 
-      expect(large.radius).toBeGreaterThan(small.radius)
+      // 5x the edits barely changes the resting size (the bump has saturated),
+      // proving the radius is no longer a cumulative function of touch count.
+      expect(Math.abs(franticVisual.radius - busyVisual.radius)).toBeLessThan(0.5)
+    })
+
+    it('spikes the radius right after a touch and eases it back to baseline', () => {
+      const touchedAt = 10_000
+      const pulseMs = 650
+      const node = makeNode({ touchCount: 3, lastTouchedAt: touchedAt })
+
+      const atTouch = nodeVisualFor(node, touchedAt, defaultTheme, { pulseMs })
+      const partway = nodeVisualFor(node, touchedAt + pulseMs / 2, defaultTheme, { pulseMs })
+      const atRest = nodeVisualFor(node, touchedAt + pulseMs, defaultTheme, { pulseMs })
+      // The same node long after the touch, with no pulse contribution: the baseline.
+      const wellAfter = nodeVisualFor(node, touchedAt + pulseMs * 10, defaultTheme, { pulseMs })
+
+      // Biggest right at the touch, shrinking as the pulse eases off...
+      expect(atTouch.radius).toBeGreaterThan(partway.radius)
+      expect(partway.radius).toBeGreaterThan(atRest.radius)
+      // ...and back at exactly baseline by the end of the pulse window (no lingering
+      // swell), matching the long-after resting size.
+      expect(atRest.radius).toBeCloseTo(wellAfter.radius, 5)
+    })
+
+    it('applies the pulse strength as a fraction of the baseline at the instant of a touch', () => {
+      const touchedAt = 10_000
+      const pulseMs = 650
+      const node = makeNode({ touchCount: 3, lastTouchedAt: touchedAt })
+
+      const baseline = nodeVisualFor(node, touchedAt + pulseMs * 10, defaultTheme, { pulseMs })
+      const peaked = nodeVisualFor(node, touchedAt, defaultTheme, { pulseMs, pulseStrength: 0.6 })
+
+      // At the touch the radius is (1 + pulseStrength) times the baseline.
+      expect(peaked.radius).toBeCloseTo(baseline.radius * 1.6, 5)
+    })
+
+    it('does not pulse a node that has never been touched', () => {
+      const node = makeNode({ touchCount: 0, lastTouchedAt: null })
+      const baseline = nodeVisualFor(node, 10_000, defaultTheme)
+      // An untouched node sits at its plain baseline with no pulse at all.
+      const again = nodeVisualFor(node, 999_999, defaultTheme)
+      expect(baseline.radius).toBeCloseTo(again.radius, 5)
     })
   })
 

@@ -13,16 +13,28 @@ import { colorForActor } from '../core/theme'
  * inputs, and a backend draws it. Nothing here touches pixi, the DOM, the clock,
  * or randomness.
  *
- * An actor's position tracks the centroid of the file positions it is currently
- * touching, then is pushed radially *outward* from the world origin (the tree
- * center) so the actor floats just outside the canopy near where it is
- * contributing rather than sitting buried in the middle of the forest. This is the
- * Gource-style placement the user asked for: contributors orbit the outside of the
- * tree by their work, not the center. A small deterministic drift on top keeps two
- * actors on the same file from stacking exactly. Its fade rises while it is active
- * and decays after its last activity, so an actor that goes quiet dissolves rather
- * than hanging on the canvas. Both are pure functions of the supplied activity and
- * playhead `now`, so a rewound timeline repaints every actor identically.
+ * An actor's position anchors on its *most recent* work, then is pushed radially
+ * *outward* from the world origin (the tree center) so the actor floats just
+ * outside the canopy near where it is contributing rather than sitting buried in
+ * the middle of the forest. This is the Gource-style placement the user asked for:
+ * contributors orbit the outside of the tree by their current work, not the
+ * center.
+ *
+ * Anchoring on recent work (not the all-time centroid) is the fix for "contributors
+ * float in the middle": a contributor that touches files spread across the tree has
+ * a centroid that averages back to the tree center, so the old centroid anchor sat
+ * it dead-center no matter how far out it was actually working. We instead blend the
+ * touched-file positions with a strong bias toward the latest touch (see
+ * {@link RECENCY_WEIGHT}), so the orb rides out to the leaf the actor is editing now.
+ *
+ * The outward push is then scaled to the *tree*, not a tiny fixed offset: the actor
+ * is pushed to just past the radius of its touched cluster from the origin (plus a
+ * margin), so it visibly clears the node cluster regardless of how large the tree
+ * has grown. A small deterministic drift on top keeps two actors on the same file
+ * from stacking exactly. Its fade rises while it is active and decays after its last
+ * activity, so an actor that goes quiet dissolves rather than hanging on the canvas.
+ * Every value is a pure function of the supplied activity and playhead `now`, so a
+ * rewound timeline repaints every actor identically.
  */
 
 /**
@@ -40,6 +52,15 @@ export type ActorActivity = {
    * still fading out; its position then holds at its last known centroid.
    */
   touched: Vec2[]
+  /**
+   * Layout-space position of the actor's *most-recently-touched* file: the file it
+   * is working on right now. The anchor is biased strongly toward this so the orb
+   * rides out to where the work currently is, rather than the centroid of every
+   * file the actor has touched (which averages to the tree center for spread-out
+   * work). Omit when the actor has touched nothing this window (it just went quiet
+   * and is fading); the anchor then falls back to the centroid / last-centroid.
+   */
+  recent?: Vec2
   /** Epoch ms of the actor's most recent activity, for the inactivity fade. */
   lastActiveAt: number
   /**
@@ -83,15 +104,17 @@ export type ActorVisualOptions = {
    */
   drift?: number
   /**
-   * How far, in layout units, the actor is pushed radially outward from the world
-   * origin past its touched-files centroid, so it floats just outside the canopy
-   * near its work (Gource-style) instead of sitting in the dense middle of the
-   * tree. Applied along the direction from the origin to the centroid; an actor
-   * working dead-center (centroid at the origin) is pushed by its own drift
-   * direction instead, so it still escapes the middle. `0` disables the outward
-   * push (the actor sits on its raw centroid).
+   * The margin, in layout units, the actor floats *past* the outer radius of its
+   * touched cluster, measured from the world origin. The push is scaled to the
+   * tree: the actor lands at `max(anchorRadius, farthestTouchedRadius) + margin`
+   * from the origin along its anchor's outward ray, so it visibly clears the node
+   * cluster regardless of how large the tree has grown (a tiny fixed offset was
+   * the bug: it was swallowed by a big tree, leaving the actor buried). An actor
+   * working dead-center (anchor at the origin and no touched files) is pushed by
+   * its own drift direction instead, so it still escapes the middle. `0` lets the
+   * actor sit exactly on the cluster's outer edge with no extra margin.
    */
-  outwardOffset?: number
+  outwardMargin?: number
   /**
    * The world origin the outward push is measured from: the tree center the actor
    * is pushed away from. Defaults to the layout origin `{ x: 0, y: 0 }`, which is
@@ -105,12 +128,24 @@ const DEFAULT_SIZE = 10
 const DEFAULT_DRIFT = 14
 
 /**
- * How far an actor is floated outward from the tree center past its touched-files
- * centroid by default, in layout units. Sized comfortably larger than a node's hot
- * radius so the orb clearly clears the canopy and reads as hovering *outside* the
- * work rather than on top of it. A judgment call worth tuning to taste.
+ * How far, in layout units, an actor floats *past* the outer radius of its touched
+ * cluster by default. This is a margin on top of the tree-scaled push (the actor is
+ * floated to just beyond the farthest file it is touching, then this much further),
+ * so it sits clearly outside the canopy at any tree size. Sized comfortably larger
+ * than a node's hot radius so the orb reads as hovering outside the work rather than
+ * on top of it. A judgment call worth tuning to taste.
  */
-const DEFAULT_OUTWARD_OFFSET = 90
+const DEFAULT_OUTWARD_MARGIN = 80
+
+/**
+ * How heavily the anchor favors the actor's most-recent touch over the centroid of
+ * everything it is touching, `0..1`. At `1` the anchor is purely the latest file; at
+ * `0` it is the plain centroid (the old, buried-in-the-middle behavior). High by
+ * design: the whole point is to ride out to where the work *is now*, while the small
+ * centroid share keeps the orb from snapping hard between rapid touches. A judgment
+ * call worth tuning to taste.
+ */
+const RECENCY_WEIGHT = 0.8
 
 /**
  * Computes the full visual of an actor at playhead time `now`. Pure and
@@ -118,11 +153,14 @@ const DEFAULT_OUTWARD_OFFSET = 90
  * `Date.now()` or randomness.
  *
  * The mapping:
- * - **position** is the centroid of the touched-file positions (or `lastCentroid`
- *   while the actor is quiet, or the origin as a last resort), then pushed radially
- *   *outward* from the world origin by `outwardOffset` so the actor floats outside
- *   the canopy near its work, and finally nudged by a small per-actor drift hashed
- *   from the actor id so co-located actors don't overlap.
+ * - **position** anchors on the actor's most-recent touch (blended with the
+ *   touched-files centroid, biased toward the latest file by {@link RECENCY_WEIGHT}),
+ *   or `lastCentroid` while the actor is quiet, or the origin as a last resort. That
+ *   anchor is then pushed radially *outward* from the world origin to just past the
+ *   outer radius of its touched cluster plus `outwardMargin`, so the actor floats
+ *   clearly outside the canopy near its current work at any tree size, and finally
+ *   nudged by a small per-actor drift hashed from the actor id so co-located actors
+ *   don't overlap.
  * - **alpha** is full at the instant of activity and decays linearly to 0 over
  *   `fadeMs` since `lastActiveAt`, so an actor that stops working fades out.
  * - **size** and **color** are constant per actor (the orb size and the actor's
@@ -132,11 +170,16 @@ export function actorVisualFor(activity: ActorActivity, now: number, options: Ac
   const fadeMs = options.fadeMs ?? DEFAULT_FADE_MS
   const size = options.size ?? DEFAULT_SIZE
   const drift = options.drift ?? DEFAULT_DRIFT
-  const outwardOffset = options.outwardOffset ?? DEFAULT_OUTWARD_OFFSET
+  const outwardMargin = options.outwardMargin ?? DEFAULT_OUTWARD_MARGIN
   const origin = options.origin ?? { x: 0, y: 0 }
 
-  const centroid = centroidOf(activity.touched, activity.lastCentroid)
-  const pushed = pushOutward(centroid, origin, outwardOffset, activity.actor)
+  // Anchor on where the actor is working *now*: the most-recent file, blended only
+  // lightly with the centroid of everything it is touching. This is the fix for the
+  // orb sitting dead-center: a spread-out contributor's centroid averages back to the
+  // tree center, but its latest touch is out at a leaf, so the recency-biased anchor
+  // rides out there with the work.
+  const anchor = anchorOf(activity)
+  const pushed = pushPastCluster(anchor, activity.touched, origin, outwardMargin, activity.actor)
   const driftOffset = actorDrift(activity.actor, drift)
   const position = {
     x: pushed.x + driftOffset.x,
@@ -149,43 +192,81 @@ export function actorVisualFor(activity: ActorActivity, now: number, options: Ac
 }
 
 /**
- * Pushes a point radially outward from `origin` by `amount` layout units, so an
- * actor floats just past its touched-files centroid, away from the tree center.
- * The direction is the unit vector from the origin to the centroid; the result
- * sits `amount` further out along that same ray, so the actor always lands
- * *strictly farther* from the origin than its centroid (the property the user
- * wants: contributors orbit the outside near their work).
+ * The actor's anchor before the outward push: a recency-weighted blend of its
+ * most-recent touch and the centroid of everything it is touching. The blend leans
+ * hard toward the recent touch ({@link RECENCY_WEIGHT}), so the orb tracks the file
+ * being edited now rather than the average of every file the actor has touched (the
+ * average is what pinned it to the tree center for cross-tree work).
  *
- * When the centroid coincides with the origin there is no outward direction to
- * push along, so the actor's stable hashed drift direction is used instead. That
- * keeps a dead-center actor from sitting exactly on the origin and still floats it
- * out into its own consistent spot rather than the crowded middle. With
- * `amount === 0` the centroid is returned unchanged.
+ * Falls back gracefully: with no recent touch it is the plain centroid; with no
+ * touches at all it is the parked `lastCentroid` (a quiet, fading actor); and with
+ * no history whatsoever it is the origin (logged, since that is an unexpected state
+ * worth surfacing rather than silently centering).
  */
-function pushOutward(centroid: Vec2, origin: Vec2, amount: number, actor: string): Vec2 {
-  if (amount === 0) {
+function anchorOf(activity: ActorActivity): Vec2 {
+  const centroid = centroidOf(activity.touched, activity.lastCentroid)
+  if (!activity.recent) {
     return centroid
   }
+  return {
+    x: activity.recent.x * RECENCY_WEIGHT + centroid.x * (1 - RECENCY_WEIGHT),
+    y: activity.recent.y * RECENCY_WEIGHT + centroid.y * (1 - RECENCY_WEIGHT),
+  }
+}
 
-  const directionX = centroid.x - origin.x
-  const directionY = centroid.y - origin.y
-  const distance = Math.hypot(directionX, directionY)
+/**
+ * Pushes the `anchor` radially outward from `origin` so the actor floats clearly
+ * past its touched cluster. The push lands the actor at
+ * `max(anchorRadius, farthestTouchedRadius) + margin` from the origin along the
+ * anchor's outward ray. Scaling to the cluster's own outer radius (not a tiny fixed
+ * offset) is the fix for actors getting buried in a large tree: the bigger the tree,
+ * the farther out the push, so the orb always reads as hovering *outside* the work.
+ *
+ * The result is always *strictly farther* from the origin than the anchor (margin is
+ * non-negative and the cluster radius is at least the anchor's own radius), the
+ * property the user wants: contributors orbit the outside near their work.
+ *
+ * When the anchor coincides with the origin there is no outward direction to push
+ * along, so the actor's stable hashed drift direction is used instead, floating a
+ * dead-center actor out into its own consistent spot rather than the crowded middle.
+ */
+function pushPastCluster(anchor: Vec2, touched: Vec2[], origin: Vec2, margin: number, actor: string): Vec2 {
+  const directionX = anchor.x - origin.x
+  const directionY = anchor.y - origin.y
+  const anchorRadius = Math.hypot(directionX, directionY)
 
-  if (distance === 0) {
-    // Centroid is the tree center: no radial direction. Fall back to the actor's
-    // own hashed drift direction so it still escapes the middle deterministically.
+  // Push to just beyond the farthest file the actor is touching, so the orb clears
+  // the whole cluster it is working in, then `margin` further still.
+  const clusterRadius = Math.max(anchorRadius, farthestRadius(touched, origin))
+  const targetRadius = clusterRadius + margin
+
+  if (anchorRadius === 0) {
+    // Anchor is the tree center: no radial direction. Fall back to the actor's own
+    // hashed drift direction so it still escapes the middle deterministically.
     const fallback = actorDrift(actor, 1)
     const fallbackLength = Math.hypot(fallback.x, fallback.y) || 1
     return {
-      x: origin.x + (fallback.x / fallbackLength) * amount,
-      y: origin.y + (fallback.y / fallbackLength) * amount,
+      x: origin.x + (fallback.x / fallbackLength) * targetRadius,
+      y: origin.y + (fallback.y / fallbackLength) * targetRadius,
     }
   }
 
   return {
-    x: centroid.x + (directionX / distance) * amount,
-    y: centroid.y + (directionY / distance) * amount,
+    x: origin.x + (directionX / anchorRadius) * targetRadius,
+    y: origin.y + (directionY / anchorRadius) * targetRadius,
   }
+}
+
+/** The radius of the farthest touched file from `origin`; `0` when none are touched. */
+function farthestRadius(touched: Vec2[], origin: Vec2): number {
+  let farthest = 0
+  for (const position of touched) {
+    const radius = Math.hypot(position.x - origin.x, position.y - origin.y)
+    if (radius > farthest) {
+      farthest = radius
+    }
+  }
+  return farthest
 }
 
 /**
