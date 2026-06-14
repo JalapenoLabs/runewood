@@ -16,6 +16,7 @@ import type { BeamScene } from './render/beamScene'
 import type { LabelScene } from './render/labelScene'
 import type { PickCandidate } from './core/picking'
 import type { PathFilter } from './core/filter'
+import type { CameraMode, RecentNodeSample, RecentActorSample } from './render/cameraMode'
 
 // Core
 import { Timeline } from './core/timeline'
@@ -29,6 +30,7 @@ import { compilePathFilter } from './core/filter'
 
 // Render
 import { Camera, autoFrame } from './render/camera'
+import { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
 import { resolveBloomQuality } from './render/bloom'
 import { PixiBackend } from './render/pixiBackend'
 
@@ -71,7 +73,21 @@ export type RunewoodController = {
   seek: (time: number) => void
   /** Set the playback rate. `1` is real time, `2` double speed, `0.5` half. */
   setSpeed: (multiplier: number) => void
-  /** Pin the camera to auto-frame the active region (`true`) or leave it free (`false`). */
+  /**
+   * Choose how the camera frames the forest: `overview` (ease to fit the whole
+   * active tree), `follow` (the Gource-style camera: ease to the recently-active
+   * region at a closer zoom and travel with the action), or `manual` (leave the
+   * view under the user's drag / wheel control). Selecting `overview` or `follow`
+   * re-engages auto control; a manual pan / zoom flips the mode to `manual` on its
+   * own so the chosen view sticks. The current mode is exposed on
+   * {@link RunewoodController.getState}.
+   */
+  setCameraMode: (mode: CameraMode) => void
+  /**
+   * Backwards-compatible shim for the old boolean follow toggle: `follow(true)`
+   * re-engages the `follow` camera, `follow(false)` switches to `manual` (free
+   * view). New code should prefer {@link RunewoodController.setCameraMode}.
+   */
   follow: (shouldFollow: boolean) => void
   /**
    * Re-read the container size and resize the renderer. Called automatically by an
@@ -181,6 +197,8 @@ export type RunewoodPlaybackState = {
   speed: number
   /** Whether the playhead is pinned to the newest event (following live). */
   following: boolean
+  /** The active camera mode, so a host overlay can reflect overview / follow / manual. */
+  cameraMode: CameraMode
 }
 
 /** Construction options for {@link createRunewood}; every field has a sensible default. */
@@ -197,8 +215,18 @@ export type RunewoodOptions = {
    */
   bloom?: BloomQuality
   /**
-   * Whether the camera auto-frames the active region from the first frame.
-   * Defaults to `true`; equivalent to calling `follow(true)` immediately.
+   * How the camera frames the forest from the first frame (issue #180): `overview`
+   * eases to fit the whole active tree, `follow` is the Gource-style camera that
+   * tracks the recently-active region at a closer zoom, and `manual` leaves the
+   * view under user control. Defaults to `follow`. A manual pan / wheel-zoom flips
+   * the live mode to `manual`; `setCameraMode` re-engages an auto mode.
+   */
+  cameraMode?: CameraMode
+  /**
+   * @deprecated Use {@link cameraMode}. Backwards-compatible boolean follow toggle:
+   * `true` selects the `follow` camera, `false` selects `manual`. Ignored when
+   * {@link cameraMode} is also supplied. Left unset, the default is the `follow`
+   * camera.
    */
   follow?: boolean
   /**
@@ -297,6 +325,22 @@ const ACTIVE_REGION_PADDING = 80
 const EMPTY_REGION_HALF_EXTENT = 200
 
 /**
+ * How far back in playhead time (ms) a node / actor counts as "recently active"
+ * for the `follow` camera. A few seconds keeps the framed region centered on
+ * where work is happening *now* and lets the camera travel as activity moves,
+ * rather than fitting the whole history. Comfortably wider than the actor recency
+ * window so an actor's just-touched files are still in frame when it is.
+ */
+const FOLLOW_ACTIVITY_WINDOW_MS = 5_000
+
+/**
+ * World-space padding around the `follow` camera's recent region. Larger than the
+ * overview padding so a single hot file is framed at a moderate, readable zoom
+ * (Gource-style) instead of filling the screen.
+ */
+const FOLLOW_REGION_PADDING = 240
+
+/**
  * Creates a Runewood controller mounted in `container` and returns it
  * synchronously. The pixi backend initializes asynchronously in the background
  * (pixi v8's device bring-up is async); any `ingest`/`seed` made before it is
@@ -354,9 +398,17 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // order on ready so "ingest immediately after construction" just works.
   const pendingActions: Array<() => void> = []
 
-  // Whether the host wants the camera to track the active region. Honored from the
-  // first frame; toggled by `follow`.
-  let following = options.follow ?? true
+  // How the camera frames the forest (issue #180): `overview` fits the whole tree,
+  // `follow` tracks the recently-active region (Gource-style), `manual` leaves the
+  // view to the user. Honored from the first frame; switched by `setCameraMode`,
+  // by the deprecated `follow` shim, and flipped to `manual` by a manual pan / zoom.
+  // The default is `follow`; the legacy `follow` boolean option still maps (true ->
+  // follow, false -> manual) when `cameraMode` is not given.
+  let cameraMode: CameraMode = resolveInitialCameraMode(options)
+
+  // The last bounds the `follow` camera framed, held so a quiet stretch (nothing
+  // recently active) gently keeps the current view instead of snapping to origin.
+  let lastFollowBounds: WorldBounds | null = null
 
   // The typed event surface (issue #10). Dependency-free; cleared on destroy.
   const emitter = new Emitter<RunewoodEventMap>()
@@ -494,11 +546,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const motionScale = prefersReducedMotion() ? 0 : 1
     springs = stepSprings(springs, targets, deltaMs * motionScale, options.springs)
 
-    // 4. Frame the active region. Under reduced motion we snap straight to the
-    //    framed transform (no glide) so the camera still tracks the action but does
-    //    not animate; otherwise we ease toward it framerate-independently.
-    if (following) {
-      const bounds = activeRegionBounds(targets)
+    // 4. Frame the forest per the camera mode. `overview` fits the whole active
+    //    tree; `follow` (Gource-style) frames only the recently-active region at a
+    //    closer zoom and travels with the action; `manual` leaves the camera under
+    //    user control and frames nothing. Under reduced motion we snap straight to
+    //    the framed transform (no glide) so the camera still tracks the action but
+    //    does not animate; otherwise we ease toward it framerate-independently.
+    if (isAutoCameraMode(cameraMode)) {
+      const bounds = cameraMode === 'follow' ? followRegionBounds(now) : activeRegionBounds(targets)
       if (prefersReducedMotion()) {
         camera.frameBounds(bounds)
       }
@@ -752,6 +807,77 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
   }
 
+  /**
+   * The world bounds the `follow` camera should frame at playhead time `now`: the
+   * Gource-style recently-active region. It collects the live spring position of
+   * every node touched within the recency window (paired with the tree's
+   * `lastTouchedAt`) plus every actor active within it, then defers to the pure
+   * {@link recentActivityBounds} to pad and box them. When nothing is recently
+   * active it returns the last framing (held on `lastFollowBounds`, or a sensible
+   * window before the first frame) so the camera gently holds rather than snapping
+   * to the origin. The chosen region is remembered for that hold.
+   */
+  function followRegionBounds(now: number): WorldBounds {
+    const nodes = recentNodeSamples()
+    const actors = recentActorSamples()
+    const fallback = lastFollowBounds ?? activeRegionBounds(targets)
+    const bounds = recentActivityBounds(nodes, actors, {
+      playhead: now,
+      windowMs: FOLLOW_ACTIVITY_WINDOW_MS,
+      padding: FOLLOW_REGION_PADDING,
+      fallback,
+    })
+    lastFollowBounds = bounds
+    return bounds
+  }
+
+  /**
+   * The follow camera's node samples, gathered in a single walk of the folded tree:
+   * each node's live spring position paired with its `lastTouchedAt`, so the pure
+   * bounds function can window by recency. Walking the tree (rather than iterating
+   * the springs and looking each path up) reads the touch time straight off the
+   * node we already hold. A node with no spring entry yet is skipped (it has no
+   * drawn position); one never touched carries a `null` time and the window drops it.
+   */
+  function recentNodeSamples(): RecentNodeSample[] {
+    const samples: RecentNodeSample[] = []
+    const stack = [ frameState.tree ]
+    while (stack.length > 0) {
+      const node = stack.pop()!
+      for (const child of node.children.values()) {
+        stack.push(child)
+      }
+      if (!node.path) {
+        continue
+      }
+      const physics = springs.get(node.path)
+      if (!physics) {
+        continue
+      }
+      samples.push({ position: physics.position, lastTouchedAt: node.lastTouchedAt })
+    }
+    return samples
+  }
+
+  /**
+   * The follow camera's actor samples: each tracked actor at the centroid of the
+   * files it is touching (or its parked last-centroid while fading), paired with
+   * its `lastActiveAt`. Active actors keep the camera on the worker even if the one
+   * file it just touched has already aged out of the node window.
+   */
+  function recentActorSamples(): RecentActorSample[] {
+    const samples: RecentActorSample[] = []
+    for (const track of frameState.actors.values()) {
+      const position = track.touchedPaths.length > 0
+        ? centroidOfPaths(track.touchedPaths)
+        : track.lastCentroid
+      if (position) {
+        samples.push({ position, lastActiveAt: track.lastActiveAt })
+      }
+    }
+    return samples
+  }
+
   /** The RAF callback: compute the real elapsed delta, tick once, schedule the next frame. */
   function frame(timestamp: number): void {
     if (destroyed) {
@@ -900,9 +1026,10 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       const totalDeltaY = screenPoint.y - dragOrigin.y
       if (Math.hypot(totalDeltaX, totalDeltaY) > CLICK_DRAG_THRESHOLD_PX) {
         dragExceededThreshold = true
-        // A deliberate manual pan detaches auto-follow so the camera stops yanking
-        // the view back to the active region each frame. `follow(true)` re-enables it.
-        following = false
+        // A deliberate manual pan switches the camera to `manual` so it stops
+        // yanking the view back to the active region each frame; the view sticks
+        // like a maps app. `setCameraMode('overview'|'follow')` re-engages auto.
+        cameraMode = 'manual'
       }
       // Pan by the incremental delta since the last move so the world tracks the
       // cursor 1:1. Even sub-threshold moves pan; the threshold only gates whether
@@ -956,8 +1083,8 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   /**
    * Zooms the camera anchored at the cursor on a wheel event, so scrolling up
    * zooms in toward the cursor and down zooms out, clamped by the camera's own
-   * limits. Like a manual pan, a wheel zoom detaches auto-follow so the user's
-   * chosen view sticks. `preventDefault` stops the page from scrolling under it.
+   * limits. Like a manual pan, a wheel zoom switches the camera to `manual` so the
+   * user's chosen view sticks. `preventDefault` stops the page from scrolling under it.
    */
   function handleWheel(wheelEvent: WheelEvent, canvas: HTMLCanvasElement): void {
     wheelEvent.preventDefault()
@@ -965,7 +1092,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // deltaY < 0 is a scroll up (zoom in); raising the factor above 1 zooms in.
     const factor = wheelEvent.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP
     camera.zoomBy(factor, screenAnchor)
-    following = false
+    cameraMode = 'manual'
   }
 
   /**
@@ -1110,8 +1237,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     setSpeed(multiplier: number): void {
       timeline.setSpeed(multiplier)
     },
+    setCameraMode(mode: CameraMode): void {
+      cameraMode = mode
+    },
     follow(shouldFollow: boolean): void {
-      following = shouldFollow
+      // Legacy boolean shim over the camera mode: follow on -> the Gource camera,
+      // follow off -> manual (free view). New code should call `setCameraMode`.
+      cameraMode = shouldFollow ? 'follow' : 'manual'
     },
     on(event, handler) {
       return emitter.on(event, handler)
@@ -1127,6 +1259,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         progress: timeline.progress(),
         speed: timeline.speed,
         following: timeline.live,
+        cameraMode,
       }
     },
     resize(): void {
@@ -1224,6 +1357,22 @@ const CLICK_DRAG_THRESHOLD_PX = 4
  * that still moves perceptibly per notch.
  */
 const WHEEL_ZOOM_STEP = 1.1
+
+/**
+ * Resolves the initial camera mode from the construction options. An explicit
+ * `cameraMode` wins; otherwise the deprecated `follow` boolean maps (`true` ->
+ * `follow`, `false` -> `manual`); with neither set the default is the Gource-style
+ * `follow` camera.
+ */
+function resolveInitialCameraMode(options: RunewoodOptions): CameraMode {
+  if (options.cameraMode !== undefined) {
+    return options.cameraMode
+  }
+  if (options.follow !== undefined) {
+    return options.follow ? 'follow' : 'manual'
+  }
+  return 'follow'
+}
 
 /**
  * Resolves the option's loose theme input (a built-in name, a full theme, or a

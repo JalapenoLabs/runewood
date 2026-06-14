@@ -12,12 +12,13 @@ import type {
   RunewoodActorClickPayload,
   RunewoodPlaybackState,
   PickCandidate,
+  CameraMode,
 } from './index'
 
 // Core
 import { describe, expectTypeOf, it } from 'vitest'
 
-import { createRunewood, Emitter, nearestWithinRadius } from './index'
+import { createRunewood, Emitter, nearestWithinRadius, isAutoCameraMode } from './index'
 
 /**
  * The issue's "public type exports verified" acceptance criterion: a type-level
@@ -64,8 +65,17 @@ describe('public type exports', () => {
       progress: number
       speed: number
       following: boolean
+      cameraMode: CameraMode
     }>()
     expectTypeOf<RunewoodController['getState']>().returns.toEqualTypeOf<RunewoodPlaybackState>()
+  })
+
+  it('exposes the camera-mode surface (option, setter, state, and the mode union)', () => {
+    expectTypeOf<CameraMode>().toEqualTypeOf<'overview' | 'follow' | 'manual'>()
+    expectTypeOf<RunewoodOptions>().toHaveProperty('cameraMode')
+    expectTypeOf<RunewoodController['setCameraMode']>().parameter(0).toEqualTypeOf<CameraMode>()
+    expectTypeOf(isAutoCameraMode).parameter(0).toEqualTypeOf<CameraMode>()
+    expectTypeOf(isAutoCameraMode).returns.toEqualTypeOf<boolean>()
   })
 
   it('types on() to return an unsubscribe function and infer the payload', () => {

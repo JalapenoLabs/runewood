@@ -14,6 +14,12 @@ export type {
 export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
 export type { PickCandidate } from './core/picking'
 export type { PathFilter, PathFilterOptions } from './core/filter'
+export type {
+  CameraMode,
+  RecentNodeSample,
+  RecentActorSample,
+  RecentActivityBoundsOptions,
+} from './render/cameraMode'
 
 export { applyEvent, createTree, seedTree } from './core/tree'
 export { Timeline } from './core/timeline'
@@ -22,6 +28,7 @@ export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from '.
 export { Emitter } from './core/emitter'
 export { nearestWithinRadius } from './core/picking'
 export { compilePathFilter } from './core/filter'
+export { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
 
 // The public controller: the single entry point a host mounts against a div.
 export { createRunewood } from './runewood'

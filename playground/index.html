@@ -108,6 +108,37 @@
         flex: 1 1 auto;
       }
 
+      /* The camera-mode segmented control: three equal buttons, the active mode
+         highlighted. It reflects the live mode from getState().cameraMode, so a
+         manual pan / wheel-zoom visibly flips the highlight to Manual. */
+      .segmented {
+        display: flex;
+        gap: 0;
+      }
+
+      .segmented button {
+        flex: 1 1 0;
+        border-radius: 0;
+        border-left-width: 0;
+      }
+
+      .segmented button:first-child {
+        border-top-left-radius: 8px;
+        border-bottom-left-radius: 8px;
+        border-left-width: 1px;
+      }
+
+      .segmented button:last-child {
+        border-top-right-radius: 8px;
+        border-bottom-right-radius: 8px;
+      }
+
+      .segmented button.active {
+        background: rgba(150, 120, 255, 0.85);
+        color: #0c0a18;
+        font-weight: 600;
+      }
+
       #state-readout {
         margin: 0;
         padding: 8px;
@@ -247,6 +278,19 @@
       </div>
 
       <div class="field">
+        <label>Camera</label>
+        <div class="segmented" id="camera-mode">
+          <button id="camera-overview" type="button" data-mode="overview">Overview</button>
+          <button id="camera-follow" type="button" data-mode="follow">Follow</button>
+          <button id="camera-manual" type="button" data-mode="manual">Manual</button>
+        </div>
+        <p class="hint">
+          Follow tracks recent activity (Gource-style). Drag or wheel-zoom flips to
+          Manual; click Overview / Follow to re-engage.
+        </p>
+      </div>
+
+      <div class="field">
         <div class="row">
           <label for="rate">Events/sec</label>
           <input id="rate" type="range" min="0" max="120" step="1" value="14" />
@@ -302,7 +346,7 @@
       <pre id="state-readout">{}</pre>
 
       <p class="hint">
-        Drag to pan, wheel to zoom (auto-follow detaches). Hover a node for its
+        Drag to pan, wheel to zoom (camera switches to Manual). Hover a node for its
         path. nodeClick / actorClick log to the console.
       </p>
     </div>

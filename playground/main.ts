@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { ThemeName } from '../src/index'
+import type { ThemeName, CameraMode } from '../src/index'
 import type { BloomQuality } from '../src/render/bloom'
 
 // Core
@@ -82,6 +82,13 @@ function main(): void {
   const excludeInput = requireElement<HTMLTextAreaElement>('exclude')
   const hoverTooltip = requireElement<HTMLDivElement>('hover-tooltip')
   const fpsCounter = requireElement<HTMLDivElement>('fps-counter')
+  // The camera-mode segmented control: one button per mode, the active one
+  // highlighted from the live `getState().cameraMode`.
+  const cameraModeButtons: Record<CameraMode, HTMLButtonElement> = {
+    overview: requireElement<HTMLButtonElement>('camera-overview'),
+    follow: requireElement<HTMLButtonElement>('camera-follow'),
+    manual: requireElement<HTMLButtonElement>('camera-manual'),
+  }
 
   // Drive the FPS readout off the page's own requestAnimationFrame deltas, which
   // tick at the display refresh and reflect the real render rate the user feels.
@@ -93,16 +100,24 @@ function main(): void {
   // theme + colorForPath the forest uses and refreshed whenever the theme changes.
   renderLegend(legendGrid, themeSelect.value as ThemeName)
 
-  // Build the engine. We start paused-following-live so the synthetic stream's
-  // newest events drag the view, and pre-seed the known structure as dim nodes.
-  // The exclude globs from the panel feed the controller's construction-time path
-  // filter, so excluded paths (node_modules, __pycache__, ...) never enter the forest.
+  // Build the engine. We start following-live so the synthetic stream's newest
+  // events drag the view, and pre-seed the known structure as dim nodes. The
+  // exclude globs from the panel feed the controller's construction-time path
+  // filter, so excluded paths (node_modules, __pycache__, ...) never enter the
+  // forest. The camera defaults to `follow` (the Gource-style camera) so that
+  // behavior is what an operator sees first.
+  //
+  // Note: the follow camera looks best with *coherent* activity that travels as a
+  // region. The synthetic generator scatters events randomly across the whole
+  // forest, so the follow camera will travel a fair bit chasing the spread; a later
+  // batch reduces the generator to 2 contributors, which tightens it.
   let controller = createRunewood(canvasHost, {
     theme: 'dusk',
     bloom: 'high',
     showLabels: true,
     autoplay: true,
     followLive: true,
+    cameraMode: 'follow',
     exclude: parseExcludePatterns(excludeInput.value),
   })
   controller.seed(seedPaths())
@@ -148,6 +163,24 @@ function main(): void {
       controller.play()
     }
   })
+
+  // Wire the camera-mode buttons: clicking one re-engages that mode via
+  // `setCameraMode`. The highlight is not set here; it is driven from the live
+  // `getState().cameraMode` in the readout interval below, so a manual pan / wheel
+  // zoom (which flips the engine to `manual` on its own) is reflected too.
+  for (const button of Object.values(cameraModeButtons)) {
+    button.addEventListener('click', () => {
+      const mode = button.dataset.mode as CameraMode
+      controller.setCameraMode(mode)
+    })
+  }
+
+  /** Highlights the button for `mode` and clears the others, reflecting the live camera mode. */
+  function syncCameraModeButtons(mode: CameraMode): void {
+    for (const [ buttonMode, button ] of Object.entries(cameraModeButtons)) {
+      button.classList.toggle('active', buttonMode === mode)
+    }
+  }
 
   // Theme, bloom, and labels are construction-time options on the controller, so
   // changing them rebuilds it in place. We hand the fresh controller the same
@@ -198,6 +231,7 @@ function main(): void {
       showLabels: labelsToggle.checked,
       autoplay: true,
       followLive: true,
+      cameraMode: 'follow',
       exclude: parseExcludePatterns(excludeInput.value),
     })
     controller.seed(seedPaths())
@@ -212,9 +246,13 @@ function main(): void {
   }
 
   // The live state readout: a tiny JSON dump of `getState()`, refreshed on a timer
-  // so an operator can watch the playhead, duration, and follow flag move.
+  // so an operator can watch the playhead, duration, and follow flag move. The same
+  // poll reflects the live camera mode onto the segmented control, so a manual pan /
+  // wheel-zoom visibly flips the highlight to Manual.
   setInterval(() => {
-    stateReadout.textContent = JSON.stringify(controller.getState(), null, 2)
+    const state = controller.getState()
+    stateReadout.textContent = JSON.stringify(state, null, 2)
+    syncCameraModeButtons(state.cameraMode)
   }, STATE_READOUT_INTERVAL_MS)
 }
 
