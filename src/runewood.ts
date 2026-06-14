@@ -18,9 +18,11 @@ import type { PickCandidate } from './core/picking'
 import type { PathFilter } from './core/filter'
 import type { VisibleNode } from './core/collapse'
 import type { CameraMode, RecentNodeSample, RecentActorSample } from './render/cameraMode'
+import type { Hsl } from './core/theme'
 
 // Core
 import { Timeline } from './core/timeline'
+import { HighlightRegistry } from './core/highlight'
 import { computeTargets, stepSprings } from './core/layout'
 import { collapseTree } from './core/collapse'
 import { defaultTheme, mergeTheme, themes } from './core/theme'
@@ -121,12 +123,64 @@ export type RunewoodController = {
    */
   getState: () => RunewoodPlaybackState
   /**
+   * Light up a SET of nodes with a breathing "watch this" glow that persists until
+   * the host clears it (issue #180). Unlike the event-driven touch flash, a
+   * highlight is a LIVE overlay: its pulse runs on wall/frame time (not the
+   * playhead), so it keeps breathing while playback is paused or being scrubbed,
+   * and it survives a seek untouched. The canonical use is Seraphim's watch page
+   * lighting every file a pull request touched while its CI runs, then clearing
+   * them when CI finishes.
+   *
+   * Returns a {@link RunewoodHighlight} handle so the host can grow / shrink the set
+   * as work progresses (`update`) or drop it (`clear`). Pass an `id` to address a
+   * specific group later (re-using an id replaces that group); omit it for a fresh
+   * generated id. The default color is a sensible attention amber.
+   *
+   * Overlaps resolve most-recently-added-wins: a node lit by two groups shows the
+   * newer group's color. Call {@link clearHighlights} to drop every group at once.
+   */
+  highlight: (paths: string[], options?: HighlightOptions) => RunewoodHighlight
+  /** Drop every active highlight group at once (e.g. all CI runs finished). */
+  clearHighlights: () => void
+  /**
    * Tear everything down: stop the RAF loop, disconnect the observer and media
    * query, drop every event subscriber, dispose every scene and the backend
    * (releasing all GPU resources), and remove the canvas from the container.
    * Idempotent and leak-free.
    */
   destroy: () => void
+}
+
+/**
+ * Options for {@link RunewoodController.highlight}. Both fields are optional: the
+ * color defaults to a sensible attention amber, and an omitted id gets a fresh
+ * generated one. Passing an existing id replaces that group in place.
+ */
+export type HighlightOptions = {
+  /** The ring color for this group's nodes. Defaults to {@link DEFAULT_HIGHLIGHT_COLOR} (amber). */
+  color?: Hsl
+  /**
+   * A stable id for the group, so the host can update or clear exactly this set
+   * later (e.g. one id per pull request). Re-using an id replaces that group's
+   * paths + color. Omit it to get a fresh generated id back on the handle.
+   */
+  id?: string
+}
+
+/**
+ * The handle {@link RunewoodController.highlight} returns: a small remote for one
+ * live highlight group. The host keeps it to drive the group as work progresses
+ * (`update` the set of lit paths, e.g. adding a newly-touched file as CI advances)
+ * and to remove it when done (`clear`, e.g. CI finished). `id` is the group's
+ * resolved id (the one passed in, or the generated one).
+ */
+export type RunewoodHighlight = {
+  /** The group's resolved id, stable for its lifetime. */
+  id: string
+  /** Replace the set of lit paths for this group, keeping its color. The per-file progressive update. */
+  update: (paths: string[]) => void
+  /** Remove this group's highlight. Idempotent; a second call is a harmless no-op. */
+  clear: () => void
 }
 
 /** Payload for the `seek` event: where the playhead landed, as time and fraction. */
@@ -454,6 +508,24 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // The typed event surface (issue #10). Dependency-free; cleared on destroy.
   const emitter = new Emitter<RunewoodEventMap>()
 
+  // The live "watch this" highlight overlay (issue #180): the set of highlight
+  // groups a host registered (e.g. a PR's files while CI runs). It is a "now"
+  // concern, deliberately OUTSIDE the replayable fold, so it persists across
+  // pause/seek and animates on the wall clock below, never the playhead. Cleared on
+  // destroy.
+  const highlights = new HighlightRegistry()
+
+  // The wall/frame animation clock for the highlights, accumulated from each frame's
+  // real `deltaMs`. It is kept entirely separate from the playhead (`timeline.time`)
+  // so a highlighted node keeps breathing even while playback is paused or being
+  // scrubbed: a seek moves the playhead, this clock only ever moves forward by real
+  // elapsed time. A monotonically rising counter is all the pure pulse needs.
+  let highlightClockMs = 0
+
+  // Counter for generated highlight-group ids, so a host that omits an id still gets
+  // a stable, unique one back on the handle.
+  let nextHighlightId = 0
+
   // Whether labels are drawn at all (the LOD policy still governs which show). A
   // host can suppress the whole label scene without touching the LOD knobs.
   const showLabels = options.showLabels ?? true
@@ -545,6 +617,12 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     if (!scene || !beamScene || !labelScene) {
       return
     }
+
+    // Advance the highlights' wall/frame animation clock by the real elapsed time,
+    // unconditionally. It is independent of the playhead, so the highlight rings
+    // breathe at a steady real-time cadence whether playback is playing, paused, or
+    // being scrubbed; only this clock (never `timeline.time`) drives their pulse.
+    highlightClockMs += deltaMs
 
     // 1. Advance the clock when playing (forward play crosses events here), then
     //    fold the tree up to wherever the playhead now sits regardless of how it
@@ -651,7 +729,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // how far the camera has pulled out. `snapshot.zoom` is the same value the
     // backend was just handed, so the floors track exactly what is on screen.
     const zoom = snapshot.zoom
-    scene.update(frameState.tree, springs, now, theme, zoom, visibleByPath)
+    // Thread the live highlight overlay + its own wall-clock animation time into the
+    // scene so highlighted nodes draw a breathing ring that animates independently of
+    // the playhead. `highlights` is passed even when empty (the scene cheaply skips
+    // the ring work then); `highlightClockMs` is the wall clock accumulated above.
+    scene.update(frameState.tree, springs, now, theme, zoom, visibleByPath, highlights, highlightClockMs)
 
     const activities = buildActorActivities()
     beamScene.update(activities, now, theme, zoom)
@@ -1344,6 +1426,28 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         cameraMode,
       }
     },
+    highlight(paths: string[], highlightOptions: HighlightOptions = {}): RunewoodHighlight {
+      const id = highlightOptions.id ?? `highlight-${nextHighlightId++}`
+      const color = highlightOptions.color ?? DEFAULT_HIGHLIGHT_COLOR
+      // Register the group immediately. The registry is plain in-memory state the
+      // tick reads each frame, so it takes effect on the very next draw whether or
+      // not the backend has finished initializing; no queueing needed.
+      highlights.set(id, paths, color)
+      return {
+        id,
+        update(nextPaths: string[]): void {
+          // Per-file progressive update (e.g. CI revealed another touched file):
+          // replace just this group's paths, keeping its color and overlap priority.
+          highlights.updatePaths(id, nextPaths)
+        },
+        clear(): void {
+          highlights.remove(id)
+        },
+      }
+    },
+    clearHighlights(): void {
+      highlights.clear()
+    },
     resize(): void {
       if (ready) {
         doResize()
@@ -1390,6 +1494,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       pointerLeaveListener = null
       wheelListener = null
       emitter.clear()
+      // Drop every live highlight so a torn-down controller leaves no overlay state
+      // behind (the scenes that drew the rings are disposed just below).
+      highlights.clear()
 
       scene?.clear()
       beamScene?.dispose()
@@ -1436,6 +1543,16 @@ const CLICK_DRAG_THRESHOLD_PX = 4
  * that still moves perceptibly per notch.
  */
 const WHEEL_ZOOM_STEP = 1.1
+
+/**
+ * The default highlight ring color when a host calls
+ * {@link RunewoodController.highlight} without one: a warm attention amber. It is a
+ * deliberate "watch this" hue that stands clear of the cool dusk background and of
+ * the cooler-leaning file palette, so a highlighted set reads at a glance. A host
+ * with its own semantics (e.g. green for passing CI, red for failing) overrides it
+ * per call via {@link HighlightOptions.color}.
+ */
+const DEFAULT_HIGHLIGHT_COLOR: Hsl = { h: 38, s: 0.95, l: 0.58 }
 
 /**
  * Resolves the initial camera mode from the construction options. An explicit

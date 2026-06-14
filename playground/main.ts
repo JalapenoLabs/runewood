@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { ThemeName, CameraMode } from '../src/index'
+import type { ThemeName, CameraMode, RunewoodEvent, RunewoodHighlight } from '../src/index'
 import type { BloomQuality } from '../src/render/bloom'
 
 // Core
@@ -51,6 +51,19 @@ const LEGEND_FILE_SAMPLES = [
 const STATE_READOUT_INTERVAL_MS = 250
 
 /**
+ * How long the simulated CI run keeps its PR files glowing before it auto-clears,
+ * standing in for "CI finished". The operator can also click the button again to
+ * clear early.
+ */
+const SIMULATED_CI_DURATION_MS = 6_000
+
+/** How many current files a simulated PR "touches", chosen at random from the live forest. */
+const SIMULATED_PR_FILE_COUNT = 6
+
+/** The amber attention color the simulated-CI highlight uses, matching the library's default. */
+const CI_HIGHLIGHT_COLOR = { h: 38, s: 0.95, l: 0.58 } as const
+
+/**
  * Exponential-smoothing weight for the FPS readout: each frame blends this much of
  * the new instantaneous rate into the running average, so the number is steady and
  * readable rather than jittering every frame. ~0.1 settles within a few frames
@@ -70,6 +83,7 @@ function main(): void {
   const startStopButton = requireElement<HTMLButtonElement>('start-stop')
   const burstButton = requireElement<HTMLButtonElement>('burst')
   const resetButton = requireElement<HTMLButtonElement>('reset')
+  const simulateCiButton = requireElement<HTMLButtonElement>('simulate-ci')
   const rateInput = requireElement<HTMLInputElement>('rate')
   const rateValue = requireElement<HTMLSpanElement>('rate-value')
   const themeSelect = requireElement<HTMLSelectElement>('theme')
@@ -128,13 +142,68 @@ function main(): void {
   wireControllerLogging(controller)
   wireHoverTooltip(controller, hoverTooltip)
 
+  // The set of file paths the live forest currently knows about, accumulated from
+  // the synthetic stream so the "Simulate CI on a PR" button can pick a handful of
+  // *real, on-screen* files to highlight. The library itself does not expose the
+  // forest (the host owns its own data), so the playground tracks it here off the
+  // very events it ingests. Seeded so the button works before the stream warms up.
+  const seenFilePaths = new Set<string>(seedPaths())
+
+  // The active simulated-CI highlight handle + its auto-clear timer, so a second
+  // button click (or a rebuild / reset) can clear it early and tear the timer down.
+  let ciHighlight: RunewoodHighlight | null = null
+  let ciClearTimer: ReturnType<typeof setTimeout> | null = null
+
+  /**
+   * The event sink the synthetic stream pushes into: forwards every event to the
+   * live controller and records any file path it carries, so the simulated-CI demo
+   * has a pool of current files to light up. Re-reads the outer `controller` binding
+   * on each call, so a controller rebuild is picked up for free.
+   */
+  function ingest(event: RunewoodEvent): void {
+    controller.ingest(event)
+    if (event.path !== undefined) {
+      seenFilePaths.add(event.path)
+    }
+  }
+
+  /** Stops any running simulated-CI highlight and clears its auto-clear timer. */
+  function stopSimulatedCi(): void {
+    if (ciClearTimer !== null) {
+      clearTimeout(ciClearTimer)
+      ciClearTimer = null
+    }
+    ciHighlight?.clear()
+    ciHighlight = null
+    simulateCiButton.textContent = 'Simulate CI on a PR'
+  }
+
+  // The simulated-CI demo (issue #180): on the first click, pick a handful of current
+  // files (a fake PR's touched set), highlight them amber, and auto-clear after a few
+  // seconds (CI "finished"). A second click clears early. This mirrors exactly how a
+  // host like Seraphim drives the feature: highlight on CI start, clear on CI finish.
+  simulateCiButton.addEventListener('click', () => {
+    if (ciHighlight) {
+      stopSimulatedCi()
+      return
+    }
+    const prFiles = pickRandomPaths(seenFilePaths, SIMULATED_PR_FILE_COUNT)
+    if (prFiles.length === 0) {
+      console.debug('[runewood] Simulate CI: no files in the forest yet, nothing to highlight')
+      return
+    }
+    ciHighlight = controller.highlight(prFiles, { color: CI_HIGHLIGHT_COLOR, id: 'simulated-ci' })
+    simulateCiButton.textContent = 'CI running... (click to clear)'
+    ciClearTimer = setTimeout(() => stopSimulatedCi(), SIMULATED_CI_DURATION_MS)
+  })
+
   // The synthetic stream is held in a mutable binding (not a const) so the Reset
   // button can throw the whole generator away and start a brand-new one from an
   // empty forest, rather than resuming the retained one. Its `onEvent` re-reads the
   // outer `controller` on every emit, so a controller rebuild is picked up for free.
   let stream = createSyntheticStream({
     eventsPerSecond: Number(rateInput.value),
-    onEvent: (event) => controller.ingest(event),
+    onEvent: ingest,
   })
   stream.start()
 
@@ -234,6 +303,9 @@ function main(): void {
 
   function rebuild(): void {
     const wasRunning = stream.isRunning()
+    // The simulated-CI highlight belongs to the controller we are about to destroy;
+    // stop it (and its auto-clear timer) so no stale handle or button label survives.
+    stopSimulatedCi()
     controller.destroy()
     // The tooltip belongs to the old controller's hover events; hide it so a stale
     // path does not linger across the rebuild.
@@ -268,6 +340,10 @@ function main(): void {
    * drives the fresh generator.
    */
   function reset(): void {
+    // Stop the simulated-CI highlight first: the controller it lives on is destroyed
+    // here, and the forest is wiped, so any tracked PR files no longer exist.
+    stopSimulatedCi()
+    seenFilePaths.clear()
     controller.destroy()
     stream.stop()
     hoverTooltip.style.display = 'none'
@@ -290,7 +366,7 @@ function main(): void {
     // continuing the previous run's retained tree.
     stream = createSyntheticStream({
       eventsPerSecond: Number(rateInput.value),
-      onEvent: (event) => controller.ingest(event),
+      onEvent: ingest,
     })
     stream.start()
     syncStartStopLabel()
@@ -416,6 +492,24 @@ function renderLegend(grid: HTMLDivElement, themeName: ThemeName): void {
     item.append(swatch, text)
     return item
   }))
+}
+
+/**
+ * Picks up to `count` random distinct paths from a set, standing in for the files a
+ * pull request touched. A partial Fisher-Yates over a copy: it shuffles only as many
+ * entries as it needs, so it stays cheap even on a large forest, and returns fewer
+ * than `count` when the set is smaller.
+ */
+function pickRandomPaths(paths: Set<string>, count: number): string[] {
+  const pool = [ ...paths ]
+  const take = Math.min(count, pool.length)
+  for (let index = 0; index < take; index += 1) {
+    const swapWith = index + Math.floor(Math.random() * (pool.length - index))
+    const temporary = pool[index]
+    pool[index] = pool[swapWith]
+    pool[swapWith] = temporary
+  }
+  return pool.slice(0, take)
 }
 
 /** Fetches an element by id, throwing loudly if the page markup is missing it. */

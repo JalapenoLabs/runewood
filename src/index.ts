@@ -13,6 +13,11 @@ export type {
   HeatOptions,
 } from './core/layout'
 export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
+export type {
+  HighlightGroup,
+  HighlightResolution,
+  HighlightPulseOptions,
+} from './core/highlight'
 export type { PickCandidate } from './core/picking'
 export type { PathFilter, PathFilterOptions } from './core/filter'
 export type {
@@ -28,6 +33,7 @@ export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
 export { Emitter } from './core/emitter'
+export { HighlightRegistry, highlightPulse } from './core/highlight'
 export { nearestWithinRadius } from './core/picking'
 export { compilePathFilter } from './core/filter'
 export { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
@@ -43,4 +49,6 @@ export type {
   RunewoodActorClickPayload,
   RunewoodNodeHoverPayload,
   RunewoodPlaybackState,
+  HighlightOptions,
+  RunewoodHighlight,
 } from './runewood'

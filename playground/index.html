@@ -279,6 +279,15 @@
       </div>
 
       <div class="field">
+        <button id="simulate-ci" type="button">Simulate CI on a PR</button>
+        <p class="hint">
+          Picks a handful of current files (a fake PR's touched files) and makes them
+          glow amber until CI "finishes". Click again to clear early; otherwise it
+          clears itself after a few seconds.
+        </p>
+      </div>
+
+      <div class="field">
         <label>Camera</label>
         <div class="segmented" id="camera-mode">
           <button id="camera-overview" type="button" data-mode="overview">Overview</button>
