@@ -40,6 +40,15 @@ export type LayoutOptions = {
    * stays exact; it only breaks up the mechanical perfection of the rings.
    */
   jitter?: number
+  /**
+   * Whether the forest root (`path: ''`) is a drawn center node the repo roots
+   * branch off of. Forwarded to {@link collapseTree} so the layout and the scene
+   * agree on the visible set. It does not change where anything is placed (the root
+   * already sits at `center` and the repos at the first ring either way); it only
+   * controls whether the collapse yields the root for the scene to draw. Defaults
+   * to `false`: the original ring-of-fans behavior.
+   */
+  rootVisible?: boolean
 }
 
 /**
@@ -135,7 +144,15 @@ export function computeTargets(tree: TreeNode, options: LayoutOptions = {}): Map
   // Collapse pass-through directories away first, then group the surviving visible
   // nodes by their display-parent so the radial recursion walks only what is drawn.
   // The forest root's path (`''`) is the display-parent of every repo root.
-  const visibleByDisplayParent = groupByDisplayParent(collapseTree(tree))
+  //
+  // When the root is drawn (`rootVisible`), `collapseTree` also yields the forest
+  // root itself with display-parent `''`; we drop it from the grouping so it is not
+  // mistaken for a child of the center (it *is* the center, placed explicitly
+  // below). Its presence in the visible list only matters to the scene/labels.
+  const visibleNodes = collapseTree(tree, { rootVisible: options.rootVisible }).filter(
+    (visible) => !visible.isForestRoot,
+  )
+  const visibleByDisplayParent = groupByDisplayParent(visibleNodes)
 
   placeVisibleChildren(tree.path, { angle: 0, span: Math.PI }, 0, {
     center,

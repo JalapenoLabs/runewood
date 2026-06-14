@@ -181,10 +181,104 @@ describe('actorVisualFor', () => {
     })
   })
 
-  describe('fade rises with activity and decays after inactivity', () => {
+  describe('lingers on its last node through idle gaps (Part C)', () => {
+    it('stays fully present through a brief idle gap, well past the old short fade', () => {
+      // The bug: an LLM agent edits a file then pauses, and the actor used to fade out
+      // after a few seconds. With a long linger it must STAY parked at full presence.
+      const lastActiveAt = 5_000
+      const activity = makeActivity({ lastActiveAt })
+
+      // Eight seconds idle (past the old 3s fade) but well inside a long linger:
+      // still fully present (no idle pulse configured, so exactly 1).
+      const visual = actorVisualFor(activity, lastActiveAt + 8_000, {
+        lingerMs: 60_000,
+        idlePulseDepth: 0,
+      })
+      expect(visual.alpha).toBe(1)
+    })
+
+    it('only begins fading after the configured long linger, not the fade window', () => {
+      const lastActiveAt = 0
+      const lingerMs = 10_000
+      const fadeMs = 2_000
+      const activity = makeActivity({ lastActiveAt })
+
+      // At the end of the linger it is still full; the fade has not started.
+      const atLingerEnd = actorVisualFor(activity, lingerMs, { lingerMs, fadeMs, idlePulseDepth: 0 })
+      expect(atLingerEnd.alpha).toBe(1)
+
+      // Halfway through the fade (which starts only after the linger): half present.
+      const midFade = actorVisualFor(activity, lingerMs + fadeMs / 2, { lingerMs, fadeMs, idlePulseDepth: 0 })
+      expect(midFade.alpha).toBeCloseTo(0.5, 5)
+
+      // Past the linger + fade: fully gone.
+      const afterFade = actorVisualFor(activity, lingerMs + fadeMs, { lingerMs, fadeMs, idlePulseDepth: 0 })
+      expect(afterFade.alpha).toBe(0)
+    })
+
+    it('breathes a gentle, bounded idle pulse once parked (size and alpha dip together)', () => {
+      const lastActiveAt = 0
+      const idleAfterMs = 500
+      const idlePulseMs = 2_000
+      const idlePulseDepth = 0.2
+      const lingerMs = 60_000
+      const baseSize = 10
+      const activity = makeActivity({ lastActiveAt })
+      const tuning = { lingerMs, idleAfterMs, idlePulseMs, idlePulseDepth, size: baseSize }
+
+      // Still active (under idleAfterMs): no breathing, full size and alpha.
+      const fresh = actorVisualFor(activity, idleAfterMs, tuning)
+      expect(fresh.alpha).toBe(1)
+      expect(fresh.size).toBeCloseTo(baseSize, 6)
+
+      // At the trough of the first breath (half a period after idling starts): the
+      // size and alpha dip by exactly the depth, never more.
+      const trough = actorVisualFor(activity, idleAfterMs + idlePulseMs / 2, tuning)
+      expect(trough.alpha).toBeCloseTo(1 - idlePulseDepth, 5)
+      expect(trough.size).toBeCloseTo(baseSize * (1 - idlePulseDepth), 5)
+
+      // Back at the top of the breath one full period later: returned to full.
+      const peak = actorVisualFor(activity, idleAfterMs + idlePulseMs, tuning)
+      expect(peak.alpha).toBeCloseTo(1, 5)
+      expect(peak.size).toBeCloseTo(baseSize, 5)
+    })
+
+    it('keeps the idle breath bounded within [1 - depth, 1] across the whole cycle', () => {
+      const idlePulseDepth = 0.3
+      const tuning = { lingerMs: 60_000, idleAfterMs: 0, idlePulseMs: 1_000, idlePulseDepth, size: 10 }
+      const activity = makeActivity({ lastActiveAt: 0 })
+
+      // Sample the breath densely over two full cycles; it must never brighten past
+      // full nor dim below the configured depth.
+      for (let nowMs = 0; nowMs <= 2_000; nowMs += 37) {
+        const visual = actorVisualFor(activity, nowMs, tuning)
+        expect(visual.alpha).toBeLessThanOrEqual(1 + 1e-9)
+        expect(visual.alpha).toBeGreaterThanOrEqual(1 - idlePulseDepth - 1e-9)
+      }
+    })
+
+    it('parks at its last centroid while lingering quiet, pushed just outside it', () => {
+      // After the recency window clears the touched files, a lingering actor falls
+      // back to its parked last-centroid (still pushed outward by the margin), so it
+      // stays floating outside its last work rather than snapping to the origin.
+      const quiet = makeActivity({ touched: [], recent: undefined, lastCentroid: { x: 300, y: 0 }})
+      const visual = actorVisualFor(quiet, 1_000, { drift: 0, outwardMargin: 40, lingerMs: 60_000 })
+
+      const distanceFromOrigin = Math.hypot(visual.position.x, visual.position.y)
+      // Parked outside its last centroid: the centroid radius (300) plus the margin.
+      expect(distanceFromOrigin).toBeCloseTo(340, 5)
+    })
+  })
+
+  describe('fade decays after the linger window elapses', () => {
+    // These exercise the raw fade with linger disabled (lingerMs: 0) and no idle
+    // pulse, so the fade is measured straight from lastActiveAt as before Part C. The
+    // lingering behavior itself is covered in its own describe above.
+    const noLinger = { lingerMs: 0, idlePulseDepth: 0 } as const
+
     it('is full at the instant of activity', () => {
       const activity = makeActivity({ lastActiveAt: 5000 })
-      const visual = actorVisualFor(activity, 5000, { fadeMs: 3000 })
+      const visual = actorVisualFor(activity, 5000, { ...noLinger, fadeMs: 3000 })
       expect(visual.alpha).toBe(1)
     })
 
@@ -193,9 +287,9 @@ describe('actorVisualFor', () => {
       const fadeMs = 3000
       const activity = makeActivity({ lastActiveAt })
 
-      const atActivity = actorVisualFor(activity, lastActiveAt, { fadeMs })
-      const midFade = actorVisualFor(activity, lastActiveAt + fadeMs / 2, { fadeMs })
-      const afterFade = actorVisualFor(activity, lastActiveAt + fadeMs, { fadeMs })
+      const atActivity = actorVisualFor(activity, lastActiveAt, { ...noLinger, fadeMs })
+      const midFade = actorVisualFor(activity, lastActiveAt + fadeMs / 2, { ...noLinger, fadeMs })
+      const afterFade = actorVisualFor(activity, lastActiveAt + fadeMs, { ...noLinger, fadeMs })
 
       expect(atActivity.alpha).toBeCloseTo(1, 5)
       expect(midFade.alpha).toBeCloseTo(0.5, 5)
@@ -204,7 +298,7 @@ describe('actorVisualFor', () => {
 
     it('clamps a long-idle actor to zero, never negative', () => {
       const activity = makeActivity({ lastActiveAt: 1000 })
-      const visual = actorVisualFor(activity, 1000 + 100_000, { fadeMs: 3000 })
+      const visual = actorVisualFor(activity, 1000 + 100_000, { ...noLinger, fadeMs: 3000 })
       expect(visual.alpha).toBe(0)
     })
 
@@ -212,8 +306,8 @@ describe('actorVisualFor', () => {
       const stale = makeActivity({ lastActiveAt: 1000 })
       const refreshed = makeActivity({ lastActiveAt: 9000 })
 
-      const staleVisual = actorVisualFor(stale, 9500, { fadeMs: 3000 })
-      const refreshedVisual = actorVisualFor(refreshed, 9500, { fadeMs: 3000 })
+      const staleVisual = actorVisualFor(stale, 9500, { ...noLinger, fadeMs: 3000 })
+      const refreshedVisual = actorVisualFor(refreshed, 9500, { ...noLinger, fadeMs: 3000 })
 
       expect(refreshedVisual.alpha).toBeGreaterThan(staleVisual.alpha)
       expect(refreshedVisual.alpha).toBeCloseTo(1 - 500 / 3000, 5)

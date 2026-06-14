@@ -81,9 +81,17 @@ export type ActorActivity = {
 export type ActorVisual = {
   /** Layout-space position: the touched-file centroid plus a gentle hashed drift. */
   position: Vec2
-  /** Presence opacity, `0..1`. Full while active, decaying after the last activity. */
+  /**
+   * Presence opacity, `0..1`. Full while active and through the linger window, then
+   * decaying after the long inactivity timeout. A gentle idle breathing modulates it
+   * down a little while the actor is parked and waiting (see {@link ActorVisualOptions}).
+   */
   alpha: number
-  /** Draw size in layout units. */
+  /**
+   * Draw size in layout units. While the actor is parked and idle this gently
+   * breathes in and out around the base size (the "still here, waiting" pulse),
+   * distinct from the punchy node/beam flash on a real edit.
+   */
   size: number
   color: Hsl
 }
@@ -91,10 +99,42 @@ export type ActorVisual = {
 /** Tuning for {@link actorVisualFor}. Every field has a default. */
 export type ActorVisualOptions = {
   /**
-   * How long after an actor's last activity its sprite takes to fade from full to
-   * invisible, in milliseconds. Measured from `lastActiveAt` against `now`.
+   * How long after the linger window an actor's sprite takes to fade from full to
+   * invisible, in milliseconds. The fade does NOT start at `lastActiveAt`; it starts
+   * once {@link lingerMs} has elapsed, so a brief pause never dissolves the actor.
+   * Measured against `now`.
    */
   fadeMs?: number
+  /**
+   * How long an actor stays fully present (parked at its last work, gently idle-
+   * pulsing) after its last activity before the fade even begins, in milliseconds.
+   * This is the lingering knob (Part C): an LLM agent that edits a file then pauses
+   * before the next edit must STAY at its last node rather than fading after a few
+   * seconds. Defaults to {@link DEFAULT_LINGER_MS} (effectively "stays for the whole
+   * session"); set it shorter to make quiet actors dissolve sooner.
+   */
+  lingerMs?: number
+  /**
+   * How long after an actor's last activity the idle breathing begins, in
+   * milliseconds. While the actor is freshly active (under this) its orb is steady
+   * at full presence; once it has been quiet this long it starts the gentle "still
+   * here, waiting" pulse. Kept short so a parked actor visibly breathes, but not so
+   * short that an actively-working actor flickers. Defaults to {@link DEFAULT_IDLE_AFTER_MS}.
+   */
+  idleAfterMs?: number
+  /**
+   * Period of one idle breath, in milliseconds: a full in-and-out of the pulse. A
+   * slow, calm breathing (a couple of seconds) reads as "present and waiting" rather
+   * than an alarm. Defaults to {@link DEFAULT_IDLE_PULSE_MS}.
+   */
+  idlePulseMs?: number
+  /**
+   * Depth of the idle breathing, `0..1`: the fraction the size and alpha dip at the
+   * trough of a breath. Small by design (a gentle swell), distinct from the punchy
+   * touch/beam flash on a real edit. `0` disables the pulse. Defaults to
+   * {@link DEFAULT_IDLE_PULSE_DEPTH}.
+   */
+  idlePulseDepth?: number
   /** Draw size of an actor orb, in layout units. */
   size?: number
   /**
@@ -126,6 +166,33 @@ export type ActorVisualOptions = {
 const DEFAULT_FADE_MS = 3_000
 const DEFAULT_SIZE = 10
 const DEFAULT_DRIFT = 14
+
+/**
+ * How long an actor lingers at full presence after its last activity before the
+ * fade begins, in milliseconds (Part C). Defaulted very long (an hour) so that for
+ * an active session a contributor effectively never fades from a normal edit-then-
+ * pause gap: it stays parked at its last node, idle-pulsing, until it acts again. A
+ * host can shorten it to make quiet actors dissolve. This is the fix for "the actor
+ * faded away after a few seconds of inactivity".
+ */
+const DEFAULT_LINGER_MS = 3_600_000
+
+/**
+ * How long after the last activity the idle breathing kicks in, in milliseconds. A
+ * little under a second: long enough that a mid-edit actor reads as steady, short
+ * enough that a parked one starts visibly breathing almost right away.
+ */
+const DEFAULT_IDLE_AFTER_MS = 800
+
+/** Period of one idle breath (full in-and-out), in milliseconds. A calm ~2.4s cycle. */
+const DEFAULT_IDLE_PULSE_MS = 2_400
+
+/**
+ * Depth of the idle breath, `0..1`: how far the size and alpha dip at the trough.
+ * Gentle (12%) so the orb softly swells and settles, clearly distinct from the
+ * punchy full-bright flash a real edit fires on the node and the beam.
+ */
+const DEFAULT_IDLE_PULSE_DEPTH = 0.12
 
 /**
  * How far, in layout units, an actor floats *past* the outer radius of its touched
@@ -161,13 +228,20 @@ const RECENCY_WEIGHT = 0.8
  *   clearly outside the canopy near its current work at any tree size, and finally
  *   nudged by a small per-actor drift hashed from the actor id so co-located actors
  *   don't overlap.
- * - **alpha** is full at the instant of activity and decays linearly to 0 over
- *   `fadeMs` since `lastActiveAt`, so an actor that stops working fades out.
- * - **size** and **color** are constant per actor (the orb size and the actor's
- *   identity hue); the renderer can scale the glow by alpha.
+ * - **alpha** stays full through the `lingerMs` window after the last activity (so a
+ *   brief edit-then-pause gap never fades the actor out, Part C), then decays
+ *   linearly to 0 over `fadeMs`. A gentle idle breath modulates it down a little
+ *   while the actor is parked and waiting.
+ * - **size** is the orb's base size, gently breathing in and out around it once the
+ *   actor goes idle (the "still here, waiting" pulse), distinct from the punchy
+ *   edit flash. **color** is the actor's constant identity hue.
  */
 export function actorVisualFor(activity: ActorActivity, now: number, options: ActorVisualOptions = {}): ActorVisual {
   const fadeMs = options.fadeMs ?? DEFAULT_FADE_MS
+  const lingerMs = options.lingerMs ?? DEFAULT_LINGER_MS
+  const idleAfterMs = options.idleAfterMs ?? DEFAULT_IDLE_AFTER_MS
+  const idlePulseMs = options.idlePulseMs ?? DEFAULT_IDLE_PULSE_MS
+  const idlePulseDepth = options.idlePulseDepth ?? DEFAULT_IDLE_PULSE_DEPTH
   const size = options.size ?? DEFAULT_SIZE
   const drift = options.drift ?? DEFAULT_DRIFT
   const outwardMargin = options.outwardMargin ?? DEFAULT_OUTWARD_MARGIN
@@ -186,9 +260,20 @@ export function actorVisualFor(activity: ActorActivity, now: number, options: Ac
     y: pushed.y + driftOffset.y,
   }
 
-  const alpha = activityFade(activity.lastActiveAt, now, fadeMs)
+  // Presence: full through the linger window, then fading. A brief edit-then-pause
+  // gap therefore does NOT dissolve the actor (Part C); it stays parked.
+  const presence = lingeringFade(activity.lastActiveAt, now, lingerMs, fadeMs)
+  // The idle breathing: a gentle swell once the actor has been quiet a moment, the
+  // "still here, waiting" read. It modulates both alpha and size by the same factor
+  // so the orb softly breathes; it is bounded and distinct from the punchy edit flash.
+  const breath = idleBreath(activity.lastActiveAt, now, idleAfterMs, idlePulseMs, idlePulseDepth)
 
-  return { position, alpha, size, color: colorForActor(activity.actor) }
+  return {
+    position,
+    alpha: presence * breath,
+    size: size * breath,
+    color: colorForActor(activity.actor),
+  }
 }
 
 /**
@@ -295,19 +380,60 @@ function centroidOf(touched: Vec2[], lastCentroid: Vec2 | undefined): Vec2 {
 }
 
 /**
- * The presence opacity for an actor given how long ago it last acted. Full
- * (`1`) at the instant of activity, decaying linearly to `0` over `fadeMs`, and
- * clamped so a long-idle actor reads as gone, not negative. An actor acting in the
- * future relative to `now` (which the controller should never produce) is treated
- * as fully present rather than over-bright.
+ * The presence opacity for a lingering actor (Part C). It stays full (`1`) for the
+ * whole `lingerMs` window after the last activity, so a brief edit-then-pause gap
+ * never fades the actor out, then decays linearly to `0` over `fadeMs` once the
+ * linger has elapsed. Clamped so a long-idle actor reads as gone, not negative. An
+ * actor acting in the future relative to `now` (which the controller should never
+ * produce) is treated as fully present rather than over-bright.
+ *
+ * With the default very-long `lingerMs`, an actor in an active session effectively
+ * never fades from a normal pause; a host that wants quiet actors to dissolve sets a
+ * shorter `lingerMs`.
  */
-function activityFade(lastActiveAt: number, now: number, fadeMs: number): number {
+function lingeringFade(lastActiveAt: number, now: number, lingerMs: number, fadeMs: number): number {
   const elapsed = now - lastActiveAt
-  if (elapsed <= 0) {
+  if (elapsed <= lingerMs) {
+    // Inside the linger window (including any future-dated activity): fully present.
     return 1
   }
-  const remaining = 1 - elapsed / fadeMs
+  // Past the linger: fade over `fadeMs` from the end of the linger window.
+  const sinceFadeStart = elapsed - lingerMs
+  const remaining = 1 - sinceFadeStart / fadeMs
   return Math.max(0, Math.min(1, remaining))
+}
+
+/**
+ * The idle breathing factor for an actor (Part C): a gentle, bounded swell of size
+ * and alpha that reads as "this contributor is here, waiting". It is exactly `1`
+ * (no breathing) while the actor is freshly active (within `idleAfterMs` of its last
+ * activity) so a working actor stays steady, then eases into a slow cosine breath
+ * once it goes quiet. The breath stays within `[1 - depth, 1]`, so it only ever dims
+ * the orb a little and never brightens it past full, keeping it clearly distinct from
+ * the punchy, full-bright flash a real edit fires on the node and the beam.
+ *
+ * Pure: the phase is derived from the elapsed playhead time, never the wall clock,
+ * so a rewound timeline reproduces the exact same breath.
+ */
+function idleBreath(
+  lastActiveAt: number,
+  now: number,
+  idleAfterMs: number,
+  idlePulseMs: number,
+  idlePulseDepth: number,
+): number {
+  const elapsed = now - lastActiveAt
+  if (idlePulseDepth <= 0 || idlePulseMs <= 0 || elapsed <= idleAfterMs) {
+    return 1
+  }
+  // A cosine that starts at the top of the breath (factor 1) the instant idling
+  // begins and dips to `1 - depth` at the trough, half a period later. Phase is the
+  // time spent idling, so the breath is continuous and seek-exact.
+  const idleElapsed = elapsed - idleAfterMs
+  const phase = (idleElapsed / idlePulseMs) * Math.PI * 2
+  // cos goes 1 -> -1 -> 1; map it to 1 -> (1 - depth) -> 1 so the orb only dims.
+  const breath = 1 - idlePulseDepth * (1 - Math.cos(phase)) / 2
+  return breath
 }
 
 /**

@@ -202,6 +202,40 @@ describe('computeTargets', () => {
     expect(angularDistance(beta, gamma)).toBeGreaterThan(0.1)
     expect(angularDistance(alpha, gamma)).toBeGreaterThan(0.1)
   })
+
+  describe('with the forest root visible (rootLabel / Part A)', () => {
+    it('places the root at the center and the repos one ring out from it', () => {
+      const targets = computeTargets(
+        treeFromPaths([ 'api/main.rs', 'docs/guide.md' ]),
+        { jitter: 0, rootVisible: true },
+      )
+
+      // The root sits at the center (the default origin).
+      expect(targets.get('')).toEqual({ x: 0, y: 0 })
+
+      const center = targets.get('')!
+      const apiRadius = distance(targets.get('api')!, center)
+      const docsRadius = distance(targets.get('docs')!, center)
+      // Both repos are on the first ring out from the shared root (depth 1).
+      expect(apiRadius).toBeGreaterThan(0)
+      expect(apiRadius).toBeCloseTo(docsRadius, 6)
+    })
+
+    it('does not change where any node is placed compared to the no-root layout', () => {
+      // The root is drawn vs not, but the radial placement of every repo and file is
+      // identical: the option only governs whether the center is yielded for drawing,
+      // since the layout already positions the root at the center either way.
+      const paths = [ 'api/src/a.rs', 'api/src/b.rs', 'docs/guide.md', 'frontend/app.ts' ]
+      const withoutRoot = computeTargets(treeFromPaths(paths), { jitter: 0 })
+      const withRoot = computeTargets(treeFromPaths(paths), { jitter: 0, rootVisible: true })
+
+      for (const [ path, position ] of withoutRoot) {
+        expect(withRoot.get(path)).toEqual(position)
+      }
+      // And the root center is present in both (the layout always seeds it).
+      expect(withRoot.get('')).toEqual(withoutRoot.get(''))
+    })
+  })
 })
 
 describe('stepSprings', () => {

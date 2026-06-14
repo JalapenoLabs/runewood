@@ -118,6 +118,10 @@ function main(): void {
     autoplay: true,
     followLive: true,
     cameraMode: 'follow',
+    // One shared root node (Part A): the repos (api/docs/frontend/infra/workspace)
+    // branch off a single labeled center, so the forest reads as one tree rather
+    // than a ring of separate fans.
+    rootLabel: 'root',
     exclude: parseExcludePatterns(excludeInput.value),
   })
   controller.seed(seedPaths())
@@ -241,6 +245,7 @@ function main(): void {
       autoplay: true,
       followLive: true,
       cameraMode: 'follow',
+      rootLabel: 'root',
       exclude: parseExcludePatterns(excludeInput.value),
     })
     controller.seed(seedPaths())
@@ -274,6 +279,7 @@ function main(): void {
       autoplay: true,
       followLive: true,
       cameraMode: 'follow',
+      rootLabel: 'root',
       exclude: parseExcludePatterns(excludeInput.value),
     })
     controller.seed(seedPaths())

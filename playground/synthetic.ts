@@ -362,12 +362,17 @@ function pickWeightedAction(): RunewoodAction {
   return 'scan'
 }
 
-/** Chance per tick of opening an idle gap, so the forest visibly goes quiet sometimes. */
-const IDLE_GAP_CHANCE = 0.04
-/** Shortest idle gap, in ticks. */
-const IDLE_GAP_MIN_TICKS = 3
-/** Longest idle gap, in ticks. */
-const IDLE_GAP_MAX_TICKS = 12
+/**
+ * Chance per tick of opening an idle gap, so the forest visibly goes quiet
+ * sometimes. Raised so the gaps are frequent enough to actually watch an actor
+ * LINGER parked at its last node (Part C) before it acts again, rather than the
+ * stream barely ever pausing.
+ */
+const IDLE_GAP_CHANCE = 0.12
+/** Shortest idle gap, in ticks (at the 100ms tick this is ~0.8s). */
+const IDLE_GAP_MIN_TICKS = 8
+/** Longest idle gap, in ticks (~3.5s), long enough to clearly see the lingering idle pulse. */
+const IDLE_GAP_MAX_TICKS = 35
 /** Chance a given tick becomes a burst (a rapid spike of events). */
 const BURST_CHANCE = 0.05
 /** How much a burst tick multiplies its event count. */

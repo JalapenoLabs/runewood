@@ -127,6 +127,15 @@ export class Scene {
         this.removeNode(path)
         continue
       }
+      // The forest root has a spring entry (at the center) whether or not it is
+      // drawn. It is only a real, visible node when a `rootLabel` is configured (the
+      // collapse then yields it flagged `isForestRoot`); otherwise it is the undrawn
+      // center the repo roots fan around, so skip it so the no-root behavior is
+      // unchanged.
+      if (path === '' && !visibleByPath.get('')?.isForestRoot) {
+        this.removeNode(path)
+        continue
+      }
       this.drawNode(node, physics.position, now, theme)
       // Edges connect a node to its *display-parent* (nearest visible ancestor), so
       // a collapsed pass-through chain is spanned by one edge, and are styled by the
@@ -299,6 +308,13 @@ export class Scene {
     theme: RunewoodTheme,
     zoom: number,
   ): void {
+    if (visible?.isForestRoot) {
+      // The shared center node is its own display-parent (`''`), so it would draw a
+      // zero-length edge to itself. It is the trunk everything else branches off of;
+      // it carries no incoming branch.
+      this.removeEdge(path)
+      return
+    }
     const displayParentPath = visible?.displayParentPath ?? ''
     const parentPhysics = displayParentPath ? springs.get(displayParentPath) : undefined
     if (!parentPhysics) {
@@ -424,8 +440,10 @@ type DrawnEdge = {
 
 /**
  * Flattens the tree into a `path -> node` lookup so the per-frame reconcile can
- * resolve each spring entry to its node in O(1). The forest root carries an empty
- * path and is not drawn, so it is skipped; every other node is keyed by its full
+ * resolve each spring entry to its node in O(1). The forest root is keyed by its
+ * empty path so that, when it is drawn as the shared center node, the reconcile can
+ * resolve its `''` spring entry to it; when the root is *not* drawn it simply has no
+ * spring entry, so this extra key is harmless. Every other node is keyed by its full
  * slash-joined path, which is exactly the key the spring state uses.
  */
 function indexNodesByPath(tree: TreeNode): Map<string, TreeNode> {
@@ -433,9 +451,7 @@ function indexNodesByPath(tree: TreeNode): Map<string, TreeNode> {
   const stack: TreeNode[] = [ tree ]
   while (stack.length > 0) {
     const node = stack.pop()!
-    if (node.path) {
-      byPath.set(node.path, node)
-    }
+    byPath.set(node.path, node)
     for (const child of node.children.values()) {
       stack.push(child)
     }

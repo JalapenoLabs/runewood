@@ -157,4 +157,72 @@ describe('collapseTree', () => {
     const secondPaths = second.map((visible) => `${visible.node.path}<-${visible.displayParentPath}@${visible.depth}`)
     expect(new Set(firstPaths)).toEqual(new Set(secondPaths))
   })
+
+  describe('with the forest root visible (rootLabel / Part A)', () => {
+    it('yields the forest root as a depth-0 center node with no display-parent', () => {
+      const tree = treeFromPaths([ 'api/main.rs', 'docs/guide.md' ])
+      const root = collapseTree(tree, { rootVisible: true }).find((visible) => visible.isForestRoot)
+
+      expect(root).toBeDefined()
+      expect(root?.node.path).toBe('')
+      expect(root?.depth).toBe(0)
+      // The center hangs off nothing; the empty display-parent here is "the center
+      // itself", which the scene treats specially via `isForestRoot`.
+      expect(root?.displayParentPath).toBe('')
+      expect(root?.isForestRoot).toBe(true)
+    })
+
+    it('makes every repo a depth-1 child of the root (an edge root -> repo)', () => {
+      const tree = treeFromPaths([ 'api/main.rs', 'docs/guide.md', 'frontend/app.ts' ])
+      const visible = collapseTree(tree, { rootVisible: true })
+
+      for (const repo of [ 'api', 'docs', 'frontend' ]) {
+        const found = visible.find((entry) => entry.node.path === repo)
+        if (!found) {
+          throw new Error(`expected repo '${repo}' to be visible`)
+        }
+        expect(found.depth).toBe(1)
+        // The repo's display-parent is the empty-string center, which is now the
+        // DRAWN root, so the scene draws an edge from the repo to the root.
+        expect(found.displayParentPath).toBe('')
+        expect(found.isForestRoot).toBe(false)
+      }
+    })
+
+    it('keeps the root even when the forest has a single repo (it is the shared trunk)', () => {
+      const tree = treeFromPaths([ 'only/deep/file.ts' ])
+      const visible = collapseTree(tree, { rootVisible: true })
+
+      expect(visible.find((entry) => entry.isForestRoot)?.node.path).toBe('')
+      // The single repo root still hangs off the drawn center at depth 1.
+      const repo = visible.find((entry) => entry.node.path === 'only')
+      expect(repo?.depth).toBe(1)
+      expect(repo?.displayParentPath).toBe('')
+    })
+
+    it('is identical to the no-root output except for the extra root entry', () => {
+      const paths = [ 'api/src/a.rs', 'api/src/b.rs', 'docs/guide.md' ]
+      const withoutRoot = collapseTree(treeFromPaths(paths))
+      const withRoot = collapseTree(treeFromPaths(paths), { rootVisible: true })
+
+      // Exactly one extra entry: the forest root.
+      expect(withRoot.length).toBe(withoutRoot.length + 1)
+      const extras = withRoot.filter((entry) => entry.isForestRoot)
+      expect(extras).toHaveLength(1)
+
+      // Every non-root visible node is unchanged (same path, display-parent, depth).
+      const key = (entry: { node: { path: string }, displayParentPath: string, depth: number }): string =>
+        `${entry.node.path}<-${entry.displayParentPath}@${entry.depth}`
+      const withoutKeys = new Set(withoutRoot.map(key))
+      const withKeysNonRoot = new Set(withRoot.filter((entry) => !entry.isForestRoot).map(key))
+      expect(withKeysNonRoot).toEqual(withoutKeys)
+    })
+  })
+
+  it('never yields the forest root when rootVisible is unset (default unchanged)', () => {
+    const tree = treeFromPaths([ 'repo/a.ts' ])
+    const visible = collapseTree(tree)
+    expect(visible.some((entry) => entry.isForestRoot)).toBe(false)
+    expect(visible.some((entry) => entry.node.path === '')).toBe(false)
+  })
 })

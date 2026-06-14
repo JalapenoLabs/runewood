@@ -5,7 +5,7 @@ import type { Vec2, SpringState, LayoutOptions, SpringParams } from './core/layo
 import type { RunewoodTheme, RunewoodThemeOverrides } from './core/theme'
 import type { WorldBounds } from './render/camera'
 import type { FrameState, BeamSpawnRequest, PulseSpawnRequest } from './core/frameStep'
-import type { ActorActivity } from './render/actors'
+import type { ActorActivity, ActorVisualOptions } from './render/actors'
 import type { LabelCandidate } from './render/labels'
 import type { BloomQuality } from './render/bloom'
 import type { SceneOptions } from './render/scene'
@@ -35,6 +35,7 @@ import { Camera, autoFrame } from './render/camera'
 import { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
 import { resolveBloomQuality } from './render/bloom'
 import { PixiBackend } from './render/pixiBackend'
+import { actorVisualFor } from './render/actors'
 
 /**
  * The public, imperative controller for a Runewood visualization (issue #9). This
@@ -280,6 +281,28 @@ export type RunewoodOptions = {
    * `false`.
    */
   lowPower?: boolean
+  /**
+   * When set, the forest root (`path: ''`) becomes a VISIBLE node at the center
+   * labeled with this string, and every top-level repo branches off it (an edge
+   * root -> repo), so the whole forest reads as one connected tree growing outward
+   * from a single trunk rather than a ring of separate radial fans. When unset (the
+   * default) there is no root node and the repo roots fan around the undrawn center,
+   * exactly the original behavior. Seraphim integration (#180) passes the workspace
+   * name here (e.g. the org or "workspace").
+   */
+  rootLabel?: string
+  /**
+   * How long an actor lingers parked at its last node before it fades, in
+   * milliseconds (Part C, the lingering knob). An LLM agent edits a file then often
+   * pauses before the next edit; with a long linger the actor STAYS at its last node
+   * (gently idle-pulsing) across that gap instead of dissolving after a few seconds.
+   * Defaults to a very long window (effectively "stays for the whole session"); set
+   * it shorter to make a quiet contributor dissolve sooner. Seraphim integration
+   * (#180) should leave it long for a live agent feed. Forwarded to the actor visual
+   * model as its `lingerMs`; finer actor tuning (idle-pulse depth, fade) is available
+   * via {@link beams}`.actors`.
+   */
+  actorLingerMs?: number
   /** Tuning for the radial tidy-tree layout. */
   layout?: LayoutOptions
   /** Tuning for the layout springs (stiffness / damping). */
@@ -435,6 +458,19 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // host can suppress the whole label scene without touching the LOD knobs.
   const showLabels = options.showLabels ?? true
 
+  // Whether the forest root is a drawn center node (Part A): set when the host
+  // configured a `rootLabel`, so every repo branches off one shared trunk. A blank
+  // / unset label leaves it off (the original ring-of-fans). Computed once: the
+  // label text never changes over the controller's life.
+  const rootLabel = options.rootLabel?.trim()
+  const rootVisible = !!rootLabel
+
+  // The resolved actor visual options (the lingering knob folded in), held so the
+  // controller can compute an actor label's presence from the very same model the
+  // orb uses, keeping the label exactly as present as its orb through the linger and
+  // idle pulse. The beam scene is constructed from the same resolved options.
+  const actorVisualOptions: ActorVisualOptions = resolveBeamSceneOptions(options).actors ?? {}
+
   // Click hit slop in screen pixels, converted to world units per click via zoom.
   const hitRadiusPx = options.hitRadius ?? DEFAULT_HIT_RADIUS_PX
 
@@ -558,12 +594,18 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     //    frame (cheap), so motion stays fluid while the expensive layout recompute
     //    is skipped on the common no-structure-change frame.
     if (targetsStale) {
-      targets = computeTargets(frameState.tree, options.layout)
+      // A configured `rootLabel` makes the forest root a drawn center node every
+      // repo branches off of (one connected tree), so both the layout and the
+      // display-collapse must agree the root is visible. Without it, the root stays
+      // undrawn and the repos fan around the center, exactly as before.
+      targets = computeTargets(frameState.tree, { ...options.layout, rootVisible: rootVisible })
       // Rebuild the display-collapse from the same structure, keyed by real path so
       // the scene and label builder can resolve each drawn node's visible ancestor
       // and depth. Both this and the targets key off the visible nodes, so they
       // stay in lockstep.
-      visibleByPath = new Map(collapseTree(frameState.tree).map((visible) => [ visible.node.path, visible ]))
+      visibleByPath = new Map(
+        collapseTree(frameState.tree, { rootVisible }).map((visible) => [ visible.node.path, visible ]),
+      )
       targetsStale = false
     }
     const motionScale = prefersReducedMotion() ? 0 : 1
@@ -731,6 +773,16 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   function buildLabelCandidates(now: number, activities: ActorActivity[]): LabelCandidate[] {
     const candidates: LabelCandidate[] = []
 
+    // The shared center node (Part A): when a `rootLabel` is configured, the forest
+    // root is drawn at the center and gets an always-visible, constant-screen-size
+    // label, like a repo root. Its spring entry is keyed by the empty path.
+    if (rootVisible && rootLabel) {
+      const rootPhysics = springs.get('')
+      if (rootPhysics) {
+        candidates.push({ kind: 'root', id: '', text: rootLabel, position: rootPhysics.position })
+      }
+    }
+
     const stack = [ frameState.tree ]
     while (stack.length > 0) {
       const node = stack.pop()!
@@ -780,7 +832,10 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         id: activity.actor,
         text: activity.actor,
         position: anchor,
-        actorAlpha: actorAlphaFor(activity, now),
+        // Drive the label's presence from the very same actor visual model the orb
+        // uses (lingering fade + idle breath), so the label lingers and breathes in
+        // exact lockstep with its orb rather than fading on its own short timer.
+        actorAlpha: actorVisualFor(activity, now, actorVisualOptions).alpha,
       })
     }
 
@@ -799,19 +854,6 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       sumY += position.y
     }
     return { x: sumX / positions.length, y: sumY / positions.length }
-  }
-
-  /**
-   * The actor's presence alpha at `now`, mirroring the actor visual model's fade so
-   * an actor label is exactly as present as its orb. Recomputed here rather than
-   * threaded out of the beam scene to keep the scenes write-only from the controller.
-   */
-  function actorAlphaFor(activity: ActorActivity, now: number): number {
-    const elapsed = now - activity.lastActiveAt
-    if (elapsed <= 0) {
-      return 1
-    }
-    return Math.max(0, Math.min(1, 1 - elapsed / ACTOR_LABEL_FADE_MS))
   }
 
   /**
@@ -965,7 +1007,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
 
     scene = backend.createScene(options.scene)
-    beamScene = backend.createBeamScene(options.beams)
+    // Fold the top-level `actorLingerMs` knob (Part C) into the beam scene's actor
+    // options, while leaving any finer per-actor tuning the host passed via
+    // `beams.actors` intact. An explicit `beams.actors.lingerMs` wins, since it is
+    // the more specific surface.
+    beamScene = backend.createBeamScene(resolveBeamSceneOptions(options))
     labelScene = backend.createLabelScene(options.labels)
 
     camera.setViewport(width, height)
@@ -1370,9 +1416,6 @@ const EMPTY_LOG: RunewoodEvent[] = []
 /** The empty candidate set handed to the label scene when labels are suppressed. */
 const EMPTY_LABELS: LabelCandidate[] = []
 
-/** How long an actor label takes to fade after its last activity, matching the actor orb's default. */
-const ACTOR_LABEL_FADE_MS = 3_000
-
 /**
  * Default click hit slop in screen pixels: how far from a node / actor a click may
  * land and still resolve to it. A few pixels of forgiveness so tapping near a
@@ -1408,6 +1451,26 @@ function resolveInitialCameraMode(options: RunewoodOptions): CameraMode {
     return options.follow ? 'follow' : 'manual'
   }
   return 'follow'
+}
+
+/**
+ * Folds the top-level {@link RunewoodOptions.actorLingerMs} knob into the beam
+ * scene's actor options as `lingerMs`, leaving every other actor / beam tuning the
+ * host supplied via `beams` intact. An explicit `beams.actors.lingerMs` is the more
+ * specific surface and wins; the top-level knob only fills it in when absent.
+ */
+function resolveBeamSceneOptions(options: RunewoodOptions): BeamSceneOptions {
+  const beams = options.beams ?? {}
+  if (options.actorLingerMs === undefined) {
+    return beams
+  }
+  return {
+    ...beams,
+    actors: {
+      lingerMs: options.actorLingerMs,
+      ...beams.actors,
+    },
+  }
 }
 
 /**
