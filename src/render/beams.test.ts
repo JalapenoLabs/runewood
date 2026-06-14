@@ -20,61 +20,75 @@ function makeSpawn(overrides: Partial<BeamSpawn> = {}): BeamSpawn {
 }
 
 describe('BeamField', () => {
-  describe('spawn + activeParticles', () => {
-    it('places particlesPerBeam particles in flight on a spawn', () => {
-      const field = new BeamField({ particlesPerBeam: 6, lifetimeMs: 1000 })
+  describe('spawn + activeBeams', () => {
+    it('places exactly one beam in flight on a spawn', () => {
+      const field = new BeamField({ lifetimeMs: 1000 })
       const placed = field.spawn(makeSpawn({ at: 0 }))
 
-      expect(placed).toBe(6)
-      // Sampled just after birth, before any phase-delayed particle could expire.
-      expect(field.activeParticles(1).length).toBe(6)
+      expect(placed).toBe(1)
+      expect(field.activeBeams(1)).toHaveLength(1)
     })
 
-    it('reports no particles before birth and after the lifetime', () => {
-      const field = new BeamField({ particlesPerBeam: 4, lifetimeMs: 1000 })
+    it('reports no beams before birth and after the lifetime', () => {
+      const field = new BeamField({ lifetimeMs: 1000 })
       field.spawn(makeSpawn({ at: 1000 }))
 
-      expect(field.activeParticles(500)).toHaveLength(0)
-      expect(field.activeParticles(2000)).toHaveLength(0)
+      expect(field.activeBeams(500)).toHaveLength(0)
+      expect(field.activeBeams(2000)).toHaveLength(0)
+    })
+
+    it('connects the actor source to the touched target with fixed endpoints', () => {
+      const field = new BeamField({ lifetimeMs: 1000 })
+      const source = { x: 10, y: 20 }
+      const target = { x: 200, y: 60 }
+      field.spawn(makeSpawn({ at: 0, source, target }))
+
+      // A flashlight pulse does not travel: the endpoints are the actor and the
+      // file for the whole life, only the width/alpha change.
+      const early = field.activeBeams(50)[0]
+      const late = field.activeBeams(700)[0]
+      expect(early.source).toEqual(source)
+      expect(early.target).toEqual(target)
+      expect(late.source).toEqual(source)
+      expect(late.target).toEqual(target)
     })
   })
 
-  describe('a beam travels source -> target and fades out', () => {
-    it('moves its leading particle from the source toward the target over its life', () => {
-      // A single particle with no phase delay so progress maps cleanly to time.
-      const field = new BeamField({ particlesPerBeam: 1, lifetimeMs: 1000, arcBow: 0 })
-      const source = { x: 0, y: 0 }
-      const target = { x: 200, y: 0 }
-      field.spawn(makeSpawn({ at: 0, source, target }))
-
-      const early = field.activeParticles(50)[0]
-      const mid = field.activeParticles(500)[0]
-      const late = field.activeParticles(950)[0]
-
-      // It marches toward the target along x.
-      expect(early.position.x).toBeLessThan(mid.position.x)
-      expect(mid.position.x).toBeLessThan(late.position.x)
-      // And ends up near the target by end of life (drift is tiny vs the span).
-      expect(late.position.x).toBeGreaterThan(150)
-    })
-
-    it('fades alpha and size to nothing by the end of the lifetime', () => {
-      const field = new BeamField({ particlesPerBeam: 1, lifetimeMs: 1000, particleSize: 4 })
+  describe('a beam is bright + wide at spawn and tapers + fades to nothing', () => {
+    it('starts bright and wide, then thins and dims, reaching zero by end of life', () => {
+      const field = new BeamField({ lifetimeMs: 1000, beamWidth: 16 })
       field.spawn(makeSpawn({ at: 0 }))
 
-      const early = field.activeParticles(10)[0]
-      const nearEnd = field.activeParticles(990)[0]
+      const spawnSample = field.activeBeams(1)[0]
+      const mid = field.activeBeams(500)[0]
+      const nearEnd = field.activeBeams(990)[0]
 
-      expect(early.alpha).toBeGreaterThan(nearEnd.alpha)
-      expect(early.size).toBeGreaterThan(nearEnd.size)
-      // Right at the boundary the particle is gone entirely.
-      expect(field.activeParticles(1000)).toHaveLength(0)
+      // Bright + wide at birth.
+      expect(spawnSample.alpha).toBeGreaterThan(0.9)
+      expect(spawnSample.width).toBeGreaterThan(14)
+
+      // Both fall monotonically toward nothing.
+      expect(mid.alpha).toBeLessThan(spawnSample.alpha)
+      expect(mid.width).toBeLessThan(spawnSample.width)
+      expect(nearEnd.alpha).toBeLessThan(mid.alpha)
+      expect(nearEnd.width).toBeLessThan(mid.width)
+
+      // The width and alpha approach zero as the life ends.
+      expect(nearEnd.alpha).toBeLessThan(0.05)
+      expect(nearEnd.width).toBeLessThan(1)
+    })
+
+    it('is fully gone (no active beam) exactly at the lifetime boundary', () => {
+      const field = new BeamField({ lifetimeMs: 1000 })
+      field.spawn(makeSpawn({ at: 0 }))
+      // Right at the boundary the beam has fully faded and freed its slot.
+      expect(field.activeBeams(1000)).toHaveLength(0)
     })
   })
 
   describe('pooling stays allocation-flat', () => {
     it('reclaims expired slots so capacity never grows under sustained spawning', () => {
-      const field = new BeamField({ capacity: 64, particlesPerBeam: 4, lifetimeMs: 1000 })
+      const field = new BeamField({ capacity: 64, lifetimeMs: 1000 })
 
       // Spawn one beam every 250ms for a long run; old beams expire as new ones land.
       let now = 0
@@ -86,37 +100,34 @@ describe('BeamField', () => {
       // The pool capacity is fixed no matter how many beams have been fired.
       expect(field.capacity).toBe(64)
       // At any instant only the beams within one lifetime are alive, far under cap.
-      const active = field.activeParticles(now)
+      const active = field.activeBeams(now)
       expect(active.length).toBeGreaterThan(0)
       expect(active.length).toBeLessThanOrEqual(64)
     })
 
-    it('evicts the nearest-to-expiry particle when the pool is saturated', () => {
-      // Capacity 2, two particles per beam: the second beam must reuse both slots.
-      const field = new BeamField({ capacity: 2, particlesPerBeam: 2, lifetimeMs: 1000, arcBow: 0 })
+    it('evicts the nearest-to-expiry beam when the pool is saturated', () => {
+      // Capacity 1: the second beam must reuse the only slot, displacing the first.
+      const field = new BeamField({ capacity: 1, lifetimeMs: 1000 })
       field.spawn(makeSpawn({ at: 0, source: { x: 0, y: 0 }, target: { x: 10, y: 0 }}))
       field.spawn(makeSpawn({ at: 100, source: { x: 500, y: 500 }, target: { x: 510, y: 500 }}))
 
-      const active = field.activeParticles(120)
-      // Still exactly capacity particles; the first beam was fully displaced.
-      expect(active).toHaveLength(2)
-      // Every surviving particle belongs to the second beam (near 500,500), proving eviction.
-      for (const particle of active) {
-        expect(particle.position.x).toBeGreaterThan(400)
-        expect(particle.position.y).toBeGreaterThan(400)
-      }
+      const active = field.activeBeams(120)
+      // Still exactly capacity beams; the first was fully displaced.
+      expect(active).toHaveLength(1)
+      // The survivor is the second beam (anchored near 500,500), proving eviction.
+      expect(active[0].source.x).toBeGreaterThan(400)
+      expect(active[0].source.y).toBeGreaterThan(400)
     })
   })
 
   describe('action changes the beam color', () => {
     it('colors create, modify, scan, and delete beams distinctly', () => {
-      const field = new BeamField({ particlesPerBeam: 1 })
       const actor = 'agent-1'
 
       function hueFor(action: BeamSpawn['action']): number {
-        const fresh = new BeamField({ particlesPerBeam: 1 })
+        const fresh = new BeamField()
         fresh.spawn(makeSpawn({ at: 0, actor, action }))
-        return fresh.activeParticles(1)[0].color.h
+        return fresh.activeBeams(1)[0].color.h
       }
 
       const create = hueFor('create')
@@ -125,88 +136,82 @@ describe('BeamField', () => {
       const del = hueFor('delete')
 
       // Same actor, different actions, so any hue difference is the action tint.
-      const hues = [ create, modify, scan, del ]
-      const unique = new Set(hues)
+      const unique = new Set([ create, modify, scan, del ])
       expect(unique.size).toBe(4)
-      void field
     })
 
     it('blends the actor color in so two actors on the same action differ', () => {
-      const fieldA = new BeamField({ particlesPerBeam: 1, actionTint: 0.5 })
-      const fieldB = new BeamField({ particlesPerBeam: 1, actionTint: 0.5 })
+      const fieldA = new BeamField({ actionTint: 0.5 })
+      const fieldB = new BeamField({ actionTint: 0.5 })
       fieldA.spawn(makeSpawn({ at: 0, actor: 'agent-a', action: 'modify' }))
       fieldB.spawn(makeSpawn({ at: 0, actor: 'agent-b', action: 'modify' }))
 
-      const colorA = fieldA.activeParticles(1)[0].color
-      const colorB = fieldB.activeParticles(1)[0].color
+      const colorA = fieldA.activeBeams(1)[0].color
+      const colorB = fieldB.activeBeams(1)[0].color
       expect(colorA.h).not.toBeCloseTo(colorB.h, 1)
     })
 
-    it('is pure actor color at tint 0 and pure action color at tint 1', () => {
-      const pureActor = new BeamField({ particlesPerBeam: 1, actionTint: 0 })
+    it('is pure actor color at tint 0', () => {
+      const pureActor = new BeamField({ actionTint: 0 })
       pureActor.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'delete' }))
-      const actorHue = pureActor.activeParticles(1)[0].color.h
+      const actorHue = pureActor.activeBeams(1)[0].color.h
       expect(actorHue).toBeCloseTo(colorForActor('agent-1').h, 5)
     })
   })
 
-  describe('pulses are actor-local bursts, not beams', () => {
-    it('spawns particles around the actor with no target reached', () => {
-      const field = new BeamField({ particlesPerBeam: 8, lifetimeMs: 1000, pulseRadius: 30 })
+  describe('pulses are actor-local flashes, not beams that reach a node', () => {
+    it('targets a short hashed nudge off the actor, within the pulse radius', () => {
+      const field = new BeamField({ lifetimeMs: 1000, pulseRadius: 30 })
       const source = { x: 100, y: 100 }
       field.spawnPulse({ at: 0, actor: 'agent-1', action: 'pulse', source })
 
-      const particles = field.activeParticles(500)
-      expect(particles.length).toBe(8)
+      const beams = field.activeBeams(500)
+      expect(beams).toHaveLength(1)
 
-      // Every pulse particle stays near the actor: within the spray radius, and it
-      // spreads in multiple directions rather than marching to one far target.
-      const directions = new Set<string>()
-      for (const particle of particles) {
-        const distance = Math.hypot(particle.position.x - source.x, particle.position.y - source.y)
-        expect(distance).toBeLessThanOrEqual(30 + 0.001)
-        directions.add(`${Math.sign(particle.position.x - source.x)},${Math.sign(particle.position.y - source.y)}`)
-      }
-      expect(directions.size).toBeGreaterThan(1)
+      const beam = beams[0]
+      expect(beam.source).toEqual(source)
+      // The pulse flash reaches only the short pulse radius off the actor.
+      const reach = Math.hypot(beam.target.x - source.x, beam.target.y - source.y)
+      expect(reach).toBeCloseTo(30, 5)
     })
 
     it('spawn with target: null behaves identically to spawnPulse', () => {
-      const viaSpawn = new BeamField({ particlesPerBeam: 5 })
-      const viaPulse = new BeamField({ particlesPerBeam: 5 })
+      const viaSpawn = new BeamField()
+      const viaPulse = new BeamField()
       viaSpawn.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'pulse', target: null }))
       viaPulse.spawnPulse({ at: 0, actor: 'agent-1', action: 'pulse', source: { x: 0, y: 0 }})
 
-      expect(viaSpawn.activeParticles(100).length).toBe(viaPulse.activeParticles(100).length)
+      expect(viaSpawn.activeBeams(100)).toEqual(viaPulse.activeBeams(100))
     })
   })
 
-  describe('clear empties active particles', () => {
+  describe('clear empties active beams', () => {
     it('drops everything in flight while keeping capacity', () => {
-      const field = new BeamField({ capacity: 32, particlesPerBeam: 4 })
+      const field = new BeamField({ capacity: 32 })
       field.spawn(makeSpawn({ at: 0 }))
-      expect(field.activeParticles(100).length).toBeGreaterThan(0)
+      expect(field.activeBeams(100).length).toBeGreaterThan(0)
 
       field.clear()
 
-      expect(field.activeParticles(100)).toHaveLength(0)
+      expect(field.activeBeams(100)).toHaveLength(0)
       expect(field.capacity).toBe(32)
     })
   })
 
   describe('determinism', () => {
-    it('produces identical particle state for identical inputs', () => {
-      const first = new BeamField({ particlesPerBeam: 6 })
-      const second = new BeamField({ particlesPerBeam: 6 })
+    it('produces identical beam state for identical inputs', () => {
+      const first = new BeamField()
+      const second = new BeamField()
       first.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'create' }))
       second.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'create' }))
 
-      expect(first.activeParticles(400)).toEqual(second.activeParticles(400))
+      expect(first.activeBeams(400)).toEqual(second.activeBeams(400))
     })
 
-    it('step is an alias for activeParticles at the same time', () => {
-      const field = new BeamField({ particlesPerBeam: 3 })
+    it('step is an alias for activeBeams at the same time', () => {
+      const field = new BeamField()
       field.spawn(makeSpawn({ at: 0 }))
-      expect(field.step(300)).toEqual(field.activeParticles(300))
+      expect(field.step(300)).toEqual(field.activeBeams(300))
     })
   })
 })

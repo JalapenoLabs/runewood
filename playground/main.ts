@@ -113,7 +113,7 @@ function main(): void {
   // batch reduces the generator to 2 contributors, which tightens it.
   let controller = createRunewood(canvasHost, {
     theme: 'dusk',
-    bloom: 'high',
+    bloom: 'off',
     showLabels: true,
     autoplay: true,
     followLive: true,

@@ -211,7 +211,10 @@ export type RunewoodOptions = {
   theme?: keyof typeof themes | RunewoodTheme | RunewoodThemeOverrides
   /**
    * The requested bloom quality. Subject to a reduced-motion / low-power
-   * downgrade at runtime (see {@link resolveBloomQuality}). Defaults to `high`.
+   * downgrade at runtime (see {@link resolveBloomQuality}). Defaults to `off`: the
+   * cheap per-node soft-glow sprite carries the glow, and skipping the heavy
+   * `AdvancedBloomFilter` is much faster. Set `low` / `high` to opt back into the
+   * cinematic screen-space bloom pass on top of the per-node glow.
    */
   bloom?: BloomQuality
   /**
@@ -354,7 +357,11 @@ const FOLLOW_REGION_PADDING = 240
  */
 export function createRunewood(container: HTMLElement, options: RunewoodOptions = {}): RunewoodController {
   const theme = resolveTheme(options.theme)
-  const requestedBloom: BloomQuality = options.bloom ?? 'high'
+  // Bloom defaults OFF: the cheap per-node soft-glow sprite (see the forest scene)
+  // now carries the glowing-forest look, and running without the heavy
+  // `AdvancedBloomFilter` is markedly faster. `high`/`low` remain an opt-in
+  // cinematic post-process (screen-space, so it no longer clips to a growing box).
+  const requestedBloom: BloomQuality = options.bloom ?? 'off'
   const lowPower = options.lowPower ?? false
 
   // The pure / logical state, all owned here and threaded through the reducer.

@@ -2,7 +2,7 @@
 
 import type { Container } from 'pixi.js'
 import type { RunewoodTheme } from '../core/theme'
-import type { BeamFieldOptions, ActiveParticle } from './beams'
+import type { BeamFieldOptions, ActiveBeam } from './beams'
 import type { ActorActivity, ActorVisualOptions } from './actors'
 
 // Core
@@ -24,10 +24,12 @@ import { actorVisualFor } from './actors'
  *
  * Two kinds of thing live here, both additively blended for a glow that reads
  * above the forest:
- * - **particles**: the vis beams flung from actors to touched files, drawn from
- *   the {@link BeamField}'s active set into one pooled `Graphics` cleared and
- *   refilled each frame (the particle count is volatile, so one batched graphic
- *   beats one persistent object per particle).
+ * - **beams**: the brief tapered flashlight pulses flung from actors to touched
+ *   files, drawn from the {@link BeamField}'s active set into one pooled `Graphics`
+ *   cleared and refilled each frame (the live beam count is volatile, so one
+ *   batched graphic beats one persistent object per beam). Each is a soft additive
+ *   tapered triangle: wide and bright at the actor, narrowing to the file, fading
+ *   over its short lifetime.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
  *   when an actor first appears and culled once it has fully faded out.
  *
@@ -44,8 +46,8 @@ export class BeamScene {
   /** Tuning for the actor visual model, forwarded verbatim each frame. */
   private readonly actorOptions: ActorVisualOptions
 
-  /** One batched graphic holding every live particle this frame, cleared and refilled. */
-  private readonly particleGraphics: Graphics
+  /** One batched graphic holding every live beam this frame, cleared and refilled. */
+  private readonly beamGraphics: Graphics
   /** Retained actor orb graphics, keyed by actor id. */
   private readonly actorGraphics: Map<string, Graphics>
 
@@ -58,11 +60,11 @@ export class BeamScene {
     this.field = new BeamField(options.beams)
     this.actorOptions = options.actors ?? {}
 
-    this.particleGraphics = new Graphics()
-    // Additive blend so overlapping particles build toward white, the way real
-    // bloom stacks, rather than painting flatly over each other.
-    this.particleGraphics.blendMode = 'add'
-    this.layer.addChild(this.particleGraphics)
+    this.beamGraphics = new Graphics()
+    // Additive blend so overlapping beams build toward white, the way real bloom
+    // stacks, rather than painting flatly over each other.
+    this.beamGraphics.blendMode = 'add'
+    this.layer.addChild(this.beamGraphics)
 
     this.actorGraphics = new Map()
   }
@@ -82,47 +84,72 @@ export class BeamScene {
    * frame between the backend's `beginFrame` and `endFrame`, after the forest
    * scene's own update so the beams layer on top.
    *
-   * Particles are drawn into a single cleared graphic (their count swings every
-   * frame, so one batched object is cheaper than churning a graphic per particle).
-   * Actors are retained per id and culled once fully faded.
+   * Beams are drawn into a single cleared graphic (their count swings every frame,
+   * so one batched object is cheaper than churning a graphic per beam). Actors are
+   * retained per id and culled once fully faded.
    *
    * @param zoom the live camera zoom (world-units-to-pixels), used to floor the
    *   actor orb radius at a constant on-screen size so an actor never shrinks to an
    *   unreadable dot as the forest grows and the camera pulls out.
    */
   public update(activities: ActorActivity[], now: number, theme: RunewoodTheme, zoom: number): void {
-    this.drawParticles(this.field.activeParticles(now), theme)
+    this.drawBeams(this.field.activeBeams(now), theme)
     this.drawActors(activities, now, theme, zoom)
   }
 
   /**
-   * Drops all in-flight particles (a backward seek; the issue says clear, don't
+   * Drops all in-flight beams (a backward seek; the issue says clear, don't
    * reverse). Actors are left to fade on their own from the activity the
-   * controller supplies, so only the particle field and its graphic are emptied.
+   * controller supplies, so only the beam field and its graphic are emptied.
    */
   public clear(): void {
     this.field.clear()
-    this.particleGraphics.clear()
+    this.beamGraphics.clear()
   }
 
   /** Removes every retained graphic. Call when tearing the scene down. */
   public dispose(): void {
-    this.particleGraphics.destroy()
+    this.beamGraphics.destroy()
     for (const actor of [ ...this.actorGraphics.keys() ]) {
       this.removeActor(actor)
     }
   }
 
-  /** Refills the single batched particle graphic from the active set. */
-  private drawParticles(particles: ActiveParticle[], theme: RunewoodTheme): void {
-    this.particleGraphics.clear()
-    for (const particle of particles) {
-      const color = hslToRgbInt(particle.color)
-      this.particleGraphics
-        .circle(particle.position.x, particle.position.y, particle.size)
+  /**
+   * Refills the single batched beam graphic from the active set. Each beam is a
+   * soft additive tapered triangle: two points spanning the beam's current width at
+   * the actor (source) end and one point at the touched file (target), so it reads
+   * as a flashlight cone narrowing onto the file rather than a stream of bullets.
+   * A degenerate zero-length beam (source == target, e.g. a beam to a node sitting
+   * on the actor) is skipped since it has no direction to give width.
+   */
+  private drawBeams(beams: ActiveBeam[], theme: RunewoodTheme): void {
+    this.beamGraphics.clear()
+    for (const beam of beams) {
+      const directionX = beam.target.x - beam.source.x
+      const directionY = beam.target.y - beam.source.y
+      const length = Math.hypot(directionX, directionY)
+      if (length === 0) {
+        continue
+      }
+
+      // The unit perpendicular to the beam, to spread the wide source end across
+      // the beam's current half-width on each side.
+      const perpendicularX = -directionY / length
+      const perpendicularY = directionX / length
+      const halfWidth = beam.width / 2
+
+      const leftX = beam.source.x + perpendicularX * halfWidth
+      const leftY = beam.source.y + perpendicularY * halfWidth
+      const rightX = beam.source.x - perpendicularX * halfWidth
+      const rightY = beam.source.y - perpendicularY * halfWidth
+
+      const color = hslToRgbInt(beam.color)
+      this.beamGraphics
+        .poly([ leftX, leftY, rightX, rightY, beam.target.x, beam.target.y ])
         // Bloom scales with the theme so a restrained theme glows gently; alpha
-        // already carries the particle's own fade.
-        .fill({ color, alpha: particle.alpha * theme.bloomIntensity })
+        // already carries the beam's own lifetime fade.
+        .fill({ color, alpha: beam.alpha * theme.bloomIntensity })
     }
   }
 

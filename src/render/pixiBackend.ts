@@ -16,7 +16,7 @@ import type { LabelLodOptions } from './labels'
 import type { BloomQuality } from './bloom'
 
 // Core
-import { Application, Container, Graphics, Text } from 'pixi.js'
+import { Application, Container, Graphics, Rectangle, Text } from 'pixi.js'
 
 // Lib
 import { AdvancedBloomFilter } from 'pixi-filters'
@@ -97,6 +97,11 @@ export class PixiBackend implements RenderBackend {
    * the world entirely (the world's `filters` array is cleared) so there is zero
    * per-frame cost, which is exactly why bloom is the first effect the quality
    * switch turns down.
+   *
+   * When applied, the world's `filterArea` is pinned to the fixed renderer screen
+   * rectangle (refreshed on resize) so the bloom is a screen-space post-process:
+   * the glow never clips to the world container's growing content bounds (the
+   * "overflow-hidden border that grows" the user reported).
    */
   private bloomFilter: AdvancedBloomFilter | null = null
 
@@ -169,11 +174,13 @@ export class PixiBackend implements RenderBackend {
    * since the layers do not exist yet.
    */
   public createScene(options?: SceneOptions): Scene | null {
-    if (!this.edgeLayer || !this.nodeLayer) {
+    if (!this.edgeLayer || !this.nodeLayer || !this.application) {
       console.debug('runewood: PixiBackend.createScene called before init, returning null')
       return null
     }
-    return new Scene(this.edgeLayer, this.nodeLayer, options)
+    // Hand the scene the live renderer so it can bake its one shared soft-glow
+    // texture (the cheap per-node glow that survives bloom being off).
+    return new Scene(this.edgeLayer, this.nodeLayer, this.application.renderer, options)
   }
 
   /**
@@ -251,7 +258,26 @@ export class PixiBackend implements RenderBackend {
     this.bloomFilter.bloomScale = parameters.strength
     this.bloomFilter.quality = parameters.quality
 
+    // Pin the filtered area to the fixed renderer screen rectangle, NOT the world
+    // container's content bounds. Without this, pixi sizes the bloom pass to the
+    // world's growing bounding box, so the glow visibly clips inside a box that
+    // grows as the forest expands (the "overflow-hidden border that grows" the
+    // user reported). A screen-sized `filterArea` makes bloom a true screen-space
+    // post-process: the glow composites over the whole viewport and never clips at
+    // a content-shaped box. It is refreshed on every `resize`.
+    this.world.filterArea = this.screenRectangle()
     this.world.filters = [ this.bloomFilter ]
+  }
+
+  /**
+   * The fixed renderer screen rectangle, in screen pixels, used as the bloom
+   * filter's `filterArea` so the glow post-process is sized to the viewport rather
+   * than the world container's growing content bounds. Read from the live renderer
+   * so it always matches the current canvas size.
+   */
+  private screenRectangle(): Rectangle {
+    const renderer = this.application!.renderer
+    return new Rectangle(0, 0, renderer.width, renderer.height)
   }
 
   public resize(width: number, height: number): void {
@@ -260,6 +286,11 @@ export class PixiBackend implements RenderBackend {
       return
     }
     this.application.renderer.resize(width, height)
+    // Keep the bloom filter area pinned to the new screen size so the glow stays a
+    // screen-space post-process across a resize and never clips to stale bounds.
+    if (this.world && this.bloomQuality !== 'off') {
+      this.world.filterArea = this.screenRectangle()
+    }
   }
 
   public beginFrame(backgroundColor: Hsl): void {

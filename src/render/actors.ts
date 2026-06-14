@@ -14,11 +14,15 @@ import { colorForActor } from '../core/theme'
  * or randomness.
  *
  * An actor's position tracks the centroid of the file positions it is currently
- * touching, eased by a small deterministic drift so two actors on the same file
- * don't stack exactly. Its fade rises while it is active and decays after its last
- * activity, so an actor that goes quiet dissolves rather than hanging on the
- * canvas. Both are pure functions of the supplied activity and playhead `now`, so
- * a rewound timeline repaints every actor identically.
+ * touching, then is pushed radially *outward* from the world origin (the tree
+ * center) so the actor floats just outside the canopy near where it is
+ * contributing rather than sitting buried in the middle of the forest. This is the
+ * Gource-style placement the user asked for: contributors orbit the outside of the
+ * tree by their work, not the center. A small deterministic drift on top keeps two
+ * actors on the same file from stacking exactly. Its fade rises while it is active
+ * and decays after its last activity, so an actor that goes quiet dissolves rather
+ * than hanging on the canvas. Both are pure functions of the supplied activity and
+ * playhead `now`, so a rewound timeline repaints every actor identically.
  */
 
 /**
@@ -78,11 +82,35 @@ export type ActorVisualOptions = {
    * always sits at the same offset and two actors on one file separate cleanly.
    */
   drift?: number
+  /**
+   * How far, in layout units, the actor is pushed radially outward from the world
+   * origin past its touched-files centroid, so it floats just outside the canopy
+   * near its work (Gource-style) instead of sitting in the dense middle of the
+   * tree. Applied along the direction from the origin to the centroid; an actor
+   * working dead-center (centroid at the origin) is pushed by its own drift
+   * direction instead, so it still escapes the middle. `0` disables the outward
+   * push (the actor sits on its raw centroid).
+   */
+  outwardOffset?: number
+  /**
+   * The world origin the outward push is measured from: the tree center the actor
+   * is pushed away from. Defaults to the layout origin `{ x: 0, y: 0 }`, which is
+   * where {@link import('../core/layout').computeTargets} centers the forest.
+   */
+  origin?: Vec2
 }
 
 const DEFAULT_FADE_MS = 3_000
 const DEFAULT_SIZE = 10
 const DEFAULT_DRIFT = 14
+
+/**
+ * How far an actor is floated outward from the tree center past its touched-files
+ * centroid by default, in layout units. Sized comfortably larger than a node's hot
+ * radius so the orb clearly clears the canopy and reads as hovering *outside* the
+ * work rather than on top of it. A judgment call worth tuning to taste.
+ */
+const DEFAULT_OUTWARD_OFFSET = 90
 
 /**
  * Computes the full visual of an actor at playhead time `now`. Pure and
@@ -91,8 +119,10 @@ const DEFAULT_DRIFT = 14
  *
  * The mapping:
  * - **position** is the centroid of the touched-file positions (or `lastCentroid`
- *   while the actor is quiet, or the origin as a last resort), nudged by a small
- *   per-actor drift hashed from the actor id so co-located actors don't overlap.
+ *   while the actor is quiet, or the origin as a last resort), then pushed radially
+ *   *outward* from the world origin by `outwardOffset` so the actor floats outside
+ *   the canopy near its work, and finally nudged by a small per-actor drift hashed
+ *   from the actor id so co-located actors don't overlap.
  * - **alpha** is full at the instant of activity and decays linearly to 0 over
  *   `fadeMs` since `lastActiveAt`, so an actor that stops working fades out.
  * - **size** and **color** are constant per actor (the orb size and the actor's
@@ -102,17 +132,60 @@ export function actorVisualFor(activity: ActorActivity, now: number, options: Ac
   const fadeMs = options.fadeMs ?? DEFAULT_FADE_MS
   const size = options.size ?? DEFAULT_SIZE
   const drift = options.drift ?? DEFAULT_DRIFT
+  const outwardOffset = options.outwardOffset ?? DEFAULT_OUTWARD_OFFSET
+  const origin = options.origin ?? { x: 0, y: 0 }
 
   const centroid = centroidOf(activity.touched, activity.lastCentroid)
+  const pushed = pushOutward(centroid, origin, outwardOffset, activity.actor)
   const driftOffset = actorDrift(activity.actor, drift)
   const position = {
-    x: centroid.x + driftOffset.x,
-    y: centroid.y + driftOffset.y,
+    x: pushed.x + driftOffset.x,
+    y: pushed.y + driftOffset.y,
   }
 
   const alpha = activityFade(activity.lastActiveAt, now, fadeMs)
 
   return { position, alpha, size, color: colorForActor(activity.actor) }
+}
+
+/**
+ * Pushes a point radially outward from `origin` by `amount` layout units, so an
+ * actor floats just past its touched-files centroid, away from the tree center.
+ * The direction is the unit vector from the origin to the centroid; the result
+ * sits `amount` further out along that same ray, so the actor always lands
+ * *strictly farther* from the origin than its centroid (the property the user
+ * wants: contributors orbit the outside near their work).
+ *
+ * When the centroid coincides with the origin there is no outward direction to
+ * push along, so the actor's stable hashed drift direction is used instead. That
+ * keeps a dead-center actor from sitting exactly on the origin and still floats it
+ * out into its own consistent spot rather than the crowded middle. With
+ * `amount === 0` the centroid is returned unchanged.
+ */
+function pushOutward(centroid: Vec2, origin: Vec2, amount: number, actor: string): Vec2 {
+  if (amount === 0) {
+    return centroid
+  }
+
+  const directionX = centroid.x - origin.x
+  const directionY = centroid.y - origin.y
+  const distance = Math.hypot(directionX, directionY)
+
+  if (distance === 0) {
+    // Centroid is the tree center: no radial direction. Fall back to the actor's
+    // own hashed drift direction so it still escapes the middle deterministically.
+    const fallback = actorDrift(actor, 1)
+    const fallbackLength = Math.hypot(fallback.x, fallback.y) || 1
+    return {
+      x: origin.x + (fallback.x / fallbackLength) * amount,
+      y: origin.y + (fallback.y / fallbackLength) * amount,
+    }
+  }
+
+  return {
+    x: centroid.x + (directionX / distance) * amount,
+    y: centroid.y + (directionY / distance) * amount,
+  }
 }
 
 /**

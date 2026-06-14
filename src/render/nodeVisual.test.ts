@@ -92,6 +92,44 @@ describe('nodeVisualFor', () => {
       expect(partway.brightness).toBeGreaterThan(afterFlash.brightness)
     })
 
+    it('decays the flash to EXACTLY zero by the end of the window, leaving no ring', () => {
+      // The user's complaint: the middle effect "never fully dissolves / lingers
+      // too long". When the heat baseline is zero, the flash is the only thing
+      // lifting brightness/glow, so at exactly flashMs both must hit precisely zero,
+      // proving the flash leaves nothing behind. We zero the heat by using a node
+      // with no touch-count heat and a cooling window no longer than the flash, so
+      // by flashMs the recency heat has also decayed to zero.
+      const touchedAt = 10_000
+      const flashMs = 1_200
+      // touchCount 0 -> no touch heat; coolingMs 1000 (< flashMs) -> recency heat is
+      // 0 by the time the flash window ends. So heat is exactly 0 at flashMs.
+      const node = makeNode({ touchCount: 0, lastTouchedAt: touchedAt })
+
+      const midFlash = nodeVisualFor(node, touchedAt + flashMs / 2, defaultTheme, { flashMs, heat: { coolingMs: 1000 }})
+      const atEnd = nodeVisualFor(node, touchedAt + flashMs, defaultTheme, { flashMs, heat: { coolingMs: 1000 }})
+
+      // The flash is clearly present partway through...
+      expect(midFlash.brightness).toBeGreaterThan(0)
+      expect(midFlash.glow).toBeGreaterThan(0)
+      // ...and is GONE (exactly zero, not a floor) at the end of the window.
+      expect(atEnd.brightness).toBe(0)
+      expect(atEnd.glow).toBe(0)
+    })
+
+    it('leaves a fully idle, cold node with no glow and no brightness at all', () => {
+      // The settled state the user wants: a node with no heat at all (never carrying
+      // touch-count heat and well past any flash) is just its core. Both the glow
+      // sprite strength and the white-lift brightness are zero, so nothing renders a
+      // lingering half-faded ring.
+      const node = makeNode({ touchCount: 0, lastTouchedAt: 0 })
+      // now is far past the flash window, so the flash contributes nothing and the
+      // zero touch-count leaves heat at zero.
+      const visual = nodeVisualFor(node, 10_000_000, defaultTheme)
+
+      expect(visual.brightness).toBe(0)
+      expect(visual.glow).toBe(0)
+    })
+
     it('never flashes a node that has never been touched', () => {
       const untouched = makeNode({ touchCount: 0, lastTouchedAt: null })
       const visual = nodeVisualFor(untouched, 10_000, defaultTheme)
@@ -102,6 +140,52 @@ describe('nodeVisualFor', () => {
       const node = makeNode({ touchCount: 10, lastTouchedAt: 10_000 })
       const visual = nodeVisualFor(node, 10_000, defaultTheme, { flashStrength: 5 })
       expect(visual.brightness).toBeLessThanOrEqual(1)
+    })
+  })
+
+  describe('glow drives the soft glow sprite', () => {
+    it('spikes the glow on a fresh touch above an idle node', () => {
+      const now = 10_000
+      const justTouched = makeNode({ touchCount: 2, lastTouchedAt: now })
+      const idle = makeNode({ touchCount: 2, lastTouchedAt: now - 1_000_000 })
+
+      const freshVisual = nodeVisualFor(justTouched, now, defaultTheme)
+      const idleVisual = nodeVisualFor(idle, now, defaultTheme)
+
+      expect(freshVisual.glow).toBeGreaterThan(idleVisual.glow)
+    })
+
+    it('keeps a faint STEADY glow on a hot idle node between touches', () => {
+      // A busy file just outside its flash window still glows softly from heat, so
+      // the forest reads as glowing even with the bloom post-process off. The flash
+      // is gone (touch is well past flashMs) but the heat baseline carries a glow.
+      const touchedAt = 10_000
+      const flashMs = 1_200
+      // Heavily touched, so touch-heat is high; sampled just past the flash window
+      // but well within the cooling window so recency heat is still up.
+      const node = makeNode({ touchCount: 12, lastTouchedAt: touchedAt })
+      const visual = nodeVisualFor(node, touchedAt + flashMs + 1, defaultTheme, { flashMs })
+
+      expect(visual.glow).toBeGreaterThan(0)
+      // It is only a faint steady glow, not a full flare (the flash is what flares).
+      expect(visual.glow).toBeLessThan(1)
+    })
+
+    it('decays the glow back down as the flash passes', () => {
+      const touchedAt = 10_000
+      const flashMs = 1_200
+      const node = makeNode({ touchCount: 3, lastTouchedAt: touchedAt })
+
+      const atTouch = nodeVisualFor(node, touchedAt, defaultTheme, { flashMs })
+      const partway = nodeVisualFor(node, touchedAt + flashMs / 2, defaultTheme, { flashMs })
+
+      expect(atTouch.glow).toBeGreaterThan(partway.glow)
+    })
+
+    it('clamps the glow to at most 1 even with an overdriven flash strength', () => {
+      const node = makeNode({ touchCount: 10, lastTouchedAt: 10_000 })
+      const visual = nodeVisualFor(node, 10_000, defaultTheme, { flashStrength: 5 })
+      expect(visual.glow).toBeLessThanOrEqual(1)
     })
   })
 
@@ -171,6 +255,8 @@ describe('nodeVisualFor', () => {
         expect(visual.alpha).toBeLessThanOrEqual(1)
         expect(visual.brightness).toBeGreaterThanOrEqual(0)
         expect(visual.brightness).toBeLessThanOrEqual(1)
+        expect(visual.glow).toBeGreaterThanOrEqual(0)
+        expect(visual.glow).toBeLessThanOrEqual(1)
       })
     }
   })

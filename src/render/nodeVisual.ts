@@ -19,7 +19,14 @@ import { colorForPath } from '../core/theme'
  * the node is (a seeded node is faint, a deleted node fades to nothing), while
  * `brightness` is how *hot* it is right now (a freshly touched node spikes white
  * then cools). A backend can map them independently: alpha to the disc's opacity,
- * brightness to the strength of the additive bloom.
+ * brightness to how far the core is pushed toward white.
+ *
+ * `glow` is the strength of the single soft additive glow sprite the backend
+ * scales under the crisp core (the redesign replaced the old hard-edged middle
+ * halo disc with one cheap radial-gradient sprite, so the "nice big glow" look
+ * survives even with the heavy bloom post-process off). A hot node carries a
+ * faint *steady* glow between touches; a fresh touch spikes it. It fully settles
+ * to zero on an idle, cold node, so nothing leaves a lingering half-faded ring.
  */
 export type NodeVisual = {
   /** Radius in world units, derived from the node's heat. */
@@ -28,8 +35,14 @@ export type NodeVisual = {
   color: Hsl
   /** Presence opacity, `0..1`. Seeded nodes are dim; deleted nodes fade toward 0. */
   alpha: number
-  /** Additive glow strength, `0..1`. Rises with heat and spikes on a fresh touch. */
+  /** How far the core is pushed toward white, `0..1`. Rises with heat and spikes on a fresh touch. */
   brightness: number
+  /**
+   * Strength of the soft additive glow sprite drawn under the core, `0..1`. A
+   * heat-scaled steady baseline plus the same touch flash that drives brightness,
+   * so a busy node blooms and an idle cold node settles to no glow at all.
+   */
+  glow: number
 }
 
 /**
@@ -67,10 +80,21 @@ const DEFAULT_FLASH_MS = 1_200
 const DEFAULT_FLASH_STRENGTH = 1
 
 /**
- * Baseline glow that scales with heat alone, before any flash is added. A hot,
- * idle node still glows softly; this keeps it from going flat between touches.
+ * Baseline brightness (how far the core is pushed toward white) that scales with
+ * heat alone, before any flash is added. A hot, idle node's core stays a touch
+ * brighter; this keeps it from going flat between touches.
  */
 const HEAT_BRIGHTNESS_WEIGHT = 0.6
+
+/**
+ * Baseline glow-sprite strength that scales with heat alone, before any flash is
+ * added. A hot, idle node keeps a soft, *steady* glow so it still reads as a
+ * glowing orb between touches even with the bloom post-process off, while a cold
+ * idle node settles to no glow at all (heat is 0, so this contributes nothing).
+ * Kept below 1 so the steady glow is a gentle halo, not a full flare; the touch
+ * flash is what spikes it bright.
+ */
+const HEAT_GLOW_WEIGHT = 0.5
 
 /**
  * Computes the full visual description of a node at playhead time `now`. Pure and
@@ -89,6 +113,10 @@ const HEAT_BRIGHTNESS_WEIGHT = 0.6
  *   from full to 0 over `deleteFadeMs` since its delete.
  * - **brightness** is a heat-scaled baseline plus a short-lived flash that spikes
  *   on a fresh touch and decays linearly over `flashMs`.
+ * - **glow** is the soft additive glow sprite's strength: a (separate) heat-scaled
+ *   baseline plus the same touch flash, so a busy node blooms and an idle cold
+ *   node settles to nothing (its heat is 0). This is what carries the big-glow
+ *   look the user liked even when the heavy bloom post-process is off.
  */
 export function nodeVisualFor(
   node: TreeNode,
@@ -112,13 +140,20 @@ export function nodeVisualFor(
 
   const alpha = alphaForStatus(node.status, node.lastTouchedAt, now, seededAlpha, deleteFadeMs)
 
-  // Baseline glow tracks heat so a busy node stays warm between touches; the
-  // flash rides on top and decays back to that baseline.
-  const baselineBrightness = heat * HEAT_BRIGHTNESS_WEIGHT
+  // The touch flash drives both the core's brightness and the glow sprite's
+  // strength: it spikes at the instant of a touch and decays linearly to exactly
+  // zero over `flashMs`, so a touched node flares then fully settles, never
+  // leaving a lingering half-faded ring.
   const flash = touchFlash(node.lastTouchedAt, now, flashMs, flashStrength)
-  const brightness = Math.min(1, baselineBrightness + flash)
 
-  return { radius, color, alpha, brightness }
+  // Both brightness and glow ride a heat-scaled baseline so a busy node stays warm
+  // between touches; the flash rides on top of each and decays back to its
+  // baseline. A cold idle node has heat 0, so both collapse to zero: just a crisp
+  // core, no glow.
+  const brightness = Math.min(1, heat * HEAT_BRIGHTNESS_WEIGHT + flash)
+  const glow = Math.min(1, heat * HEAT_GLOW_WEIGHT + flash)
+
+  return { radius, color, alpha, brightness, glow }
 }
 
 /**
