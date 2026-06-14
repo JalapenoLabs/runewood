@@ -169,7 +169,7 @@ export class Scene {
       // node's *visible* depth so a deep leaf drawn near the center is not a hairline.
       // A node missing from the map (a repo root hanging off the undrawn center) has
       // no drawable parent and carries no branch.
-      this.drawEdge(path, physics.position, visibleByPath.get(path), springs, theme, zoom)
+      this.drawEdge(path, physics.position, visibleByPath.get(path), visibleByPath, springs, theme, zoom)
 
       // The live highlight ring (issue #180): an extra breathing halo over a node a
       // host is watching (a PR's files during CI). It rides the node's live spring
@@ -348,6 +348,7 @@ export class Scene {
     path: string,
     position: Vec2,
     visible: VisibleNode | undefined,
+    visibleByPath: Map<string, VisibleNode>,
     springs: SpringState,
     theme: RunewoodTheme,
     zoom: number,
@@ -359,11 +360,18 @@ export class Scene {
       this.removeEdge(path)
       return
     }
+    // Connect to the display-parent only when that parent is itself a DRAWN node.
+    // A repo root's display-parent is the empty string: when a `rootLabel` is set
+    // that key is the visible forest root (so the repo branches off it), but with
+    // no root label the empty string is the undrawn center and the repo carries no
+    // branch. Both have a spring entry at `''`, so the drawn-ness is decided by
+    // whether `visibleByPath` actually holds the parent, not by the path's truthiness.
     const displayParentPath = visible?.displayParentPath ?? ''
-    const parentPhysics = displayParentPath ? springs.get(displayParentPath) : undefined
-    if (!parentPhysics) {
-      // No drawable parent (a repo root hanging off the undrawn forest center, or
-      // a display-parent not yet tracked): nothing to connect to this frame.
+    const parentVisible = visibleByPath.get(displayParentPath)
+    const parentPhysics = springs.get(displayParentPath)
+    if (!parentVisible || !parentPhysics) {
+      // No drawable parent (a repo root hanging off the undrawn forest center, or a
+      // display-parent not tracked yet): nothing to connect to this frame.
       this.removeEdge(path)
       return
     }
