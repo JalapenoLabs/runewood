@@ -51,7 +51,7 @@ function decisionFor(decisions: ReturnType<typeof decideLabels>, id: string) {
 describe('decideLabels', () => {
   describe('actor labels', () => {
     it('shows an active actor label and carries its presence as alpha', () => {
-      const decisions = decideLabels([ actorCandidate({ actorAlpha: 0.8 }) ], 1, 1000)
+      const decisions = decideLabels([ actorCandidate({ actorAlpha: 0.8 }) ], 1000)
       const decision = decisionFor(decisions, 'agent-1')
 
       expect(decision.kind).toBe('actor')
@@ -60,30 +60,22 @@ describe('decideLabels', () => {
     })
 
     it('hides an actor that has fully faded out', () => {
-      const decisions = decideLabels([ actorCandidate({ actorAlpha: 0 }) ], 1, 1000)
+      const decisions = decideLabels([ actorCandidate({ actorAlpha: 0 }) ], 1000)
       expect(decisionFor(decisions, 'agent-1').visible).toBe(false)
-    })
-
-    it('keeps actor labels visible even zoomed far out', () => {
-      const decisions = decideLabels([ actorCandidate() ], 0.01, 1000, { fileZoomThreshold: 0.6 })
-      expect(decisionFor(decisions, 'agent-1').visible).toBe(true)
     })
   })
 
   describe('directory-root labels', () => {
-    it('stays visible at the subtle root alpha across every zoom', () => {
-      const zoomedOut = decideLabels([ rootCandidate() ], 0.01, 1000, { rootAlpha: 0.45 })
-      const zoomedIn = decideLabels([ rootCandidate() ], 50, 1000, { rootAlpha: 0.45 })
+    it('stays visible at the subtle root alpha', () => {
+      const decisions = decideLabels([ rootCandidate() ], 1000, { rootAlpha: 0.45 })
 
-      expect(decisionFor(zoomedOut, 'repo').visible).toBe(true)
-      expect(decisionFor(zoomedOut, 'repo').alpha).toBeCloseTo(0.45, 5)
-      expect(decisionFor(zoomedIn, 'repo').visible).toBe(true)
-      expect(decisionFor(zoomedIn, 'repo').alpha).toBeCloseTo(0.45, 5)
+      expect(decisionFor(decisions, 'repo').visible).toBe(true)
+      expect(decisionFor(decisions, 'repo').alpha).toBeCloseTo(0.45, 5)
     })
 
     it('is subtler than a fresh file or active actor label', () => {
       const candidates = [ rootCandidate(), fileCandidate({ lastTouchedAt: 1000 }), actorCandidate() ]
-      const decisions = decideLabels(candidates, 1, 1000, { rootAlpha: 0.45 })
+      const decisions = decideLabels(candidates, 1000, { rootAlpha: 0.45 })
 
       const root = decisionFor(decisions, 'repo')
       const file = decisionFor(decisions, 'repo/src/main.ts')
@@ -96,7 +88,7 @@ describe('decideLabels', () => {
 
   describe('file labels fade with the touch flash', () => {
     it('is full opacity at the instant of the touch', () => {
-      const decisions = decideLabels([ fileCandidate({ lastTouchedAt: 1000 }) ], 1, 1000, { fileFadeMs: 1200 })
+      const decisions = decideLabels([ fileCandidate({ lastTouchedAt: 1000 }) ], 1000, { fileFadeMs: 1200 })
       const decision = decisionFor(decisions, 'repo/src/main.ts')
 
       expect(decision.visible).toBe(true)
@@ -108,9 +100,9 @@ describe('decideLabels', () => {
       const fileFadeMs = 1200
       const candidate = fileCandidate({ lastTouchedAt })
 
-      const atTouch = decideLabels([ candidate ], 1, lastTouchedAt, { fileFadeMs })
-      const midFade = decideLabels([ candidate ], 1, lastTouchedAt + fileFadeMs / 2, { fileFadeMs })
-      const afterFade = decideLabels([ candidate ], 1, lastTouchedAt + fileFadeMs, { fileFadeMs })
+      const atTouch = decideLabels([ candidate ], lastTouchedAt, { fileFadeMs })
+      const midFade = decideLabels([ candidate ], lastTouchedAt + fileFadeMs / 2, { fileFadeMs })
+      const afterFade = decideLabels([ candidate ], lastTouchedAt + fileFadeMs, { fileFadeMs })
 
       expect(decisionFor(atTouch, candidate.id).alpha).toBeCloseTo(1, 5)
       expect(decisionFor(midFade, candidate.id).alpha).toBeCloseTo(0.5, 5)
@@ -126,34 +118,11 @@ describe('decideLabels', () => {
         text: 'cold.ts',
         position: { x: 0, y: 0 },
       }
-      expect(decisionFor(decideLabels([ candidate ], 1, 1000), candidate.id).visible).toBe(false)
+      expect(decisionFor(decideLabels([ candidate ], 1000), candidate.id).visible).toBe(false)
     })
   })
 
-  describe('level-of-detail culls file labels but keeps roots and actors', () => {
-    it('hides file labels when zoomed out far enough, keeping roots and actors', () => {
-      const candidates = [
-        fileCandidate({ lastTouchedAt: 1000 }),
-        rootCandidate(),
-        actorCandidate(),
-      ]
-      // Zoom below the file threshold: the file tier is culled wholesale.
-      const decisions = decideLabels(candidates, 0.2, 1000, { fileZoomThreshold: 0.6 })
-
-      expect(decisionFor(decisions, 'repo/src/main.ts').visible).toBe(false)
-      expect(decisionFor(decisions, 'repo').visible).toBe(true)
-      expect(decisionFor(decisions, 'agent-1').visible).toBe(true)
-    })
-
-    it('shows file labels again once zoomed in past the threshold', () => {
-      const candidate = fileCandidate({ lastTouchedAt: 1000 })
-      const culled = decideLabels([ candidate ], 0.2, 1000, { fileZoomThreshold: 0.6 })
-      const shown = decideLabels([ candidate ], 1.0, 1000, { fileZoomThreshold: 0.6 })
-
-      expect(decisionFor(culled, candidate.id).visible).toBe(false)
-      expect(decisionFor(shown, candidate.id).visible).toBe(true)
-    })
-
+  describe('level-of-detail gates file labels by density, never by zoom', () => {
     it('culls the whole file tier when lit-label density exceeds the cap, but keeps roots and actors', () => {
       const litFiles: LabelCandidate[] = []
       for (let index = 0; index < 10; index++) {
@@ -162,7 +131,7 @@ describe('decideLabels', () => {
       const candidates = [ ...litFiles, rootCandidate(), actorCandidate() ]
 
       // Cap of 5 with 10 lit files: the file tier is over budget and culled.
-      const decisions = decideLabels(candidates, 1, 1000, { fileDensityCap: 5 })
+      const decisions = decideLabels(candidates, 1000, { fileDensityCap: 5 })
 
       for (const file of litFiles) {
         expect(decisionFor(decisions, file.id).visible).toBe(false)
@@ -177,7 +146,7 @@ describe('decideLabels', () => {
         litFiles.push(fileCandidate({ id: `repo/src/file-${index}.ts`, text: `file-${index}.ts`, lastTouchedAt: 1000 }))
       }
 
-      const decisions = decideLabels(litFiles, 1, 1000, { fileDensityCap: 5 })
+      const decisions = decideLabels(litFiles, 1000, { fileDensityCap: 5 })
       for (const file of litFiles) {
         expect(decisionFor(decisions, file.id).visible).toBe(true)
       }
@@ -192,7 +161,7 @@ describe('decideLabels', () => {
         cold.push(fileCandidate({ id: `repo/cold-${index}.ts`, text: `cold-${index}.ts`, lastTouchedAt: -1_000_000 }))
       }
 
-      const decisions = decideLabels([ lit, ...cold ], 1, 1000, { fileDensityCap: 2, fileFadeMs: 1200 })
+      const decisions = decideLabels([ lit, ...cold ], 1000, { fileDensityCap: 2, fileFadeMs: 1200 })
       expect(decisionFor(decisions, 'repo/lit.ts').visible).toBe(true)
     })
   })
@@ -202,7 +171,7 @@ describe('decideLabels', () => {
       const longName = 'a-really-long-file-name-that-overflows.tsx'
       const candidate = fileCandidate({ id: 'repo/long', text: longName, lastTouchedAt: 1000 })
 
-      const decision = decisionFor(decideLabels([ candidate ], 1, 1000, { maxTextLength: 12 }), 'repo/long')
+      const decision = decisionFor(decideLabels([ candidate ], 1000, { maxTextLength: 12 }), 'repo/long')
 
       expect(decision.text.length).toBe(12)
       expect(decision.text.endsWith('…')).toBe(true)
@@ -211,7 +180,7 @@ describe('decideLabels', () => {
 
     it('leaves a name within the limit untouched', () => {
       const candidate = fileCandidate({ id: 'repo/short', text: 'main.ts', lastTouchedAt: 1000 })
-      const decision = decisionFor(decideLabels([ candidate ], 1, 1000, { maxTextLength: 24 }), 'repo/short')
+      const decision = decisionFor(decideLabels([ candidate ], 1000, { maxTextLength: 24 }), 'repo/short')
       expect(decision.text).toBe('main.ts')
     })
 
@@ -219,7 +188,7 @@ describe('decideLabels', () => {
       const root = rootCandidate({ id: 'repo', text: 'an-extremely-long-repository-name' })
       const actor = actorCandidate({ id: 'agent', text: 'an-extremely-long-actor-identifier' })
 
-      const decisions = decideLabels([ root, actor ], 1, 1000, { maxTextLength: 10 })
+      const decisions = decideLabels([ root, actor ], 1000, { maxTextLength: 10 })
       expect(decisionFor(decisions, 'repo').text.length).toBe(10)
       expect(decisionFor(decisions, 'agent').text.length).toBe(10)
     })
@@ -228,8 +197,8 @@ describe('decideLabels', () => {
   describe('determinism', () => {
     it('is a pure function of its inputs', () => {
       const candidates = [ fileCandidate(), rootCandidate(), actorCandidate() ]
-      const first = decideLabels(candidates, 1, 1200)
-      const second = decideLabels(candidates, 1, 1200)
+      const first = decideLabels(candidates, 1200)
+      const second = decideLabels(candidates, 1200)
       expect(first).toEqual(second)
     })
   })

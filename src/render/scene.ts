@@ -3,6 +3,7 @@
 import type { Container, Renderer, Texture } from 'pixi.js'
 import type { TreeNode } from '../core/tree'
 import type { SpringState, Vec2 } from '../core/layout'
+import type { VisibleNode } from '../core/collapse'
 import type { RunewoodTheme } from '../core/theme'
 import type { NodeVisualOptions } from './nodeVisual'
 import type { EdgeVisualOptions } from './edgeVisual'
@@ -106,7 +107,14 @@ export class Scene {
    *   thickness at a constant on-screen width so a branch never thins to nothing
    *   when the camera pulls far out and the whole forest shrinks.
    */
-  public update(tree: TreeNode, springs: SpringState, now: number, theme: RunewoodTheme, zoom: number): void {
+  public update(
+    tree: TreeNode,
+    springs: SpringState,
+    now: number,
+    theme: RunewoodTheme,
+    zoom: number,
+    visibleByPath: Map<string, VisibleNode>,
+  ): void {
     const nodesByPath = indexNodesByPath(tree)
 
     this.cullDeparted(springs)
@@ -120,7 +128,12 @@ export class Scene {
         continue
       }
       this.drawNode(node, physics.position, now, theme)
-      this.drawEdge(node, path, physics.position, springs, theme, zoom)
+      // Edges connect a node to its *display-parent* (nearest visible ancestor), so
+      // a collapsed pass-through chain is spanned by one edge, and are styled by the
+      // node's *visible* depth so a deep leaf drawn near the center is not a hairline.
+      // A node missing from the map (a repo root hanging off the undrawn center) has
+      // no drawable parent and carries no branch.
+      this.drawEdge(path, physics.position, visibleByPath.get(path), springs, theme, zoom)
     }
   }
 
@@ -279,25 +292,27 @@ export class Scene {
    * branch; their entry in {@link edgeGraphics} stays absent.
    */
   private drawEdge(
-    node: TreeNode,
     path: string,
     position: Vec2,
+    visible: VisibleNode | undefined,
     springs: SpringState,
     theme: RunewoodTheme,
     zoom: number,
   ): void {
-    const lastSlash = path.lastIndexOf('/')
-    const parentPath = lastSlash > 0 ? path.slice(0, lastSlash) : ''
-    const parentPhysics = parentPath ? springs.get(parentPath) : undefined
+    const displayParentPath = visible?.displayParentPath ?? ''
+    const parentPhysics = displayParentPath ? springs.get(displayParentPath) : undefined
     if (!parentPhysics) {
       // No drawable parent (a repo root hanging off the undrawn forest center, or
-      // a parent not yet tracked): nothing to connect to this frame.
+      // a display-parent not yet tracked): nothing to connect to this frame.
       this.removeEdge(path)
       return
     }
 
-    // Depth is the number of path segments: `repo` is depth 1, `repo/src` depth 2.
-    const depth = path.split('/').length
+    // Style the branch by the node's *visible* depth (repo root = 1), so a branch
+    // that spans a collapsed pass-through chain is styled by its drawn ring, not by
+    // how many real path segments it skipped. A node with no collapse info present
+    // falls back to its raw path-segment count.
+    const depth = visible?.depth ?? path.split('/').length
     const visual = edgeVisualFor(depth, theme, this.edgeOptions)
 
     // Floor the stroke at a constant on-screen width. The branch is drawn in world

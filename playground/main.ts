@@ -69,6 +69,7 @@ function main(): void {
   const stateReadout = requireElement<HTMLPreElement>('state-readout')
   const startStopButton = requireElement<HTMLButtonElement>('start-stop')
   const burstButton = requireElement<HTMLButtonElement>('burst')
+  const resetButton = requireElement<HTMLButtonElement>('reset')
   const rateInput = requireElement<HTMLInputElement>('rate')
   const rateValue = requireElement<HTMLSpanElement>('rate-value')
   const themeSelect = requireElement<HTMLSelectElement>('theme')
@@ -108,9 +109,8 @@ function main(): void {
   // behavior is what an operator sees first.
   //
   // Note: the follow camera looks best with *coherent* activity that travels as a
-  // region. The synthetic generator scatters events randomly across the whole
-  // forest, so the follow camera will travel a fair bit chasing the spread; a later
-  // batch reduces the generator to 2 contributors, which tightens it.
+  // region. The synthetic generator now runs just 2 contributors (see `ACTORS` in
+  // synthetic.ts), so the activity stays tighter and the follow camera is calmer.
   let controller = createRunewood(canvasHost, {
     theme: 'dusk',
     bloom: 'off',
@@ -124,7 +124,11 @@ function main(): void {
   wireControllerLogging(controller)
   wireHoverTooltip(controller, hoverTooltip)
 
-  const stream = createSyntheticStream({
+  // The synthetic stream is held in a mutable binding (not a const) so the Reset
+  // button can throw the whole generator away and start a brand-new one from an
+  // empty forest, rather than resuming the retained one. Its `onEvent` re-reads the
+  // outer `controller` on every emit, so a controller rebuild is picked up for free.
+  let stream = createSyntheticStream({
     eventsPerSecond: Number(rateInput.value),
     onEvent: (event) => controller.ingest(event),
   })
@@ -146,6 +150,11 @@ function main(): void {
   })
 
   burstButton.addEventListener('click', () => stream.burst())
+
+  // Reset / Restart: tear the whole visualization down and recreate it fresh, the
+  // way the theme-change rebuild does, but also throw the synthetic generator away
+  // so the forest starts empty again rather than continuing the retained tree.
+  resetButton.addEventListener('click', () => reset())
 
   rateInput.addEventListener('input', () => {
     const nextRate = Number(rateInput.value)
@@ -243,6 +252,42 @@ function main(): void {
     if (!wasRunning) {
       stream.stop()
     }
+  }
+
+  /**
+   * Resets the playground to a clean slate: destroy the controller, throw away the
+   * synthetic generator (so its retained forest is gone), and recreate both fresh,
+   * exactly like the theme-change rebuild but with an empty forest restarted from
+   * zero. The new stream's `onEvent` captures the new `controller`, and the outer
+   * `stream` binding is repointed so every later control (start/stop, burst, rate)
+   * drives the fresh generator.
+   */
+  function reset(): void {
+    controller.destroy()
+    stream.stop()
+    hoverTooltip.style.display = 'none'
+
+    controller = createRunewood(canvasHost, {
+      theme: themeSelect.value as ThemeName,
+      bloom: bloomSelect.value as BloomQuality,
+      showLabels: labelsToggle.checked,
+      autoplay: true,
+      followLive: true,
+      cameraMode: 'follow',
+      exclude: parseExcludePatterns(excludeInput.value),
+    })
+    controller.seed(seedPaths())
+    wireControllerLogging(controller)
+    wireHoverTooltip(controller, hoverTooltip)
+
+    // A brand-new generator starts the fake forest over from empty, rather than
+    // continuing the previous run's retained tree.
+    stream = createSyntheticStream({
+      eventsPerSecond: Number(rateInput.value),
+      onEvent: (event) => controller.ingest(event),
+    })
+    stream.start()
+    syncStartStopLabel()
   }
 
   // The live state readout: a tiny JSON dump of `getState()`, refreshed on a timer

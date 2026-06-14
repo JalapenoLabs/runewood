@@ -66,26 +66,59 @@ describe('computeTargets', () => {
     }
   })
 
-  it('places every node in the tree (plus the forest root)', () => {
+  it('places every visible node (plus the forest root), collapsing single-child dirs', () => {
     const targets = computeTargets(treeFromPaths([ 'repo/src/main.rs' ]))
 
-    // forest root '', 'repo', 'repo/src', 'repo/src/main.rs'
+    // forest root '', 'repo' (root), 'repo/src/main.rs' (leaf). `repo/src` is a
+    // single-child pass-through directory: it is collapsed away and gets no target.
     expect(targets.has('')).toBe(true)
     expect(targets.has('repo')).toBe(true)
-    expect(targets.has('repo/src')).toBe(true)
     expect(targets.has('repo/src/main.rs')).toBe(true)
+    expect(targets.has('repo/src')).toBe(false)
   })
 
-  it('pushes each depth one ring further from the center', () => {
-    const targets = computeTargets(treeFromPaths([ 'repo/src/main.rs' ]), { jitter: 0 })
+  it('keeps a multi-child intermediate directory placed (it is not collapsed)', () => {
+    // With two children, `repo/src` is a real branch and must get a target.
+    const targets = computeTargets(treeFromPaths([ 'repo/src/a.rs', 'repo/src/b.rs' ]))
+    expect(targets.has('repo/src')).toBe(true)
+    expect(targets.has('repo/src/a.rs')).toBe(true)
+    expect(targets.has('repo/src/b.rs')).toBe(true)
+  })
+
+  it('pushes each visible depth one ring further from the center', () => {
+    // `repo/src` has two children so it stays visible; depth grows ring by ring.
+    const targets = computeTargets(treeFromPaths([ 'repo/src/a.rs', 'repo/src/b.rs' ]), { jitter: 0 })
     const center = targets.get('')!
 
     const repoRadius = distance(targets.get('repo')!, center)
     const srcRadius = distance(targets.get('repo/src')!, center)
-    const fileRadius = distance(targets.get('repo/src/main.rs')!, center)
+    const fileRadius = distance(targets.get('repo/src/a.rs')!, center)
 
     expect(srcRadius).toBeGreaterThan(repoRadius)
     expect(fileRadius).toBeGreaterThan(srcRadius)
+  })
+
+  it('does not fling a leaf below a collapsed chain out past a real sibling depth', () => {
+    // `docs` has two children; the deep leaf hangs directly off `docs` (its nearest
+    // visible ancestor), so it lands one ring out from `docs`, exactly like the
+    // shallow sibling, rather than seven rings out for its seven real segments.
+    const targets = computeTargets(
+      treeFromPaths([
+        'docs/helpers/cmd/routes/http/pkg/parser.mdx',
+        'docs/guide.mdx',
+      ]),
+      { jitter: 0 },
+    )
+    const center = targets.get('')!
+
+    // The collapsed intermediates have no target at all.
+    expect(targets.has('docs/helpers')).toBe(false)
+    expect(targets.has('docs/helpers/cmd/routes/http/pkg')).toBe(false)
+
+    const shallowRadius = distance(targets.get('docs/guide.mdx')!, center)
+    const deepRadius = distance(targets.get('docs/helpers/cmd/routes/http/pkg/parser.mdx')!, center)
+    // Both leaves sit on the same ring (one out from `docs`), so their radii match.
+    expect(deepRadius).toBeCloseTo(shallowRadius, 6)
   })
 
   it('keeps each file within its own repo wedge, not a sibling repo wedge', () => {
@@ -128,12 +161,16 @@ describe('computeTargets', () => {
     }
   })
 
-  it('grows a lone-directory chain straight outward (single child inherits the angle)', () => {
+  it('grows a lone-directory chain straight outward (the leaf inherits the root angle)', () => {
+    // The whole single-child chain `deep/nested` collapses away; only the repo root
+    // and the leaf remain, and the lone-child leaf inherits the parent's angle so it
+    // grows straight outward rather than drifting.
     const targets = computeTargets(treeFromPaths([ 'repo/deep/nested/file.ts' ]), { jitter: 0 })
 
+    expect(targets.has('repo/deep')).toBe(false)
+    expect(targets.has('repo/deep/nested')).toBe(false)
+
     const repoAngle = angleOf(targets.get('repo')!)
-    expect(angleOf(targets.get('repo/deep')!)).toBeCloseTo(repoAngle, 9)
-    expect(angleOf(targets.get('repo/deep/nested')!)).toBeCloseTo(repoAngle, 9)
     expect(angleOf(targets.get('repo/deep/nested/file.ts')!)).toBeCloseTo(repoAngle, 9)
   })
 

@@ -1,6 +1,9 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { TreeNode } from './tree'
+import type { VisibleNode } from './collapse'
+
+import { collapseTree } from './collapse'
 
 /**
  * A 2D point in layout space. Layout space is abstract and unitless: the
@@ -98,10 +101,18 @@ type AngularWedge = {
 }
 
 /**
- * Computes the target position of every node in the tree as a pure radial
- * tidy-tree. The forest root sits at `center`; its children (the repo roots) are
- * spread evenly around the full circle, and each node hands its descendants a
- * slice of its own angular wedge, pushing them one ring further out per depth.
+ * Computes the target position of every *visible* node in the tree as a pure
+ * radial tidy-tree. The forest root sits at `center`; its visible children (the
+ * repo roots) are spread evenly around the full circle, and each node hands its
+ * visible descendants a slice of its own angular wedge, pushing them one ring
+ * further out per *visible* depth.
+ *
+ * Collapsed pass-through directories (a non-root directory with exactly one child,
+ * see {@link collapseTree}) are skipped: they get no target at all, the depth
+ * counts only visible ancestors so a leaf below a long collapsed chain is not
+ * flung many rings out, and each visible node's wedge comes from its nearest
+ * visible ancestor. The collapse is a display transform; the underlying tree (and
+ * every full path) is untouched, so picking and beams still use real paths.
  *
  * The result is a deterministic function of `(tree, options)` alone: identical
  * input yields an identical map, with no reads of `Math.random`, the wall clock,
@@ -121,15 +132,36 @@ export function computeTargets(tree: TreeNode, options: LayoutOptions = {}): Map
   // anyway keeps the recursion uniform.
   targets.set(tree.path, { x: center.x, y: center.y })
 
-  placeChildren(tree, { angle: 0, span: Math.PI }, 0, {
+  // Collapse pass-through directories away first, then group the surviving visible
+  // nodes by their display-parent so the radial recursion walks only what is drawn.
+  // The forest root's path (`''`) is the display-parent of every repo root.
+  const visibleByDisplayParent = groupByDisplayParent(collapseTree(tree))
+
+  placeVisibleChildren(tree.path, { angle: 0, span: Math.PI }, 0, {
     center,
     ringSpacing,
     wedgeFill,
     jitter,
     targets,
+    visibleByDisplayParent,
   })
 
   return targets
+}
+
+/** Buckets the visible nodes by their display-parent path so children are looked up in O(1). */
+function groupByDisplayParent(visible: VisibleNode[]): Map<string, TreeNode[]> {
+  const byParent = new Map<string, TreeNode[]>()
+  for (const { node, displayParentPath } of visible) {
+    const siblings = byParent.get(displayParentPath)
+    if (siblings) {
+      siblings.push(node)
+    }
+    else {
+      byParent.set(displayParentPath, [ node ])
+    }
+  }
+  return byParent
 }
 
 /** Everything the recursion needs that does not change between nodes. */
@@ -139,23 +171,28 @@ type PlacementContext = {
   wedgeFill: number
   jitter: number
   targets: Map<string, Vec2>
+  /** Visible nodes grouped by their nearest-visible-ancestor (display-parent) path. */
+  visibleByDisplayParent: Map<string, TreeNode[]>
 }
 
 /**
- * Lays out `parent`'s children across the parent's `wedge`, one ring further out
- * than the parent, then recurses into each child with its own narrowed wedge.
+ * Lays out the visible children of `parentPath` across the parent's `wedge`, one
+ * ring further out than the parent's *visible* depth, then recurses into each
+ * child with its own narrowed wedge. Driven by the display-parent grouping (not
+ * the raw `children` map) so collapsed intermediates are skipped and every edge
+ * spans from a visible node to its nearest visible ancestor.
  *
  * Children are visited in sorted path order so the layout is independent of Map
  * insertion order: two trees that are structurally equal but were built by
  * different event sequences must produce identical targets.
  */
-function placeChildren(
-  parent: TreeNode,
+function placeVisibleChildren(
+  parentPath: string,
   wedge: AngularWedge,
   depth: number,
   context: PlacementContext,
 ): void {
-  const children = [ ...parent.children.values() ].sort((left, right) => {
+  const children = [ ...(context.visibleByDisplayParent.get(parentPath) ?? []) ].sort((left, right) => {
     return left.path < right.path ? -1 : left.path > right.path ? 1 : 0
   })
   if (children.length === 0) {
@@ -189,7 +226,7 @@ function placeChildren(
     // Hand each child a wedge centered on its own (pre-jitter) angle so its
     // descendants stay cleanly within its slice. Half a per-child span keeps a
     // node's whole sub-tree inside the angular band the parent allotted it.
-    placeChildren(child, { angle: childAngle, span: perChildSpan / 2 }, childDepth, context)
+    placeVisibleChildren(child.path, { angle: childAngle, span: perChildSpan / 2 }, childDepth, context)
   }
 }
 

@@ -22,8 +22,13 @@ import type { RunewoodEvent, RunewoodAction } from '../src/index'
  * playground's wiring (the page) cleanly separated from its data (this file).
  */
 
-/** The fake actors that take turns (or overlap) crawling the forest. */
-const ACTORS = [ 'fable', 'sonnet', 'opus', 'haiku', 'scout' ] as const
+/**
+ * The fake actors that take turns (or overlap) crawling the forest. Kept to
+ * exactly two contributors per direct user feedback: a smaller cast makes the
+ * follow camera calmer (it no longer chases a swarm scattered across the whole
+ * forest) and reads more like a real, focused work session.
+ */
+const ACTORS = [ 'fable', 'sonnet' ] as const
 
 /** The repo roots of the fake forest. Mirrors a real Seraphim-style multi-repo workspace. */
 const REPO_ROOTS = [ 'api', 'frontend', 'workspace', 'docs', 'infra' ] as const

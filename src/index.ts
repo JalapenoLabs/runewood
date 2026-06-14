@@ -2,6 +2,7 @@
 
 export type { RunewoodAction, RunewoodEvent } from './types'
 export type { NodeStatus, TreeNode } from './core/tree'
+export type { VisibleNode } from './core/collapse'
 export type { AdvanceResult } from './core/timeline'
 export type {
   Vec2,
@@ -22,6 +23,7 @@ export type {
 } from './render/cameraMode'
 
 export { applyEvent, createTree, seedTree } from './core/tree'
+export { collapseTree } from './core/collapse'
 export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'

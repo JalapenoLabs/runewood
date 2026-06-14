@@ -11,27 +11,23 @@ import { hslToRgbInt } from './color'
 import { decideLabels } from './labels'
 
 /**
- * The font size, in world units, every label glyph is drawn at. pixi's default
- * {@link Text} size read too large in the playground, so labels are pinned to a
- * deliberate base and then taken 25% smaller per direct user feedback: the text
- * was crowding the forest. {@link LABEL_FONT_SIZE_SCALE} is the reduction factor,
- * kept as its own constant so the "why 0.75" is documented at the call site.
+ * The on-screen height, in *screen pixels*, every label glyph is drawn at. pixi's
+ * default {@link Text} size read too large in the playground, so labels are pinned
+ * to a deliberate base and then taken 25% smaller per direct user feedback: the
+ * text was crowding the forest. {@link LABEL_FONT_SIZE_SCALE} is the reduction
+ * factor, kept as its own constant so the "why 0.75" is documented at the call site.
+ *
+ * Crucially this is a *screen* size, not a world size: per direct user feedback,
+ * every label (file, root, AND actor) must stay the same size on screen as the
+ * camera zooms, navigates, and pans, rather than shrinking with the world when the
+ * camera pulls out. The world font size is therefore divided by the live `zoom`
+ * (see {@link update}), so the rendered glyph lands on exactly this many screen
+ * pixels at any zoom. At `zoom === 1` it is exactly this size; at half zoom the
+ * world font doubles to keep the screen size constant.
  */
-const LABEL_BASE_FONT_SIZE = 16
+const LABEL_BASE_SCREEN_PX = 16
 const LABEL_FONT_SIZE_SCALE = 0.75
-const LABEL_FONT_SIZE = LABEL_BASE_FONT_SIZE * LABEL_FONT_SIZE_SCALE
-
-/**
- * The minimum on-screen height, in screen pixels, an *actor* label is ever drawn
- * at. Labels are sized in world units that the camera scales by `zoom`, so an
- * actor's name shrinks to an illegible smear once the camera pulls far out. For
- * actor labels only (the "who is doing what" headline the user must always read),
- * the world font size is floored at `MIN_ACTOR_LABEL_SCREEN_PX / zoom` so the name
- * stays roughly constant on screen. File and root labels keep their plain world
- * font size: per the design they are allowed to shrink and the file tier is culled
- * outright when the camera is too far out (see the LOD model).
- */
-const MIN_ACTOR_LABEL_SCREEN_PX = 13
+const LABEL_SCREEN_PX = LABEL_BASE_SCREEN_PX * LABEL_FONT_SIZE_SCALE
 
 /**
  * The retained label layer that sits *above* the forest and the beams (issue #7):
@@ -82,11 +78,13 @@ export class LabelScene {
    * holds a label the model has ruled out.
    *
    * @param candidates every label the caller would like drawn this frame.
-   * @param zoom the live camera zoom, driving the file-tier level-of-detail.
+   * @param zoom the live camera zoom, used to counter-scale every glyph so each
+   *   label keeps a constant on-screen size regardless of how far the camera pulls
+   *   out (the file-tier LOD is now a pure density gate, independent of zoom).
    * @param now the playhead time, driving the file touch-flash fade.
    */
   public update(candidates: LabelCandidate[], zoom: number, now: number, theme: RunewoodTheme): void {
-    const decisions = decideLabels(candidates, zoom, now, this.options)
+    const decisions = decideLabels(candidates, now, this.options)
     const present = new Set<string>()
 
     for (const decision of decisions) {
@@ -100,7 +98,7 @@ export class LabelScene {
 
       let text = this.textById.get(decision.id)
       if (!text) {
-        text = new Text({ text: decision.text, style: { fontSize: LABEL_FONT_SIZE }})
+        text = new Text({ text: decision.text })
         this.layer.addChild(text)
         this.textById.set(decision.id, text)
       }
@@ -108,17 +106,19 @@ export class LabelScene {
       // every kind shares the theme's label hue; the per-kind distinction is
       // carried by alpha (subtle roots vs full file/actor flashes).
       //
-      // Actor labels get a constant-on-screen floor: their world font size is lifted
-      // to `MIN_ACTOR_LABEL_SCREEN_PX / zoom` when that exceeds the base, so the
-      // name stays readable however far the camera zooms out. Up close the base size
-      // wins and nothing changes. File / root labels keep the plain world size.
-      const isActor = decision.kind === 'actor'
-      const minActorFontSize = isActor && zoom > 0
-        ? MIN_ACTOR_LABEL_SCREEN_PX / zoom
-        : 0
+      // Constant on-screen size for EVERY kind: the glyph is authored in world units
+      // that the camera scales by `zoom`, so dividing the screen-pixel target by the
+      // live zoom yields the world font size that lands on exactly `LABEL_SCREEN_PX`
+      // screen pixels at any zoom. File, root, and actor labels therefore never
+      // shrink as the camera pulls out (the user's explicit ask); the LOD model still
+      // governs *which* labels show. A non-positive zoom (degenerate) falls back to
+      // the raw screen size so a label is never lost to a divide-by-zero.
+      const worldFontSize = zoom > 0
+        ? LABEL_SCREEN_PX / zoom
+        : LABEL_SCREEN_PX
       text.text = decision.text
       text.style.fill = hslToRgbInt(theme.label)
-      text.style.fontSize = Math.max(LABEL_FONT_SIZE, minActorFontSize)
+      text.style.fontSize = worldFontSize
       text.alpha = decision.alpha
       text.position.set(decision.position.x, decision.position.y)
     }

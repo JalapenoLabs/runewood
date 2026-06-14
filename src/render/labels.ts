@@ -21,8 +21,14 @@ import type { Vec2 } from '../core/layout'
  *   opacity so they sit behind the live action.
  * - **file** labels are the noisy, optional tier. A freshly touched file shows a
  *   brief label that fades with the same touch-flash window the node uses, and the
- *   whole tier is culled when the camera is zoomed out or when too many files are
- *   lit at once. This is the level-of-detail that keeps the view legible.
+ *   whole tier is culled when too many files are lit at once. This density cap is
+ *   the level-of-detail that keeps the view legible.
+ *
+ * Note: labels are drawn at a constant on-screen size (the backend counter-scales
+ * them by the camera zoom), so a zoomed-out label stays just as legible as a
+ * zoomed-in one. The file tier is therefore *not* culled by zoom; legibility is
+ * preserved by the density cap (and the per-label touch-flash fade) instead, so a
+ * constant-size label is never hidden merely because the camera pulled out.
  */
 
 /** Which tier a candidate label belongs to. Drives its entire visibility policy. */
@@ -74,17 +80,12 @@ export type LabelDecision = {
 /** Tuning for {@link decideLabels}. Every field has a sensible default. */
 export type LabelLodOptions = {
   /**
-   * Camera zoom (world-units-to-pixels) at or above which file labels are allowed
-   * to show. Below it the forest is small enough on screen that per-file text is
-   * unreadable noise, so the whole file tier is culled and only roots and actors
-   * remain. Roots and actors ignore this entirely.
-   */
-  fileZoomThreshold?: number
-  /**
    * The most lit file labels to show at once. Above this the file tier is too
    * dense to read without overlapping, so it is culled wholesale (a simple v1
    * density gate, not per-label overlap resolution). Roots and actors are exempt,
-   * so they always survive a dense burst.
+   * so they always survive a dense burst. Since labels are drawn at a constant
+   * on-screen size, this count gate (not the camera zoom) is what keeps the file
+   * tier legible.
    */
   fileDensityCap?: number
   /**
@@ -104,7 +105,6 @@ export type LabelLodOptions = {
   maxTextLength?: number
 }
 
-const DEFAULT_FILE_ZOOM_THRESHOLD = 0.6
 const DEFAULT_FILE_DENSITY_CAP = 40
 // Mirrors nodeVisual's DEFAULT_FLASH_MS so a file's label and its glow flash decay together.
 const DEFAULT_FILE_FADE_MS = 1_200
@@ -116,20 +116,21 @@ const TRUNCATION_ELLIPSIS = '…'
 
 /**
  * Decides the full set of label draws for one frame. Pure and deterministic: it
- * reads only the candidates, the zoom, the playhead `now`, and the options, never
- * the clock or randomness, so a rewound timeline reproduces the exact same labels.
+ * reads only the candidates, the playhead `now`, and the options, never the clock
+ * or randomness, so a rewound timeline reproduces the exact same labels.
  *
  * The level-of-detail policy:
  * - **actor** labels are kept whenever the actor has any presence (`actorAlpha >
  *   0`) and carry that presence as their alpha, so a label is exactly as visible
  *   as the orb it names and disappears the instant the actor fully fades.
  * - **root** labels are always visible at the subtle `rootAlpha`, regardless of
- *   zoom or how busy the forest is, so a viewer can always read the repo names.
- * - **file** labels are culled as a tier when the camera is below
- *   `fileZoomThreshold` (too small to read) or when more file labels are currently
- *   lit than `fileDensityCap` (too crowded to read). A surviving file label's
- *   alpha follows its touch flash: full at the touch, fading linearly to 0 over
+ *   how busy the forest is, so a viewer can always read the repo names.
+ * - **file** labels are culled as a tier only when more file labels are currently
+ *   lit than `fileDensityCap` (too crowded to read). A surviving file label's alpha
+ *   follows its touch flash: full at the touch, fading linearly to 0 over
  *   `fileFadeMs`, and a file whose flash has fully decayed is simply not shown.
+ *   There is intentionally no zoom gate: labels are drawn at a constant on-screen
+ *   size, so a zoomed-out file label stays legible and is kept.
  *
  * Density is measured from the *lit* file labels (those still inside their fade
  * window), not every file on screen, because only a lit label would be drawn; a
@@ -137,11 +138,9 @@ const TRUNCATION_ELLIPSIS = '…'
  */
 export function decideLabels(
   candidates: LabelCandidate[],
-  zoom: number,
   now: number,
   options: LabelLodOptions = {},
 ): LabelDecision[] {
-  const fileZoomThreshold = options.fileZoomThreshold ?? DEFAULT_FILE_ZOOM_THRESHOLD
   const fileDensityCap = options.fileDensityCap ?? DEFAULT_FILE_DENSITY_CAP
   const fileFadeMs = options.fileFadeMs ?? DEFAULT_FILE_FADE_MS
   const rootAlpha = options.rootAlpha ?? DEFAULT_ROOT_ALPHA
@@ -161,10 +160,9 @@ export function decideLabels(
     }
   }
 
-  // The two tier-wide gates for file labels. Roots and actors never consult these.
-  const zoomedInEnough = zoom >= fileZoomThreshold
-  const sparseEnough = fileAlphaById.size <= fileDensityCap
-  const fileTierVisible = zoomedInEnough && sparseEnough
+  // The one tier-wide gate for file labels: density. Roots and actors never consult
+  // it. There is no zoom gate, because constant-size labels stay legible zoomed out.
+  const fileTierVisible = fileAlphaById.size <= fileDensityCap
 
   const decisions: LabelDecision[] = []
   for (const candidate of candidates) {

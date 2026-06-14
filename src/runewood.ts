@@ -16,11 +16,13 @@ import type { BeamScene } from './render/beamScene'
 import type { LabelScene } from './render/labelScene'
 import type { PickCandidate } from './core/picking'
 import type { PathFilter } from './core/filter'
+import type { VisibleNode } from './core/collapse'
 import type { CameraMode, RecentNodeSample, RecentActorSample } from './render/cameraMode'
 
 // Core
 import { Timeline } from './core/timeline'
 import { computeTargets, stepSprings } from './core/layout'
+import { collapseTree } from './core/collapse'
 import { defaultTheme, mergeTheme, themes } from './core/theme'
 import { createFrameState, stepFrame } from './core/frameStep'
 import { seedTree } from './core/tree'
@@ -380,6 +382,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   let targets = new Map<string, Vec2>()
   let targetsStale = true
 
+  // The display-collapse of the tree, keyed by real node path, memoized on the same
+  // structure-changed signal as the layout targets. It records which nodes are
+  // visible (collapsed pass-through directories are skipped), each visible node's
+  // nearest visible ancestor (so an edge spans a collapsed chain in one hop), and
+  // its visible depth. The scene and the label builder both read it so they agree
+  // on exactly what is drawn. Recomputed only when the structure changes, like the
+  // targets, since it too is a pure function of the tree's shape.
+  let visibleByPath = new Map<string, VisibleNode>()
+
   // The forward-only visual shell, created once the backend is ready.
   const backend = new PixiBackend()
   let scene: Scene | null = null
@@ -548,6 +559,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     //    is skipped on the common no-structure-change frame.
     if (targetsStale) {
       targets = computeTargets(frameState.tree, options.layout)
+      // Rebuild the display-collapse from the same structure, keyed by real path so
+      // the scene and label builder can resolve each drawn node's visible ancestor
+      // and depth. Both this and the targets key off the visible nodes, so they
+      // stay in lockstep.
+      visibleByPath = new Map(collapseTree(frameState.tree).map((visible) => [ visible.node.path, visible ]))
       targetsStale = false
     }
     const motionScale = prefersReducedMotion() ? 0 : 1
@@ -593,7 +609,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // how far the camera has pulled out. `snapshot.zoom` is the same value the
     // backend was just handed, so the floors track exactly what is on screen.
     const zoom = snapshot.zoom
-    scene.update(frameState.tree, springs, now, theme, zoom)
+    scene.update(frameState.tree, springs, now, theme, zoom, visibleByPath)
 
     const activities = buildActorActivities()
     beamScene.update(activities, now, theme, zoom)
@@ -720,6 +736,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       }
       const physics = springs.get(node.path)
       if (!physics) {
+        continue
+      }
+      // Only nodes that survived the display-collapse get a label: a collapsed
+      // pass-through directory has no node, position, or label. It also has no
+      // spring entry (it gets no target), so this is belt-and-suspenders, but it
+      // keeps the label set exactly aligned with what the scene draws.
+      if (!visibleByPath.has(node.path)) {
         continue
       }
       // A repo root is a depth-1 directory (no slash in its path); everything else
