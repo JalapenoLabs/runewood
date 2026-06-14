@@ -6,6 +6,28 @@ import type { VisibleNode } from './collapse'
 import { collapseTree } from './collapse'
 
 /**
+ * NOTE (force-directed migration): the controller no longer drives the LAYOUT from
+ * this module. The deterministic radial {@link computeTargets} + damped
+ * {@link stepSprings} pipeline was replaced by the continuous, Gource-style
+ * force-directed simulation in `./physics` ({@link import('./physics').ForceLayout}),
+ * which is always gently reacting and settling instead of springing to fixed targets
+ * and freezing. `computeTargets` / `stepSprings` / `SpringState` / `SpringParams` are
+ * kept here (still exported, still unit-testable) for reference and any host that
+ * wants the old pure radial placement, but the live controller uses the sim.
+ *
+ * What this means for the seek-exact contract: the tree FOLD remains pure and
+ * replayable (that lives in `./tree` and `./frameStep`), so seeking to any time
+ * reproduces the exact tree. The LAYOUT, however, is now a forward-only physics sim
+ * that re-settles on a rewind rather than reproducing pixel-exact prior positions.
+ * The old "targets are a pure, seek-exact function of the tree" claim below describes
+ * THIS module's radial functions only, which are indeed pure; it no longer describes
+ * what the controller renders.
+ *
+ * {@link nodeHeat} and {@link Vec2} are untouched and still used everywhere (heat
+ * drives node radius/glow; Vec2 is the shared layout-space point type).
+ */
+
+/**
  * A 2D point in layout space. Layout space is abstract and unitless: the
  * renderer maps it to screen/world coordinates. Targets and live positions are
  * both expressed in these coordinates.

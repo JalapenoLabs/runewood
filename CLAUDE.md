@@ -22,10 +22,18 @@ React, or Svelte specifics in the core.
    entry points; never import a framework into the core.
 2. **Tree state is a pure fold over the event log.** The tree at time `t` is a
    deterministic reduction of all events with `at <= t` (see `src/core/tree.ts`).
-   This is what makes `seek`/rewind exact and the core testable. Do not introduce
-   forward-only mutable state (e.g. physics) into the *logical* tree; visual
-   springs may animate toward layout targets, but the targets must derive purely
-   from the folded tree, never accumulate.
+   This is what makes the DATA `seek`/rewind exact and the core testable. Do not
+   introduce forward-only mutable state into the *logical* tree itself: the fold,
+   the actor tracking, and the collapse must stay pure functions of the event log.
+   **The LAYOUT is the deliberate exception.** As of the force-directed migration,
+   node *positions* come from a continuous, Gource-style physics simulation
+   (`src/core/physics.ts`, `ForceLayout`) that is always gently settling and is
+   forward-only visual state, NOT a pure function of the tree. A backward seek
+   re-folds the (exact) tree and then resets + re-syncs the sim, which re-settles
+   organically rather than reproducing pixel-exact prior positions. So: the data
+   fold stays seek-exact; the layout no longer is, by design. (The old pure radial
+   `computeTargets`/`stepSprings` in `src/core/layout.ts` are retained for reference
+   but the controller no longer drives the layout from them.)
 3. **Rendering is isolated behind an interface.** The first renderer targets
    WebGL2 (likely via a thin layer). Keep the scene/layout decoupled from the
    draw backend so it can be swapped.

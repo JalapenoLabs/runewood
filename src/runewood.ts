@@ -1,7 +1,8 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { RunewoodEvent } from './types'
-import type { Vec2, SpringState, LayoutOptions, SpringParams } from './core/layout'
+import type { Vec2, NodePhysics, LayoutOptions, SpringParams } from './core/layout'
+import type { ForceLayoutOptions } from './core/physics'
 import type { RunewoodTheme, RunewoodThemeOverrides } from './core/theme'
 import type { WorldBounds } from './render/camera'
 import type { FrameState, BeamSpawnRequest, PulseSpawnRequest } from './core/frameStep'
@@ -23,7 +24,7 @@ import type { Hsl } from './core/theme'
 // Core
 import { Timeline } from './core/timeline'
 import { HighlightRegistry } from './core/highlight'
-import { computeTargets, stepSprings } from './core/layout'
+import { ForceLayout } from './core/physics'
 import { collapseTree } from './core/collapse'
 import { defaultTheme, mergeTheme, themes } from './core/theme'
 import { createFrameState, stepFrame } from './core/frameStep'
@@ -42,11 +43,12 @@ import { actorVisualFor } from './render/actors'
 /**
  * The public, imperative controller for a Runewood visualization (issue #9). This
  * is the single entry point a host uses: it wires the timeline, the pure tree
- * fold, the layout springs, the camera, and the pixi renderer together and owns
- * the one `requestAnimationFrame` loop that drives them. It is the *only* module
- * allowed to read the wall clock and call `requestAnimationFrame`; everything
+ * fold, the force-directed layout sim, the camera, and the pixi renderer together
+ * and owns the one `requestAnimationFrame` loop that drives them. It is the *only*
+ * module allowed to read the wall clock and call `requestAnimationFrame`; everything
  * below it stays pure and time-injected (the playhead time flows down, never the
- * wall clock).
+ * wall clock) EXCEPT the layout sim, which is deliberately forward-only visual state
+ * (it re-settles on a rewind rather than reproducing exact prior positions).
  *
  * Shape: an `xterm.js`/`chart.js`-style imperative controller created against a
  * DOM element, never a framework component. React/Svelte wrappers, if they ever
@@ -72,8 +74,12 @@ export type RunewoodController = {
   pause: () => void
   /**
    * Jump the playhead to an absolute epoch-ms time. A backward jump re-folds the
-   * tree exactly and clears transient particles; a forward jump replays the
-   * crossed events' effects.
+   * tree exactly (the data fold stays seek-exact) and clears transient particles; a
+   * forward jump replays the crossed events' effects. Note the LAYOUT is no longer
+   * frame-exact across a backward jump: the force-directed sim is reset and re-settles
+   * from fresh spawns on the rebuilt tree, so node positions after a rewind are
+   * organically re-derived rather than pixel-identical to before. This is the accepted
+   * tradeoff for the continuously-alive, Gource-style physics.
    */
   seek: (time: number) => void
   /** Set the playback rate. `1` is real time, `2` double speed, `0.5` half. */
@@ -357,9 +363,22 @@ export type RunewoodOptions = {
    * via {@link beams}`.actors`.
    */
   actorLingerMs?: number
-  /** Tuning for the radial tidy-tree layout. */
+  /**
+   * Tuning for the continuous force-directed layout: spring rest length + stiffness,
+   * sibling repulsion strength, damping, and the integration-step clamp. These are the
+   * knobs that make the forest feel livelier or calmer. See {@link ForceLayoutOptions}.
+   */
+  physics?: ForceLayoutOptions
+  /**
+   * @deprecated The radial tidy-tree was replaced by the force-directed sim
+   * ({@link physics}). Only its `center` is still honored, as the sim's center / root
+   * pin. Every other field is ignored.
+   */
   layout?: LayoutOptions
-  /** Tuning for the layout springs (stiffness / damping). */
+  /**
+   * @deprecated The damped springs were replaced by the force-directed sim
+   * ({@link physics}). This field is ignored; use {@link physics} instead.
+   */
   springs?: SpringParams
   /** Tuning forwarded to the retained forest scene (node / edge visuals). */
   scene?: SceneOptions
@@ -446,26 +465,38 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // The pure / logical state, all owned here and threaded through the reducer.
   const timeline = new Timeline()
   const camera = new Camera()
-  let springs: SpringState = new Map()
   let frameState: FrameState = createFrameState()
 
-  // The radial layout targets, memoized across frames. They derive purely from the
-  // tree structure (which paths exist + how they nest), never from touch counts or
-  // time, so recomputing the whole tidy-tree every frame is pure waste once the
-  // structure is stable. We recompute only when a step reports it added a node (or
-  // a rebuild/seed changed the structure); the springs keep easing toward these
-  // cached targets every frame regardless, which stays cheap. `targets` starts
-  // empty (an empty forest) and `targetsStale` forces the first real recompute.
-  let targets = new Map<string, Vec2>()
-  let targetsStale = true
+  // The continuous, Gource-style force-directed layout (replacing the old radial
+  // targets + springs). It OWNS a live `{ position, velocity }` per visible node and
+  // evolves them under edge springs, sibling repulsion, and damping EVERY frame, so
+  // the forest is always gently reacting and settling instead of springing to fixed
+  // targets and then freezing. Unlike the old targets, these positions are NOT a pure
+  // function of the tree: that is the accepted tradeoff for the always-alive feel, so
+  // a backward seek re-folds the (pure) tree and lets the sim re-settle rather than
+  // reproducing pixel-exact prior positions. The scene/labels/beams/camera read
+  // positions straight off `physics.state`, exactly where they read the old springs.
+  const physics = new ForceLayout(resolvePhysicsOptions(options))
+
+  // The sim's live body map, held as a stable binding the helper functions read from
+  // (the scene/labels/beams/camera/picking) so they need no awareness of the sim
+  // object. `physics.state` returns the same Map by reference for the controller's
+  // whole life, so this is captured once and never re-pointed.
+  const bodies: Map<string, NodePhysics> = physics.state
+
+  // Whether the tree structure changed since the sim was last synced. The sim only
+  // needs re-syncing (bodies added/removed) when a node was added or removed; the
+  // `step` runs every frame regardless. Starts true so the first frame syncs the
+  // (possibly seeded) forest. Set by a step that added a node, a seed, or a rebuild.
+  let structureStale = true
 
   // The display-collapse of the tree, keyed by real node path, memoized on the same
-  // structure-changed signal as the layout targets. It records which nodes are
-  // visible (collapsed pass-through directories are skipped), each visible node's
-  // nearest visible ancestor (so an edge spans a collapsed chain in one hop), and
-  // its visible depth. The scene and the label builder both read it so they agree
-  // on exactly what is drawn. Recomputed only when the structure changes, like the
-  // targets, since it too is a pure function of the tree's shape.
+  // structure-changed signal as the physics sync. It records which nodes are visible
+  // (collapsed pass-through directories are skipped), each visible node's nearest
+  // visible ancestor (so an edge spans a collapsed chain in one hop), and its visible
+  // depth. The scene, the label builder, and the physics sync all read it so they
+  // agree on exactly what is drawn. Recomputed only when the structure changes, since
+  // it is a pure function of the tree's shape.
   let visibleByPath = new Map<string, VisibleNode>()
 
   // The forward-only visual shell, created once the backend is ready.
@@ -647,10 +678,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
     lastFoldedPlayhead = now
     frameState = step.state
-    // A step that added a node (or re-folded the tree) invalidates the cached
-    // layout targets; otherwise the structure is unchanged and the cache stands.
+    // A step that added a node (or re-folded the tree) changes which nodes are
+    // visible, so the sim must be re-synced (bodies added/removed) and the
+    // display-collapse rebuilt; otherwise the structure is unchanged and both stand.
     if (step.structureChanged) {
-      targetsStale = true
+      structureStale = true
     }
 
     // Fire `reachedLiveEdge` on the transition into "caught up to the newest event
@@ -665,29 +697,34 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // 2. Spawn this tick's beams / pulses into the transient particle field.
     spawnEffects(step.beams, step.pulses)
 
-    // 3. Layout targets are memoized: recompute the radial tidy-tree only when the
-    //    structure changed this step (a node was added, a rebuild, or a seed),
-    //    since the targets are a pure function of the tree's shape, not of touch
-    //    counts or time. The springs still ease toward the cached targets every
-    //    frame (cheap), so motion stays fluid while the expensive layout recompute
-    //    is skipped on the common no-structure-change frame.
-    if (targetsStale) {
+    // 3. Sync the force sim's bodies to the current visible set, but only when the
+    //    structure changed this step (a node was added/removed, a rebuild, or a
+    //    seed): the display-collapse is a pure function of the tree's shape, so
+    //    re-walking it every frame is pure waste once the structure is stable. The
+    //    sim's `step` below runs every frame regardless, which is what keeps the
+    //    forest continuously alive even when nothing structural happened.
+    if (structureStale) {
       // A configured `rootLabel` makes the forest root a drawn center node every
-      // repo branches off of (one connected tree), so both the layout and the
-      // display-collapse must agree the root is visible. Without it, the root stays
-      // undrawn and the repos fan around the center, exactly as before.
-      targets = computeTargets(frameState.tree, { ...options.layout, rootVisible: rootVisible })
-      // Rebuild the display-collapse from the same structure, keyed by real path so
-      // the scene and label builder can resolve each drawn node's visible ancestor
-      // and depth. Both this and the targets key off the visible nodes, so they
-      // stay in lockstep.
-      visibleByPath = new Map(
-        collapseTree(frameState.tree, { rootVisible }).map((visible) => [ visible.node.path, visible ]),
-      )
-      targetsStale = false
+      // repo branches off of (one connected tree), so both the sim and the display-
+      // collapse must agree the root is visible (and pinned at the center). Without
+      // it, the root stays undrawn and the repos fan around the center, as before.
+      const visibleNodes = collapseTree(frameState.tree, { rootVisible })
+      // Rebuild the display-collapse, keyed by real path, so the scene, the label
+      // builder, and the sim all resolve each drawn node's visible ancestor and
+      // depth from one shared, in-lockstep view of the structure.
+      visibleByPath = new Map(visibleNodes.map((visible) => [ visible.node.path, visible ]))
+      // Add bodies for newly-visible nodes (spawned off their parent) and drop bodies
+      // for nodes no longer visible. The forest root, when shown, is pinned here.
+      physics.sync(visibleNodes)
+      structureStale = false
     }
-    const motionScale = prefersReducedMotion() ? 0 : 1
-    springs = stepSprings(springs, targets, deltaMs * motionScale, options.springs)
+    // Advance the simulation EVERY frame so it is always settling: residual velocity
+    // keeps easing and a recent node's disturbance keeps propagating out. Under
+    // reduced motion the sim still runs (so positions stay correct) but is stepped at
+    // a faster effective rate so it settles almost immediately with little visible
+    // glide; otherwise it steps by the real elapsed time.
+    const physicsDeltaMs = prefersReducedMotion() ? deltaMs * REDUCED_MOTION_STEP_SCALE : deltaMs
+    physics.step(physicsDeltaMs)
 
     // 4. Frame the forest per the camera mode. `overview` fits the whole active
     //    tree; `follow` (Gource-style) frames only the recently-active region at a
@@ -696,7 +733,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     //    the framed transform (no glide) so the camera still tracks the action but
     //    does not animate; otherwise we ease toward it framerate-independently.
     if (isAutoCameraMode(cameraMode)) {
-      const bounds = cameraMode === 'follow' ? followRegionBounds(now) : activeRegionBounds(targets)
+      const bounds = cameraMode === 'follow' ? followRegionBounds(now) : activeRegionBounds(bodies)
       if (prefersReducedMotion()) {
         camera.frameBounds(bounds)
       }
@@ -733,7 +770,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // scene so highlighted nodes draw a breathing ring that animates independently of
     // the playhead. `highlights` is passed even when empty (the scene cheaply skips
     // the ring work then); `highlightClockMs` is the wall clock accumulated above.
-    scene.update(frameState.tree, springs, now, theme, zoom, visibleByPath, highlights, highlightClockMs)
+    scene.update(frameState.tree, bodies, now, theme, zoom, visibleByPath, highlights, highlightClockMs)
 
     const activities = buildActorActivities()
     beamScene.update(activities, now, theme, zoom)
@@ -766,9 +803,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       return
     }
     for (const beam of beams) {
-      const target = springs.get(beam.path)
+      const target = bodies.get(beam.path)
       if (!target) {
-        // The node has no spring entry yet (it spawns this same frame); skip the
+        // The node has no physics body yet (it is added this same frame); skip the
         // beam rather than point it at the origin. It is a single transient effect;
         // the file still lights up via its node flash.
         continue
@@ -795,16 +832,16 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     return centroidOfPaths(track.touchedPaths)
   }
 
-  /** Mean of the live spring positions of a set of paths; the origin if none are tracked yet. */
+  /** Mean of the live physics positions of a set of paths; the origin if none are tracked yet. */
   function centroidOfPaths(paths: string[]): Vec2 {
     let sumX = 0
     let sumY = 0
     let count = 0
     for (const path of paths) {
-      const physics = springs.get(path)
-      if (physics) {
-        sumX += physics.position.x
-        sumY += physics.position.y
+      const body = bodies.get(path)
+      if (body) {
+        sumX += body.position.x
+        sumY += body.position.y
         count += 1
       }
     }
@@ -814,15 +851,15 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     return { x: sumX / count, y: sumY / count }
   }
 
-  /** Turns the reducer's actor tracking into drawable activity, resolving paths to spring positions. */
+  /** Turns the reducer's actor tracking into drawable activity, resolving paths to physics positions. */
   function buildActorActivities(): ActorActivity[] {
     const activities: ActorActivity[] = []
     for (const track of frameState.actors.values()) {
       const touched: Vec2[] = []
       for (const path of track.touchedPaths) {
-        const physics = springs.get(path)
-        if (physics) {
-          touched.push(physics.position)
+        const body = bodies.get(path)
+        if (body) {
+          touched.push(body.position)
         }
       }
       const lastCentroid = touched.length > 0 ? centroidOfPaths(track.touchedPaths) : track.lastCentroid
@@ -830,11 +867,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       if (touched.length > 0) {
         track.lastCentroid = lastCentroid
       }
-      // Resolve the actor's most-recently-touched file to its live spring position
+      // Resolve the actor's most-recently-touched file to its live physics position
       // so the orb can anchor on where the work is *now* (out at the leaves), not
       // the centroid of everything it has touched. Undefined until the path has a
-      // spring entry, or once the actor has gone quiet (the window cleared it).
-      const recent = track.recentPath ? springs.get(track.recentPath)?.position : undefined
+      // body, or once the actor has gone quiet (the window cleared it).
+      const recent = track.recentPath ? bodies.get(track.recentPath)?.position : undefined
       activities.push({
         actor: track.actor,
         touched,
@@ -857,11 +894,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
 
     // The shared center node (Part A): when a `rootLabel` is configured, the forest
     // root is drawn at the center and gets an always-visible, constant-screen-size
-    // label, like a repo root. Its spring entry is keyed by the empty path.
+    // label, like a repo root. Its physics body is keyed by the empty path.
     if (rootVisible && rootLabel) {
-      const rootPhysics = springs.get('')
-      if (rootPhysics) {
-        candidates.push({ kind: 'root', id: '', text: rootLabel, position: rootPhysics.position })
+      const rootBody = bodies.get('')
+      if (rootBody) {
+        candidates.push({ kind: 'root', id: '', text: rootLabel, position: rootBody.position })
       }
     }
 
@@ -874,13 +911,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       if (!node.path) {
         continue
       }
-      const physics = springs.get(node.path)
-      if (!physics) {
+      const body = bodies.get(node.path)
+      if (!body) {
         continue
       }
       // Only nodes that survived the display-collapse get a label: a collapsed
       // pass-through directory has no node, position, or label. It also has no
-      // spring entry (it gets no target), so this is belt-and-suspenders, but it
+      // physics body (it is never synced), so this is belt-and-suspenders, but it
       // keeps the label set exactly aligned with what the scene draws.
       if (!visibleByPath.has(node.path)) {
         continue
@@ -889,14 +926,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       // that is a file gets a file label.
       const isRepoRoot = !node.path.includes('/') && !node.isFile
       if (isRepoRoot) {
-        candidates.push({ kind: 'root', id: node.path, text: node.name, position: physics.position })
+        candidates.push({ kind: 'root', id: node.path, text: node.name, position: body.position })
       }
       else if (node.isFile) {
         candidates.push({
           kind: 'file',
           id: node.path,
           text: node.name,
-          position: physics.position,
+          position: body.position,
           lastTouchedAt: node.lastTouchedAt ?? undefined,
         })
       }
@@ -939,13 +976,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   }
 
   /**
-   * The world bounds enclosing the active region, derived from the layout targets
-   * (the canonical positions, so the camera frames where nodes are settling, not
-   * where they currently are mid-spring). Padded so glowing nodes near the edge are
-   * not clipped, and falls back to a sensible window when the forest is empty.
+   * The world bounds enclosing the active region, derived from the live physics
+   * positions. With the force sim there are no separate canonical targets to frame,
+   * so the camera frames where the nodes actually are; since the sim is always gently
+   * settling the framing is stable rather than jittery. Padded so glowing nodes near
+   * the edge are not clipped, and falls back to a sensible window when empty.
    */
-  function activeRegionBounds(targets: Map<string, Vec2>): WorldBounds {
-    if (targets.size === 0) {
+  function activeRegionBounds(bodies: Map<string, NodePhysics>): WorldBounds {
+    if (bodies.size === 0) {
       return {
         min: { x: -EMPTY_REGION_HALF_EXTENT, y: -EMPTY_REGION_HALF_EXTENT },
         max: { x: EMPTY_REGION_HALF_EXTENT, y: EMPTY_REGION_HALF_EXTENT },
@@ -955,7 +993,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     let minY = Infinity
     let maxX = -Infinity
     let maxY = -Infinity
-    for (const position of targets.values()) {
+    for (const { position } of bodies.values()) {
       minX = Math.min(minX, position.x)
       minY = Math.min(minY, position.y)
       maxX = Math.max(maxX, position.x)
@@ -980,7 +1018,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   function followRegionBounds(now: number): WorldBounds {
     const nodes = recentNodeSamples()
     const actors = recentActorSamples()
-    const fallback = lastFollowBounds ?? activeRegionBounds(targets)
+    const fallback = lastFollowBounds ?? activeRegionBounds(physics.state)
     const bounds = recentActivityBounds(nodes, actors, {
       playhead: now,
       windowMs: FOLLOW_ACTIVITY_WINDOW_MS,
@@ -995,8 +1033,8 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
    * The follow camera's node samples, gathered in a single walk of the folded tree:
    * each node's live spring position paired with its `lastTouchedAt`, so the pure
    * bounds function can window by recency. Walking the tree (rather than iterating
-   * the springs and looking each path up) reads the touch time straight off the
-   * node we already hold. A node with no spring entry yet is skipped (it has no
+   * the bodies and looking each path up) reads the touch time straight off the
+   * node we already hold. A node with no physics body yet is skipped (it has no
    * drawn position); one never touched carries a `null` time and the window drops it.
    */
   function recentNodeSamples(): RecentNodeSample[] {
@@ -1010,11 +1048,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       if (!node.path) {
         continue
       }
-      const physics = springs.get(node.path)
-      if (!physics) {
+      const body = bodies.get(node.path)
+      if (!body) {
         continue
       }
-      samples.push({ position: physics.position, lastTouchedAt: node.lastTouchedAt })
+      samples.push({ position: body.position, lastTouchedAt: node.lastTouchedAt })
     }
     return samples
   }
@@ -1062,10 +1100,20 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       timeline.getEvents(),
     )
     frameState = step.state
-    // A backward seek re-folds the tree, so its cached layout targets are stale and
-    // must be recomputed on the next tick.
+    // A seek that changed the structure (a backward re-fold always does, a forward
+    // seek does when it crosses new nodes) leaves the display-collapse stale, so the
+    // next tick re-syncs the sim and rebuilds the collapse from the sought tree.
     if (step.structureChanged) {
-      targetsStale = true
+      structureStale = true
+    }
+    // A backward-seek REBUILD re-folds the tree to a different shape, so the sim's
+    // bodies (carrying positions for the old, now-rewound forest) no longer match.
+    // Drop them all and let the next tick's `sync` re-spawn the rebuilt visible set,
+    // which re-settles into place. This is the accepted tradeoff: the DATA fold stays
+    // exact (the tree is re-folded deterministically), but the LAYOUT positions
+    // re-settle from fresh spawns rather than reproducing the prior pixel-exact frame.
+    if (seekResult.rebuild) {
+      physics.reset()
     }
     // The seek already folded the tree to the sought time, so keep the loop's
     // fold cursor in sync: without this the next tick would re-cross everything
@@ -1289,11 +1337,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     emitter.emit('nodeHover', { path, screen: { x: screenPoint.x, y: screenPoint.y }})
   }
 
-  /** The live node pick candidates: every spring-tracked node at its drawn position. */
+  /** The live node pick candidates: every simulated node at its drawn position. */
   function nodeCandidates(): PickCandidate[] {
     const candidates: PickCandidate[] = []
-    for (const [ path, physics ] of springs) {
-      candidates.push({ id: path, position: physics.position })
+    for (const [ path, body ] of bodies) {
+      candidates.push({ id: path, position: body.position })
     }
     return candidates
   }
@@ -1367,9 +1415,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         // backward seek re-seeds them when it re-folds the tree.
         seedTree(frameState.tree, keptPaths)
         frameState.seededPaths.push(...keptPaths)
-        // Seeding adds dim structure to the tree, so the cached layout targets must
-        // be recomputed to place the newly seeded nodes.
-        targetsStale = true
+        // Seeding adds dim structure to the tree, so the next tick must re-sync the
+        // sim (spawning bodies for the newly seeded nodes) and rebuild the collapse.
+        structureStale = true
       }
       if (ready) {
         run()
@@ -1512,7 +1560,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         backend.dispose()
       }
 
-      springs.clear()
+      physics.reset()
     },
   }
 }
@@ -1569,6 +1617,29 @@ function resolveInitialCameraMode(options: RunewoodOptions): CameraMode {
   }
   return 'follow'
 }
+
+/**
+ * Resolves the force-directed sim's options from the construction options. The
+ * explicit {@link RunewoodOptions.physics} block wins field-by-field; its `center`
+ * falls back to the deprecated `layout.center` (the one layout field the sim still
+ * honors) so a host that pinned the old radial layout's center keeps the same center
+ * for the sim. Everything else defaults inside {@link ForceLayout}.
+ */
+function resolvePhysicsOptions(options: RunewoodOptions): ForceLayoutOptions {
+  return {
+    ...options.physics,
+    center: options.physics?.center ?? options.layout?.center,
+  }
+}
+
+/**
+ * How much faster the sim is stepped under reduced motion: the real frame delta is
+ * scaled up so the physics settles almost immediately with little visible glide,
+ * honoring the preference for minimal motion while still keeping the positions correct
+ * (the sim must keep running so nodes are where the scene expects them). The sim's own
+ * `maxStepMs` clamp still bounds any single step, so this never destabilizes it.
+ */
+const REDUCED_MOTION_STEP_SCALE = 4
 
 /**
  * Folds the top-level {@link RunewoodOptions.actorLingerMs} knob into the beam
