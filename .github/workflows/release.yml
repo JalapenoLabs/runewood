@@ -1,11 +1,19 @@
 name: Release
 
-# Every push to main cuts a patch release: bump the version, tag it, publish to
-# BOTH registries, and open a GitHub Release. release-it publishes the unscoped
-# `runewood` to npmjs; a follow-up step republishes the same build to GitHub
-# Packages as `@jalapenolabs/runewood`. The release commit carries "[skip ci]" so
-# it does not retrigger this workflow (and pushes made with GITHUB_TOKEN do not
-# start new runs anyway, a second guard against loops).
+# Every push to main cuts a patch release: bump the version, tag it, open a GitHub
+# Release, and publish to BOTH registries. release-it only handles the version
+# bump + tag + GitHub release (it does NOT publish). The unscoped `runewood` is
+# then published to npmjs via TRUSTED PUBLISHING (OIDC, no token: the runner's
+# id-token is exchanged for a short-lived credential, and provenance is generated
+# automatically). The same build is republished to GitHub Packages as
+# `@jalapenolabs/runewood` using the built-in GITHUB_TOKEN. The release commit
+# carries "[skip ci]" so it does not retrigger this workflow (and pushes made with
+# GITHUB_TOKEN do not start new runs anyway, a second guard against loops).
+#
+# Trusted publishing requires npm CLI >= 11.5.1 and Node >= 22.14.0; the npm that
+# ships with Node 22 is 10.x, so the workflow upgrades npm before publishing. The
+# npmjs trusted publisher must be configured on npmjs.com (org/user, repo
+# `runewood`, workflow filename `release.yml`, allowed action: npm publish).
 on:
   push:
     branches: [main]
@@ -24,7 +32,7 @@ permissions:
 
 jobs:
   release:
-    name: Patch release to npm
+    name: Release to npmjs + GitHub Packages
     runs-on: [self-hosted, Linux, X64, fedora]
     # Skip the run entirely for the release bot's own commit, belt-and-suspenders
     # with [skip ci].
@@ -49,20 +57,28 @@ jobs:
       - name: Build
         run: yarn build
 
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; Node 22 ships npm 10.x.
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
+
       - name: Configure git identity
         run: |
           git config user.name "jalapeno-release-bot"
           git config user.email "release-bot@jalapenolabs.io"
 
-      # Publishes the unscoped `runewood` to npmjs, bumps + tags the version, pushes
-      # the release commit, and opens the GitHub Release. The bumped version is left
-      # in package.json on disk for the GitHub Packages step below to reuse.
-      - name: Release to npmjs
+      # release-it ONLY bumps the version, tags it, pushes the release commit, and
+      # opens the GitHub Release (its npm.publish is false). The bumped version is
+      # left in package.json on disk for the two publish steps below to reuse.
+      - name: Bump version, tag, and GitHub release
         run: yarn release patch --ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Publish the unscoped `runewood` to npmjs via trusted publishing: no token,
+      # the OIDC id-token is exchanged for a short-lived credential and provenance
+      # is attached automatically (the registry is already npmjs from setup-node).
+      - name: Publish to npmjs (trusted publishing)
+        run: npm publish
 
       # Re-point npm at GitHub Packages for the @jalapenolabs scope. setup-node
       # rewrites the auth config so `npm publish` below targets npm.pkg.github.com,
