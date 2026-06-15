@@ -869,19 +869,54 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         track.lastCentroid = lastCentroid
       }
       // Resolve the actor's most-recently-touched file to its live physics position
-      // so the orb can anchor on where the work is *now* (out at the leaves), not
-      // the centroid of everything it has touched. Undefined until the path has a
-      // body, or once the actor has gone quiet (the window cleared it).
-      const recent = track.recentPath ? bodies.get(track.recentPath)?.position : undefined
+      // so the orb can anchor on where the work is *now* (out at the leaves), not the
+      // centroid of everything it has touched. When the file's own body has not spawned
+      // yet (a brand-new file this same frame) we fall back to the file's PARENT body,
+      // so the actor still anchors out at that directory near the periphery rather than
+      // collapsing to the centroid/center. Undefined only once the actor has gone quiet
+      // (the window cleared `recentPath`).
+      const recent = track.recentPath ? resolveRecentPosition(track.recentPath) : undefined
+      // The actor's current drawn orb position, so the pure model can HOLD it where it
+      // already is on a frame that resolves no file at all, never yanking it to center.
+      const hold = beamScene?.actorOrbPosition(track.actor) ?? undefined
+      // If nothing resolves this frame (no live file, no parent, no parked centroid, no
+      // orb yet), there is genuinely no non-center place to put the actor: skip it for
+      // this frame rather than emit an activity that would anchor at the origin. It
+      // reappears (and swoops in) the instant any of its files gets a body.
+      if (!recent && touched.length === 0 && !lastCentroid && !hold) {
+        continue
+      }
       activities.push({
         actor: track.actor,
         touched,
         recent,
         lastActiveAt: track.lastActiveAt,
         lastCentroid,
+        hold,
       })
     }
     return activities
+  }
+
+  /**
+   * The live position to anchor an actor's orb on for its most-recent file: the file's
+   * own physics body when it has spawned, otherwise the body of its PARENT directory.
+   * A brand-new file has no body for a frame or two while the sim spawns it; anchoring
+   * on the parent keeps the actor out at that directory near the periphery in the
+   * meantime instead of falling back toward the tree center. `undefined` only when
+   * neither the file nor its parent has a body yet.
+   */
+  function resolveRecentPosition(path: string): Vec2 | undefined {
+    const body = bodies.get(path)
+    if (body) {
+      return body.position
+    }
+    const lastSlash = path.lastIndexOf('/')
+    if (lastSlash <= 0) {
+      return undefined
+    }
+    const parentPath = path.slice(0, lastSlash)
+    return bodies.get(parentPath)?.position
   }
 
   /**

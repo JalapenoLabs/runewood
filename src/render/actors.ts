@@ -73,6 +73,18 @@ export type ActorActivity = {
    * or never-active actor.
    */
   lastCentroid?: Vec2
+  /**
+   * The actor's current drawn orb position, supplied by the controller from the
+   * retained motion. It is the LAST-resort anchor: if a frame can resolve no file
+   * position at all (the live file's body has not spawned yet, nothing is touched,
+   * and there is no parked centroid), the actor *holds where it already is* rather
+   * than being yanked to the tree center. This is the Gource rule made literal: a
+   * user is only ever pushed toward its files, never re-seated at the origin, so a
+   * momentary "no resolvable file" frame leaves it exactly where it stood. Omit only
+   * for an actor that has never been drawn (no orb yet); the controller then skips
+   * emitting it for that frame rather than centering it.
+   */
+  hold?: Vec2
 }
 
 /**
@@ -228,7 +240,8 @@ const RECENCY_WEIGHT = 0.8
  * The mapping:
  * - **position** anchors on the actor's most-recent touch (blended with the
  *   touched-files centroid, biased toward the latest file by {@link RECENCY_WEIGHT}),
- *   or `lastCentroid` while the actor is quiet, or the origin as a last resort. That
+ *   or `lastCentroid` while the actor is quiet, or its held orb position (never the
+ *   origin) as a last resort. That
  *   anchor is then nudged a SHORT fixed `outwardOffset` into the open space along its
  *   local outward direction (away from the tree center), so the actor hugs its file
  *   with a short beam at any tree size, and finally nudged by a small per-actor drift
@@ -288,13 +301,17 @@ export function actorVisualFor(activity: ActorActivity, now: number, options: Ac
  * being edited now rather than the average of every file the actor has touched (the
  * average is what pinned it to the tree center for cross-tree work).
  *
- * Falls back gracefully: with no recent touch it is the plain centroid; with no
- * touches at all it is the parked `lastCentroid` (a quiet, fading actor); and with
- * no history whatsoever it is the origin (logged, since that is an unexpected state
- * worth surfacing rather than silently centering).
+ * Falls back gracefully, and NEVER to the tree center: with no recent touch it is
+ * the plain centroid; with no touches at all it is the parked `lastCentroid` (a
+ * quiet, fading actor); with none of those it is the actor's current orb position
+ * (`hold`), so a frame that can resolve no file leaves the actor exactly where it
+ * already stood rather than yanking it to the origin. The origin is used only as a
+ * logged, should-never-happen guard for an actor with no history and no orb at all
+ * (the controller skips emitting that case upstream, so it is unreachable in
+ * practice).
  */
 function anchorOf(activity: ActorActivity): Vec2 {
-  const centroid = centroidOf(activity.touched, activity.lastCentroid)
+  const centroid = centroidOf(activity.touched, activity.lastCentroid, activity.hold)
   if (!activity.recent) {
     return centroid
   }
@@ -344,18 +361,26 @@ function floatOutsideFile(anchor: Vec2, origin: Vec2, offset: number, actor: str
 }
 
 /**
- * The centroid (mean) of the touched-file positions. Falls back to `lastCentroid`
- * when the actor is touching nothing this window (it just went quiet but is still
- * fading), and to the origin only when there is no history at all. The origin
- * fallback is logged because an actor with neither current touches nor a remembered
- * centroid is an unexpected state worth surfacing rather than silently centering.
+ * The centroid (mean) of the touched-file positions. Falls back, in order and NEVER
+ * to the tree center: to `lastCentroid` when the actor is touching nothing this
+ * window (it just went quiet but is still fading), then to `hold` (its current orb
+ * position) when there is no parked centroid either, so a frame that resolves no file
+ * keeps the actor exactly where it already is. The origin is returned only when there
+ * is no history AND no orb whatsoever, an unexpected state the controller filters out
+ * upstream; it is logged because it should never be reached, not silently centered.
  */
-function centroidOf(touched: Vec2[], lastCentroid: Vec2 | undefined): Vec2 {
+function centroidOf(touched: Vec2[], lastCentroid: Vec2 | undefined, hold: Vec2 | undefined): Vec2 {
   if (touched.length === 0) {
     if (lastCentroid) {
       return lastCentroid
     }
-    console.debug('runewood: actor has no touched files and no last centroid, placing at origin')
+    if (hold) {
+      // No file and no parked centroid: hold the actor where it already is rather
+      // than pulling it to the center. This is the Gource "only ever pushed toward
+      // files" rule for the one-frame gap before a brand-new file's body spawns.
+      return hold
+    }
+    console.debug('runewood: actor has no touched files, no last centroid, and no held position; placing at origin')
     return { x: 0, y: 0 }
   }
 
@@ -423,6 +448,81 @@ function idleBreath(
   // cos goes 1 -> -1 -> 1; map it to 1 -> (1 - depth) -> 1 so the orb only dims.
   const breath = 1 - idlePulseDepth * (1 - Math.cos(phase)) / 2
   return breath
+}
+
+/**
+ * One actor's target position, the unit {@link separateActorTargets} operates on.
+ * The `actor` id is carried so a perfectly-coincident pair can be split along a
+ * stable, per-actor direction rather than randomly.
+ */
+export type ActorTarget = {
+  actor: string
+  position: Vec2
+}
+
+/**
+ * Gentle mutual repulsion between actor targets so two contributors working near
+ * each other do not stack into one orb (Gource's `RUser::applyForceUser` personal
+ * space, ported pure). Any pair closer than `personalSpace` is pushed apart along the
+ * line between them by half the shortfall each, so the pair ends up roughly
+ * `personalSpace` apart while staying centered on where they were. A perfectly
+ * coincident pair (no line between them) is split along each actor's stable hashed
+ * direction so the result is deterministic, never random like Gource's jitter.
+ *
+ * This complements the per-actor {@link actorDrift} (which already offsets each actor
+ * by a constant hashed nudge): drift keeps a single actor's orb off its exact file,
+ * while this resolves the remaining overlap between DIFFERENT actors whose files
+ * happen to sit on top of each other. It is a pure function of its inputs (a single
+ * relaxation pass, no clock, no randomness), so a rewound timeline separates the same
+ * actors identically. `personalSpace <= 0` disables it (returns the inputs unchanged).
+ */
+export function separateActorTargets(targets: ActorTarget[], personalSpace: number): Vec2[] {
+  const positions = targets.map((target) => ({ x: target.position.x, y: target.position.y }))
+  if (personalSpace <= 0) {
+    return positions
+  }
+
+  for (let outer = 0; outer < targets.length; outer++) {
+    for (let inner = outer + 1; inner < targets.length; inner++) {
+      const first = positions[outer]
+      const second = positions[inner]
+      let directionX = second.x - first.x
+      let directionY = second.y - first.y
+      let distance = Math.hypot(directionX, directionY)
+
+      if (distance >= personalSpace) {
+        continue
+      }
+
+      if (distance < 1e-6) {
+        // Perfectly coincident: there is no line to push along, so split the pair
+        // along each actor's own stable hashed direction (deterministic, unlike
+        // Gource's random kick) so two orbs on the exact same file still separate. The
+        // gap is treated as zero (they fully open to `personalSpace`); the drift only
+        // gives the direction, so its raw length must not leak into the push distance.
+        const firstDrift = actorDrift(targets[outer].actor, 1)
+        const driftLength = Math.hypot(firstDrift.x, firstDrift.y) || 1
+        directionX = -firstDrift.x / driftLength
+        directionY = -firstDrift.y / driftLength
+        distance = 0
+      }
+      else {
+        directionX /= distance
+        directionY /= distance
+      }
+
+      // `directionX/Y` are now a unit vector along the separation line. Push each target
+      // half of the shortfall apart along it, so the midpoint stays put and the pair
+      // opens up to `personalSpace`.
+      const push = (personalSpace - distance) / 2
+      first.x -= directionX * push
+      first.y -= directionY * push
+      second.x += directionX * push
+      second.y += directionY * push
+    }
+  }
+
+  return positions
 }
 
 /**

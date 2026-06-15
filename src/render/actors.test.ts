@@ -6,7 +6,7 @@ import type { ActorActivity } from './actors'
 import { describe, expect, it } from 'vitest'
 
 import { colorForActor } from '../core/theme'
-import { actorVisualFor } from './actors'
+import { actorVisualFor, separateActorTargets } from './actors'
 
 /** A baseline actor activity the tests tweak per case. */
 function makeActivity(overrides: Partial<ActorActivity> = {}): ActorActivity {
@@ -16,6 +16,7 @@ function makeActivity(overrides: Partial<ActorActivity> = {}): ActorActivity {
     recent: overrides.recent,
     lastActiveAt: overrides.lastActiveAt ?? 1000,
     lastCentroid: overrides.lastCentroid,
+    hold: overrides.hold,
   }
 }
 
@@ -77,6 +78,53 @@ describe('actorVisualFor', () => {
       // No touched cluster, so the push reduces to the anchor (the parked centroid).
       expect(visual.position.x).toBeCloseTo(200, 5)
       expect(visual.position.y).toBeCloseTo(90, 5)
+    })
+
+    it('holds at its current orb position (never the origin) when no file and no parked centroid resolve', () => {
+      // The brand-new-file gap: the live file body has not spawned yet, nothing is
+      // touched, and there is no parked centroid. The actor must HOLD where it already
+      // is (its orb position), NOT snap to the tree center. This is the core "never in
+      // the middle" guarantee for the one-frame gap before a node spawns.
+      const held = { x: 480, y: -120 }
+      const activity = makeActivity({ touched: [], recent: undefined, lastCentroid: undefined, hold: held })
+
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
+
+      expect(visual.position.x).toBeCloseTo(held.x, 5)
+      expect(visual.position.y).toBeCloseTo(held.y, 5)
+      // And nowhere near the origin.
+      expect(Math.hypot(visual.position.x, visual.position.y)).toBeGreaterThan(400)
+    })
+
+    it('prefers the parked last centroid over the held orb position when both exist', () => {
+      // A quiet, fading actor parks at where it last worked (its last centroid), not at
+      // wherever its orb has drifted; `hold` is only the deeper fallback below that.
+      const activity = makeActivity({
+        touched: [],
+        recent: undefined,
+        lastCentroid: { x: 200, y: 0 },
+        hold: { x: 999, y: 999 },
+      })
+      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
+
+      expect(visual.position.x).toBeCloseTo(200, 5)
+      expect(visual.position.y).toBeCloseTo(0, 5)
+    })
+
+    it('follows its file outward: as the live file migrates out, the actor travels out with it', () => {
+      // Gource's core reason users are never central: the actor target tracks the LIVE
+      // file position, so as the layout pushes the file outward the actor rides out too.
+      const inner = makeActivity({ actor: 'agent-1', touched: [{ x: 100, y: 0 }], recent: { x: 100, y: 0 }})
+      const outer = makeActivity({ actor: 'agent-1', touched: [{ x: 900, y: 0 }], recent: { x: 900, y: 0 }})
+
+      const innerVisual = actorVisualFor(inner, 1000, { drift: 0, outwardOffset: 60 })
+      const outerVisual = actorVisualFor(outer, 1000, { drift: 0, outwardOffset: 60 })
+
+      const innerRadius = Math.hypot(innerVisual.position.x, innerVisual.position.y)
+      const outerRadius = Math.hypot(outerVisual.position.x, outerVisual.position.y)
+      // The actor moved out with its file (and stays the short offset beyond it).
+      expect(outerRadius).toBeGreaterThan(innerRadius)
+      expect(outerRadius).toBeCloseTo(900 + 60, 5)
     })
 
     it('gives co-located actors distinct drift so their orbs do not stack exactly', () => {
@@ -350,5 +398,71 @@ describe('actorVisualFor', () => {
       const second = actorVisualFor(activity, 1500)
       expect(first).toEqual(second)
     })
+  })
+})
+
+describe('separateActorTargets', () => {
+  it('leaves targets already farther apart than the personal space untouched', () => {
+    const targets = [
+      { actor: 'agent-a', position: { x: 0, y: 0 }},
+      { actor: 'agent-b', position: { x: 500, y: 0 }},
+    ]
+    const separated = separateActorTargets(targets, 50)
+    expect(separated[0]).toEqual({ x: 0, y: 0 })
+    expect(separated[1]).toEqual({ x: 500, y: 0 })
+  })
+
+  it('pushes two near actors apart to roughly the personal space, centered on their midpoint', () => {
+    const targets = [
+      { actor: 'agent-a', position: { x: 0, y: 0 }},
+      { actor: 'agent-b', position: { x: 20, y: 0 }},
+    ]
+    const personalSpace = 60
+    const separated = separateActorTargets(targets, personalSpace)
+
+    const distance = Math.hypot(separated[1].x - separated[0].x, separated[1].y - separated[0].y)
+    expect(distance).toBeCloseTo(personalSpace, 5)
+    // The midpoint stays put (they opened symmetrically), so each moved out by half the
+    // shortfall: from 10 (the original midpoint) the gap of 60 splits to -20 and 40.
+    const midpointX = (separated[0].x + separated[1].x) / 2
+    expect(midpointX).toBeCloseTo(10, 5)
+  })
+
+  it('splits perfectly coincident actors deterministically (no random kick)', () => {
+    const coincident = () => [
+      { actor: 'agent-a', position: { x: 100, y: 100 }},
+      { actor: 'agent-b', position: { x: 100, y: 100 }},
+    ]
+    const personalSpace = 40
+
+    const first = separateActorTargets(coincident(), personalSpace)
+    const second = separateActorTargets(coincident(), personalSpace)
+
+    // They no longer overlap...
+    const distance = Math.hypot(first[1].x - first[0].x, first[1].y - first[0].y)
+    expect(distance).toBeCloseTo(personalSpace, 5)
+    // ...and the split is identical run to run (deterministic, seek-safe).
+    expect(first).toEqual(second)
+  })
+
+  it('disables separation when the personal space is zero', () => {
+    const targets = [
+      { actor: 'agent-a', position: { x: 0, y: 0 }},
+      { actor: 'agent-b', position: { x: 1, y: 0 }},
+    ]
+    const separated = separateActorTargets(targets, 0)
+    expect(separated[0]).toEqual({ x: 0, y: 0 })
+    expect(separated[1]).toEqual({ x: 1, y: 0 })
+  })
+
+  it('returns copies, never mutating the input positions', () => {
+    const targets = [
+      { actor: 'agent-a', position: { x: 0, y: 0 }},
+      { actor: 'agent-b', position: { x: 5, y: 0 }},
+    ]
+    separateActorTargets(targets, 80)
+    // The originals are untouched (the function returns fresh vectors).
+    expect(targets[0].position).toEqual({ x: 0, y: 0 })
+    expect(targets[1].position).toEqual({ x: 5, y: 0 })
   })
 })

@@ -12,7 +12,7 @@ import { Graphics } from 'pixi.js'
 
 import { hslToRgbInt } from './color'
 import { BeamField } from './beams'
-import { actorVisualFor } from './actors'
+import { actorVisualFor, separateActorTargets } from './actors'
 import { ActorMotion } from './actorMotion'
 
 /**
@@ -65,6 +65,12 @@ export class BeamScene {
   private readonly actorOptions: ActorVisualOptions
   /** Tuning for the actor motion (glide + opacity ramp + swoop), forwarded to each {@link ActorMotion}. */
   private readonly motionOptions: ActorMotionOptions
+  /**
+   * The personal-space distance, in world units, two actor orbs are kept apart by
+   * each frame (Gource's user-to-user repulsion). `0` disables the separation. See
+   * {@link separateActorTargets}.
+   */
+  private readonly personalSpace: number
 
   /** One batched graphic holding every live beam this frame, cleared and refilled. */
   private readonly beamGraphics: Graphics
@@ -87,6 +93,7 @@ export class BeamScene {
     this.field = new BeamField(options.beams)
     this.actorOptions = options.actors ?? {}
     this.motionOptions = options.motion ?? {}
+    this.personalSpace = options.personalSpace ?? DEFAULT_ACTOR_PERSONAL_SPACE
 
     this.beamGraphics = new Graphics()
     // Additive blend so overlapping beams build toward white, the way real bloom
@@ -265,6 +272,12 @@ export class BeamScene {
       ? MIN_ACTOR_SCREEN_PX / zoom
       : 0
 
+    // Compute every visible actor's modeled visual once, then gently separate their
+    // resting targets so two contributors working on top of each other do not stack
+    // into one orb (Gource's personal-space repulsion). The separated targets feed the
+    // glide below; presence/size/color stay as modeled. Fully-faded actors are culled
+    // here so they neither separate nor draw.
+    const visible: { activity: ActorActivity, visual: ReturnType<typeof actorVisualFor> }[] = []
     for (const activity of activities) {
       const visual = actorVisualFor(activity, now, this.actorOptions)
       if (visual.alpha <= 0) {
@@ -273,11 +286,22 @@ export class BeamScene {
         this.removeActor(activity.actor)
         continue
       }
+      visible.push({ activity, visual })
+    }
+
+    const separated = separateActorTargets(
+      visible.map((entry) => ({ actor: entry.activity.actor, position: entry.visual.position })),
+      this.personalSpace,
+    )
+
+    for (let index = 0; index < visible.length; index++) {
+      const { activity, visual } = visible[index]
       present.add(activity.actor)
 
-      // The target the orb wants to rest at this frame (the placement model's outward
-      // recency position). The retained motion eases the drawn position toward it.
-      const target = visual.position
+      // The target the orb wants to rest at this frame: the placement model's outward
+      // recency position, nudged apart from any co-located actor. The retained motion
+      // eases the drawn position toward it.
+      const target = separated[index]
       let motion = this.actorMotion.get(activity.actor)
       if (!motion) {
         // First appearance (or a reappearance after a full fade): start OUT in the
@@ -339,6 +363,15 @@ export class BeamScene {
 const MIN_ACTOR_SCREEN_PX = 9
 
 /**
+ * The default personal-space distance, in world units, two actor orbs are kept apart
+ * by each frame (Gource's user-to-user repulsion, {@link separateActorTargets}). Sized
+ * a little above an orb's own draw size so two contributors on the same file read as
+ * two distinct dudes rather than one. A judgment call worth tuning to taste; set to `0`
+ * via {@link BeamSceneOptions.personalSpace} to disable.
+ */
+const DEFAULT_ACTOR_PERSONAL_SPACE = 28
+
+/**
  * The additive layers each beam is drawn from, widest-and-dimmest first so the
  * bright thin core lands on top. Stacking these with an additive blend turns the
  * flat "sharp triangle" into a soft glow: the wide low-alpha layers spread a haze to
@@ -359,4 +392,10 @@ export type BeamSceneOptions = {
   actors?: ActorVisualOptions
   /** Tuning for the actor swoop-in / glide / ease-to-rest motion. See {@link ActorMotionOptions}. */
   motion?: ActorMotionOptions
+  /**
+   * The personal-space distance, in world units, two actor orbs are kept apart by each
+   * frame (Gource's user-to-user repulsion). Defaults to {@link DEFAULT_ACTOR_PERSONAL_SPACE};
+   * `0` disables the separation so co-located orbs rely on their hashed drift alone.
+   */
+  personalSpace?: number
 }
