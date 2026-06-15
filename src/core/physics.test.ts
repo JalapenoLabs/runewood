@@ -14,6 +14,9 @@ import {
   countSiblings,
   collisionRadiusFor,
   shouldCollide,
+  fanSpreadForces,
+  antiFoldbackForce,
+  untangleGroupForces,
 } from './physics'
 
 /**
@@ -90,6 +93,7 @@ function defaultedOptions(overrides: ForceLayoutOptions = {}): Required<ForceLay
     siblingRestScale: 1,
     springStiffness: 26,
     outwardBias: 0.18,
+    untangleStrength: 0.35,
     fileRestLength: 40,
     collisionStiffness: 240,
     collisionMargin: 10,
@@ -345,7 +349,11 @@ describe('ForceLayout', () => {
   describe('sibling-count rest length', () => {
     it('rests a child on a WIDER ring when it has more siblings (six > one)', () => {
       const buildAndSettle = (siblingNames: string[]): number => {
-        const layout = new ForceLayout()
+        // The untangle force is disabled here so this isolates the sibling-count rest length /
+        // collision mechanism under test: a tidy fan (the untangle force's job) packs siblings more
+        // efficiently and would otherwise let the crowded ring settle slightly tighter, which is its
+        // own behavior, covered by the dedicated untangle tests below.
+        const layout = new ForceLayout({ untangleStrength: 0 })
         layout.sync([
           rootVisible(),
           dir('repo', '', 1),
@@ -658,5 +666,190 @@ describe('buildSpatialGrid', () => {
 
     expect(pathsIn(grid.cells.get('3,4'))).toEqual([ 'a' ])
     expect(pathsIn(grid.cells.get('3,5'))).toEqual([ 'b' ])
+  })
+})
+
+/** The signed angle of `point` around `center`, in (-pi, pi]. Reads a child's angle for the fan tests. */
+function angleAround(center: Vec2, point: Vec2): number {
+  return Math.atan2(point.y - center.y, point.x - center.x)
+}
+
+/** The absolute angular separation between two points around a shared center, in [0, pi]. */
+function angularGap(center: Vec2, left: Vec2, right: Vec2): number {
+  let delta = angleAround(center, right) - angleAround(center, left)
+  while (delta > Math.PI) {
+    delta -= Math.PI * 2
+  }
+  while (delta <= -Math.PI) {
+    delta += Math.PI * 2
+  }
+  return Math.abs(delta)
+}
+
+/**
+ * Advances sibling children a few explicit-Euler steps under ONLY the fan-spread force (the parent
+ * is the fixed anchor), so a test can assert their angular gap actually opens over time, not just
+ * that the instantaneous force points the right way. A tiny step keeps the integration well-behaved.
+ */
+function stepFanSpread(parent: Vec2, children: Vec2[], scale: number, steps: number): Vec2[] {
+  const positions = children.map((child) => ({ x: child.x, y: child.y }))
+  const stepSize = 0.0005
+  for (let iteration = 0; iteration < steps; iteration++) {
+    const forces = fanSpreadForces(parent, positions, scale)
+    for (let index = 0; index < positions.length; index++) {
+      positions[index].x += forces[index].x * stepSize
+      positions[index].y += forces[index].y * stepSize
+    }
+  }
+  return positions
+}
+
+describe('fanSpreadForces', () => {
+  it('spreads two siblings at nearly the same angle apart, widening their gap over several steps', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    // Two children at radius 100, both near angle 0 (a tiny 0.05 rad apart): badly crowded.
+    const children: Vec2[] = [
+      { x: 100, y: 0 },
+      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+    ]
+
+    const gapBefore = angularGap(parent, children[0], children[1])
+    const settled = stepFanSpread(parent, children, 50, 200)
+    const gapAfter = angularGap(parent, settled[0], settled[1])
+
+    // The fan emerged: stepping under the spreading force alone opened the wedge between them.
+    expect(gapAfter).toBeGreaterThan(gapBefore)
+  })
+
+  it('applies opposing, purely tangential pushes to a crowded pair (one each way around the parent)', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    // Two children near angle 0, very close in angle, at the same radius. The lower one (negative
+    // angle) is pushed further negative in angle, the upper (positive) further positive.
+    const lower: Vec2 = { x: 100 * Math.cos(-0.04), y: 100 * Math.sin(-0.04) }
+    const upper: Vec2 = { x: 100 * Math.cos(0.04), y: 100 * Math.sin(0.04) }
+    const forces = fanSpreadForces(parent, [ lower, upper ], 50)
+
+    // The two children move in OPPOSITE angular directions: the lower child's force points
+    // clockwise (decreasing angle) and the upper's counter-clockwise (increasing angle). The
+    // angular direction of a force is the sign of (offset cross force).
+    const crossLower = lower.x * forces[0].y - lower.y * forces[0].x
+    const crossUpper = upper.x * forces[1].y - upper.y * forces[1].x
+    expect(crossLower).toBeLessThan(0)
+    expect(crossUpper).toBeGreaterThan(0)
+
+    // Each push is purely tangential (perpendicular to that child's own radial axis), so the radial
+    // (dot) component is essentially zero.
+    const radialLower = lower.x * forces[0].x + lower.y * forces[0].y
+    const radialUpper = upper.x * forces[1].x + upper.y * forces[1].y
+    expect(Math.abs(radialLower)).toBeLessThan(1e-9)
+    expect(Math.abs(radialUpper)).toBeLessThan(1e-9)
+  })
+
+  it('leaves an evenly-fanned group essentially at rest (a good fan needs ~no spreading)', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    // Four siblings 90 deg apart: a perfect fan, whose adjacent gaps (pi/2) meet the even-gap
+    // threshold (2*pi / 4 = pi/2) exactly, so none push.
+    const radius = 100
+    const children: Vec2[] = [ 0, 1, 2, 3 ].map((quarter) => {
+      const angle = (quarter * Math.PI) / 2
+      return { x: radius * Math.cos(angle), y: radius * Math.sin(angle) }
+    })
+    const forces = fanSpreadForces(parent, children, 50)
+
+    for (const force of forces) {
+      expect(Math.hypot(force.x, force.y)).toBeLessThan(1e-9)
+    }
+  })
+
+  it('returns a zero force for a lone child (no sibling to fan against)', () => {
+    const forces = fanSpreadForces({ x: 0, y: 0 }, [{ x: 100, y: 0 }], 50)
+    expect(forces).toHaveLength(1)
+    expect(forces[0]).toEqual({ x: 0, y: 0 })
+  })
+
+  it('produces no spreading force at all when the scale is zero (the disabled fan)', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    const children: Vec2[] = [
+      { x: 100, y: 0 },
+      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+    ]
+    const forces = fanSpreadForces(parent, children, 0)
+    for (const force of forces) {
+      expect(Math.hypot(force.x, force.y)).toBe(0)
+    }
+  })
+})
+
+describe('antiFoldbackForce', () => {
+  const outward: Vec2 = { x: 1, y: 0 }
+
+  it('pushes a child folded back inward of its parent toward the outward side', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    // The child sits on the INWARD side of the parent (negative x along the outward axis): folded
+    // back. It must be pushed back outward (positive x).
+    const child: Vec2 = { x: -30, y: 5 }
+    const force = antiFoldbackForce(parent, outward, child, 10)
+
+    expect(force.x).toBeGreaterThan(0)
+    // The push is purely along the outward axis, so it has no off-axis (y) component here.
+    expect(force.y).toBeCloseTo(0, 12)
+  })
+
+  it('grows with how far inward the child has folded', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    const slight = antiFoldbackForce(parent, outward, { x: -10, y: 0 }, 10)
+    const deep = antiFoldbackForce(parent, outward, { x: -40, y: 0 }, 10)
+    expect(deep.x).toBeGreaterThan(slight.x)
+  })
+
+  it('leaves a child already on the outward side untouched', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    const child: Vec2 = { x: 50, y: 10 }
+    const force = antiFoldbackForce(parent, outward, child, 10)
+    expect(force).toEqual({ x: 0, y: 0 })
+  })
+
+  it('returns zero when the parent has no defined outward direction', () => {
+    const force = antiFoldbackForce({ x: 0, y: 0 }, null, { x: -50, y: 0 }, 10)
+    expect(force).toEqual({ x: 0, y: 0 })
+  })
+
+  it('returns zero when the scale is zero (the disabled untangle force)', () => {
+    const force = antiFoldbackForce({ x: 0, y: 0 }, outward, { x: -50, y: 0 }, 0)
+    expect(force).toEqual({ x: 0, y: 0 })
+  })
+})
+
+describe('untangleGroupForces', () => {
+  it('produces no force at all when the strength scale is zero', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    const children: Vec2[] = [
+      { x: 100, y: 0 },
+      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+    ]
+    const forces = untangleGroupForces(parent, { x: 1, y: 0 }, children, 0)
+
+    expect(forces).toHaveLength(2)
+    for (const force of forces) {
+      expect(Math.hypot(force.x, force.y)).toBe(0)
+    }
+  })
+
+  it('combines the fan spreading and the anti-foldback into one force per child', () => {
+    const parent: Vec2 = { x: 0, y: 0 }
+    const outward: Vec2 = { x: 1, y: 0 }
+    // Two crowded children, both slightly INWARD of the parent (negative x) so both terms engage:
+    // the fan spreads them in y, the anti-foldback pushes them back out in +x.
+    const children: Vec2[] = [
+      { x: -100 * Math.cos(0.04), y: -100 * Math.sin(0.04) },
+      { x: -100 * Math.cos(0.04), y: 100 * Math.sin(0.04) },
+    ]
+    const forces = untangleGroupForces(parent, outward, children, 50)
+
+    // Both get pushed back outward (anti-foldback, +x) and apart in y (fan), so neither force is
+    // zero and the y components oppose.
+    expect(forces[0].x).toBeGreaterThan(0)
+    expect(forces[1].x).toBeGreaterThan(0)
+    expect(Math.sign(forces[0].y)).not.toBe(Math.sign(forces[1].y))
   })
 })

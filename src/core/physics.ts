@@ -91,6 +91,7 @@ export class ForceLayout {
       siblingRestScale: options.siblingRestScale ?? DEFAULT_SIBLING_REST_SCALE,
       springStiffness: options.springStiffness ?? DEFAULT_SPRING_STIFFNESS,
       outwardBias: options.outwardBias ?? DEFAULT_OUTWARD_BIAS,
+      untangleStrength: options.untangleStrength ?? DEFAULT_UNTANGLE_STRENGTH,
       fileRestLength: options.fileRestLength ?? DEFAULT_FILE_REST_LENGTH,
       collisionStiffness: options.collisionStiffness ?? DEFAULT_COLLISION_STIFFNESS,
       collisionMargin: options.collisionMargin ?? DEFAULT_COLLISION_MARGIN,
@@ -242,6 +243,7 @@ export class ForceLayout {
 
     this.applyEdgeSprings(forces)
     this.applyOutwardBias(forces)
+    this.applyUntangle(forces)
     this.applyCollision(forces)
     this.integrate(forces, deltaSeconds)
   }
@@ -317,6 +319,112 @@ export class ForceLayout {
       force.x += (offsetX / distance) * magnitude
       force.y += (offsetY / distance) * magnitude
     }
+  }
+
+  /**
+   * The untangle force: a gentle, continuous nudge that encourages branches to straighten into
+   * clean fans, so siblings stop crossing over each other while the layout stays fluid and
+   * emergent. It is gated by {@link ForceLayoutOptions.untangleStrength} (a moderate default; `0`
+   * disables it entirely and the method is a no-op), and it stacks two soft terms drawn from
+   * Gource's `applyForces`, never a rigid snap-to-target:
+   *
+   * 1. **Angular fan spreading** ({@link fanSpreadForces}): for each parent with two or more
+   *    visible siblings of the same kind, siblings that sit too close in angle *around the parent*
+   *    push each other apart TANGENTIALLY (perpendicular to the child->parent axis). The fan is
+   *    emergent: it arises from the nodes repelling each other in angle, not from assigning each a
+   *    fixed slot, so the group settles into an evenly-spread fan on its own and an already-even
+   *    fan feels almost nothing.
+   * 2. **Anti-foldback** ({@link antiFoldbackForce}): each child is nudged toward the FAR side of
+   *    its parent along the parent's outward direction (grandparent->parent, or center->parent for
+   *    a repo root), so a branch keeps growing outward and does not fold back across its neighbors.
+   *    This is Gource's `parent_edge_normal` term, kept gentle. It complements (does not duplicate)
+   *    {@link applyOutwardBias}: the bias pushes a node radially away from the shared center, while
+   *    this pushes it past its OWN parent along that parent's growth axis, which is what actually
+   *    unfolds a branch that doubled back.
+   *
+   * Both terms are scaled by `untangleStrength * springStiffness * restLength`, so they stay in
+   * fixed proportion to the spring no matter how the forest is tuned and never overpower it. The
+   * grouping mirrors the rest of the sim: directories and files are separate sibling sets, and a
+   * file group is fanned around its directory just like a directory group is around its parent.
+   */
+  private applyUntangle(forces: Map<string, Vec2>): void {
+    if (this.options.untangleStrength <= 0) {
+      // Disabled: the user dialed the fan force off entirely, so skip the whole pass.
+      return
+    }
+
+    const scale = this.options.untangleStrength * this.options.springStiffness * this.options.restLength
+    for (const group of this.siblingGroups()) {
+      const parentBody = this.bodies.get(group.parentPath)
+      const anchor = parentBody ? parentBody.position : this.options.center
+      const outward = this.outwardDirectionOf(group.parentPath, anchor)
+
+      const childPositions = group.childPaths.map((childPath) => this.bodies.get(childPath)!.position)
+      const groupForces = untangleGroupForces(anchor, outward, childPositions, scale)
+
+      for (let index = 0; index < group.childPaths.length; index++) {
+        const force = forces.get(group.childPaths[index])
+        if (!force) {
+          continue
+        }
+        force.x += groupForces[index].x
+        force.y += groupForces[index].y
+      }
+    }
+  }
+
+  /**
+   * Groups the currently-tracked, non-file-mixed bodies into sibling sets for {@link applyUntangle}:
+   * one set per display-parent per kind (directories and files kept apart, exactly as
+   * {@link countSiblings} does), each carrying its parent path and the paths of the children that
+   * hang off it. Only groups of two or more are yielded, since a lone child has no siblings to fan
+   * against and no foldback worth correcting on its own (the spring + outward bias already place
+   * it). Reads the live metadata index, so it is cheap and needs no tree walk.
+   */
+  private siblingGroups(): SiblingGroup[] {
+    const byKey = new Map<string, SiblingGroup>()
+    for (const [ path, meta ] of this.metaByPath) {
+      const kind = meta.isFile ? 'file' : 'dir'
+      const key = `${kind}:${meta.displayParentPath}`
+      const existing = byKey.get(key)
+      if (existing) {
+        existing.childPaths.push(path)
+      }
+      else {
+        byKey.set(key, { parentPath: meta.displayParentPath, childPaths: [ path ]})
+      }
+    }
+
+    const groups: SiblingGroup[] = []
+    for (const group of byKey.values()) {
+      if (group.childPaths.length >= 2) {
+        groups.push(group)
+      }
+    }
+    return groups
+  }
+
+  /**
+   * The unit outward direction at a parent: the way its branch is growing, which the anti-foldback
+   * pushes its children past. It points from the parent's *own* parent (the grandparent of the
+   * children) toward the parent, mirroring Gource's `parent_edge_normal`; for a repo root, whose
+   * display-parent is the undrawn center, it points from the configured center toward the parent.
+   * When the parent sits exactly on its own parent (no defined direction yet) it returns `null`,
+   * and the anti-foldback simply sits out that frame until the spring moves the parent off.
+   */
+  private outwardDirectionOf(parentPath: string, parentPosition: Vec2): Vec2 | null {
+    const parentMeta = this.metaByPath.get(parentPath)
+    const grandparentPath = parentMeta?.displayParentPath
+    const grandparentBody = grandparentPath !== undefined ? this.bodies.get(grandparentPath) : undefined
+    const origin = grandparentBody ? grandparentBody.position : this.options.center
+
+    const directionX = parentPosition.x - origin.x
+    const directionY = parentPosition.y - origin.y
+    const length = Math.hypot(directionX, directionY)
+    if (length < EPSILON) {
+      return null
+    }
+    return { x: directionX / length, y: directionY / length }
   }
 
   /**
@@ -639,6 +747,172 @@ export function collisionRadiusFor(visible: VisibleNode, options: Required<Force
 }
 
 /**
+ * One sibling set for the untangle pass: the path of the shared display-parent and the paths of
+ * the two-or-more children of the SAME kind that hang off it. Built by
+ * {@link ForceLayout.siblingGroups} from the live metadata index.
+ */
+export type SiblingGroup = {
+  parentPath: string
+  childPaths: string[]
+}
+
+/**
+ * The untangle force for one sibling group, the pure heart of {@link ForceLayout.applyUntangle}:
+ * given the parent's position, its outward direction (grandparent->parent, or `null` when
+ * undefined), the children's positions, and a force `scale`, it returns one force vector per child
+ * (parallel to `childPositions`). It combines the two gentle, emergent terms and is free of time,
+ * randomness, and mutation, so it is directly unit-testable.
+ *
+ * - **Fan spreading** ({@link fanSpreadForces}): pairwise TANGENTIAL angular repulsion around the
+ *   parent, so siblings too close in angle fan apart and an already-even fan barely moves.
+ * - **Anti-foldback** ({@link antiFoldbackForce}): a push toward the outward side of the parent for
+ *   any child that has folded back inward of it.
+ *
+ * Returns zero vectors (never `undefined` slots) for a degenerate group, so the caller can add the
+ * result element-wise without guarding.
+ */
+export function untangleGroupForces(
+  parentPosition: Vec2,
+  outward: Vec2 | null,
+  childPositions: Vec2[],
+  scale: number,
+): Vec2[] {
+  const fanForces = fanSpreadForces(parentPosition, childPositions, scale)
+  const result: Vec2[] = []
+  for (let index = 0; index < childPositions.length; index++) {
+    const foldback = antiFoldbackForce(parentPosition, outward, childPositions[index], scale)
+    result.push({
+      x: fanForces[index].x + foldback.x,
+      y: fanForces[index].y + foldback.y,
+    })
+  }
+  return result
+}
+
+/**
+ * Angular fan spreading: the emergent fan. For every pair of siblings in the group, the smaller the
+ * angular gap between them *around the parent*, the harder they push each other apart along their
+ * TANGENTIAL directions (each perpendicular to its own child->parent axis, in the sense that widens
+ * the gap). The push falls off linearly to zero once the gap reaches {@link FAN_SPREAD_ARC} divided
+ * by the number of siblings (the gap an even fan would have), so an already-even fan settles at
+ * rest and only crowded pairs feel a nudge. Pure: it reads only positions and returns a force per
+ * child, never a fixed-slot target, so the fan arises from the nodes spreading each other.
+ *
+ * A child sitting exactly on the parent has no defined angle and is skipped for that pair (the
+ * spring pulls it off the parent first). Returns one force per child, parallel to `childPositions`.
+ */
+export function fanSpreadForces(parentPosition: Vec2, childPositions: Vec2[], scale: number): Vec2[] {
+  const forces: Vec2[] = childPositions.map(() => ({ x: 0, y: 0 }))
+  const count = childPositions.length
+  if (count < 2) {
+    return forces
+  }
+
+  // The angular gap an even fan would leave between adjacent siblings if they spread across the
+  // whole reference arc. A pair closer than this is "too close" and gets a spreading nudge; a pair
+  // at or beyond it is already as open as an even fan wants, so it feels nothing.
+  const evenGap = FAN_SPREAD_ARC / count
+
+  for (let leftIndex = 0; leftIndex < count; leftIndex++) {
+    const leftOffsetX = childPositions[leftIndex].x - parentPosition.x
+    const leftOffsetY = childPositions[leftIndex].y - parentPosition.y
+    const leftDistance = Math.hypot(leftOffsetX, leftOffsetY)
+    if (leftDistance < EPSILON) {
+      continue
+    }
+
+    for (let rightIndex = leftIndex + 1; rightIndex < count; rightIndex++) {
+      const rightOffsetX = childPositions[rightIndex].x - parentPosition.x
+      const rightOffsetY = childPositions[rightIndex].y - parentPosition.y
+      const rightDistance = Math.hypot(rightOffsetX, rightOffsetY)
+      if (rightDistance < EPSILON) {
+        continue
+      }
+
+      // The signed angle from the left child to the right child around the parent, in (-pi, pi].
+      // Its sign tells each child which tangential way to move to widen the gap between them.
+      const leftAngle = Math.atan2(leftOffsetY, leftOffsetX)
+      const rightAngle = Math.atan2(rightOffsetY, rightOffsetX)
+      let delta = rightAngle - leftAngle
+      while (delta > Math.PI) {
+        delta -= Math.PI * 2
+      }
+      while (delta <= -Math.PI) {
+        delta += Math.PI * 2
+      }
+
+      const gap = Math.abs(delta)
+      if (gap >= evenGap) {
+        // Already at least as open as an even fan: no spreading push for this pair.
+        continue
+      }
+
+      // A gentle push that grows as the pair crowds together (linear in how far inside the even gap
+      // they sit) and vanishes exactly at the even gap, so the fan settles rather than oscillating.
+      const closeness = (evenGap - gap) / evenGap
+      const magnitude = scale * closeness
+
+      // Each child moves along its own tangent (perpendicular to its child->parent axis), in the
+      // direction that increases the gap. The right child sits at +delta from the left, so it is
+      // pushed toward +delta and the left toward -delta.
+      const leftTangentX = -leftOffsetY / leftDistance
+      const leftTangentY = leftOffsetX / leftDistance
+      const rightTangentX = -rightOffsetY / rightDistance
+      const rightTangentY = rightOffsetX / rightDistance
+
+      const leftSign = delta > 0 ? -1 : 1
+      const rightSign = delta > 0 ? 1 : -1
+
+      forces[leftIndex].x += leftTangentX * magnitude * leftSign
+      forces[leftIndex].y += leftTangentY * magnitude * leftSign
+      forces[rightIndex].x += rightTangentX * magnitude * rightSign
+      forces[rightIndex].y += rightTangentY * magnitude * rightSign
+    }
+  }
+
+  return forces
+}
+
+/**
+ * Anti-foldback (Gource's `parent_edge_normal` term, kept gentle): a soft push that keeps a child
+ * on the FAR side of its parent along the parent's outward growth direction, so a branch keeps
+ * fanning outward and never folds back inward across its neighbors. The push is proportional to how
+ * far *inward* of the parent the child has drifted (its offset projected onto the inward direction),
+ * directed back outward, and is exactly zero once the child is already on the outward side, so a
+ * well-placed child feels nothing. Pure: positions in, one force out.
+ *
+ * With no defined outward direction (`outward` is `null`, e.g. a parent sitting on the center) it
+ * returns zero, deferring to the spring + outward bias to move the parent off first.
+ */
+export function antiFoldbackForce(
+  parentPosition: Vec2,
+  outward: Vec2 | null,
+  childPosition: Vec2,
+  scale: number,
+): Vec2 {
+  if (!outward) {
+    return { x: 0, y: 0 }
+  }
+
+  const offsetX = childPosition.x - parentPosition.x
+  const offsetY = childPosition.y - parentPosition.y
+
+  // How far the child sits along the parent's outward axis. Negative means it has folded back to
+  // the inward side of the parent; that shortfall is exactly how hard we push it back outward.
+  const alongOutward = offsetX * outward.x + offsetY * outward.y
+  if (alongOutward >= 0) {
+    // Already on (or past) the outward side: nothing to unfold.
+    return { x: 0, y: 0 }
+  }
+
+  const magnitude = scale * (-alongOutward) * FOLDBACK_GAIN
+  return {
+    x: outward.x * magnitude,
+    y: outward.y * magnitude,
+  }
+}
+
+/**
  * Tuning for {@link ForceLayout}. Every field has a sensible default, so the common construction
  * is `new ForceLayout()`. These are the knobs the user reaches for to make the forest feel
  * livelier or calmer, or to trade tightness against spread.
@@ -676,6 +950,17 @@ export type ForceLayoutOptions = {
    * at all (pure spring + collision).
    */
   outwardBias?: number
+  /**
+   * Strength of the GENTLE untangle force, as a fraction of a unit spring's pull. It encourages
+   * branches to straighten into clean fans by (1) spreading siblings that crowd together in angle
+   * around their parent apart tangentially, and (2) nudging any child that has folded back inward
+   * of its parent toward the outward side, so a branch keeps growing outward instead of crossing
+   * over its neighbors. Like the outward bias it is deliberately soft and emergent (the fan arises
+   * from siblings repelling each other in angle, never a snap to fixed slots), so springiness and
+   * fluidity are preserved. This is the "fluid vs straight" knob: raise it for tidier fans, lower
+   * for a looser, more organic tangle. Set `0` to disable the untangle force entirely.
+   */
+  untangleStrength?: number
   /**
    * Rest length of a file's edge to its directory, in layout units. Much shorter than a directory
    * edge so files hug their directory as a tight satellite cluster rather than spreading like a
@@ -759,6 +1044,32 @@ const DEFAULT_SPRING_STIFFNESS = 26
  * directional" vs "looser / more emergent".
  */
 const DEFAULT_OUTWARD_BIAS = 0.18
+
+/**
+ * Default untangle strength (the gentle fan force), as a fraction of a unit spring's pull. A
+ * moderate value: firm enough to coax crossed branches into tidy fans over a second or two, soft
+ * enough that the tangential spreading and the anti-foldback never overpower the spring or kill the
+ * fluid, self-settling feel. This is the user's "fluid vs straight" dial; `0` turns it off.
+ */
+const DEFAULT_UNTANGLE_STRENGTH = 0.35
+
+/**
+ * The reference arc (radians) the angular fan spreading spreads a sibling group across: a full
+ * circle's worth of room, divided by the sibling count to get the even-fan gap each pair targets.
+ * A pair closer in angle than that even gap is nudged apart; a pair already at least that open
+ * feels nothing, so the group settles into an even fan rather than oscillating. Using the full
+ * `2*pi` keeps the spreading gentle (siblings only push apart when genuinely crowded) while still
+ * letting a group fan all the way around its parent when it needs to.
+ */
+const FAN_SPREAD_ARC = Math.PI * 2
+
+/**
+ * The anti-foldback gain: how hard a folded-back child is pushed back outward, per unit of how far
+ * inward of its parent it has drifted. Kept at 1 so the push is simply proportional to the inward
+ * shortfall (already pre-scaled by the shared untangle scale), gentle and self-limiting since it
+ * vanishes the instant the child reaches the outward side.
+ */
+const FOLDBACK_GAIN = 1
 
 /**
  * Default file rest length, in layout units: well under a directory's {@link DEFAULT_REST_LENGTH}
