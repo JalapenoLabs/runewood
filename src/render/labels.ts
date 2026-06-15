@@ -24,11 +24,12 @@ import type { Vec2 } from '../core/layout'
  *   whole tier is culled when too many files are lit at once. This density cap is
  *   the level-of-detail that keeps the view legible.
  *
- * Note: labels are drawn at a constant on-screen size (the backend counter-scales
- * them by the camera zoom), so a zoomed-out label stays just as legible as a
- * zoomed-in one. The file tier is therefore *not* culled by zoom; legibility is
- * preserved by the density cap (and the per-label touch-flash fade) instead, so a
- * constant-size label is never hidden merely because the camera pulled out.
+ * Note: labels are drawn at a constant on-screen size (the backend renders them in
+ * a screen-space layer outside the camera transform, at a fixed screen-pixel font
+ * size), so a zoomed-out label stays just as legible as a zoomed-in one. The file
+ * tier is therefore *not* culled by zoom; legibility is preserved by the density cap
+ * (and the per-label touch-flash fade) instead, so a constant-size label is never
+ * hidden merely because the camera pulled out.
  */
 
 /** Which tier a candidate label belongs to. Drives its entire visibility policy. */
@@ -96,9 +97,10 @@ export type LabelLodOptions = {
    */
   fileFadeMs?: number
   /**
-   * The persistent opacity of a root label. Kept well below 1 so repo names read
-   * as a subtle, ever-present orientation layer rather than competing with the
-   * live file/actor labels.
+   * The persistent opacity of a root label. Kept a touch below 1 so repo names read
+   * as a calm, ever-present orientation layer rather than competing with the live
+   * file/actor labels, but high enough to be clearly legible (the old value was so
+   * faint the names were hard to read, per direct user feedback).
    */
   rootAlpha?: number
   /** The longest a label's text may be before it is truncated with an ellipsis. */
@@ -108,7 +110,11 @@ export type LabelLodOptions = {
 const DEFAULT_FILE_DENSITY_CAP = 40
 // Mirrors nodeVisual's DEFAULT_FLASH_MS so a file's label and its glow flash decay together.
 const DEFAULT_FILE_FADE_MS = 1_200
-const DEFAULT_ROOT_ALPHA = 0.45
+// Raised from a near-invisible 0.45 per direct user feedback that the root /
+// directory names were too faint to read. 0.85 keeps them a touch below the
+// full-opacity file/actor flashes (so they still read as the calm orientation
+// layer) while being clearly legible.
+const DEFAULT_ROOT_ALPHA = 0.85
 const DEFAULT_MAX_TEXT_LENGTH = 24
 
 /** The single trailing glyph a truncated label ends with, in place of the clipped tail. */

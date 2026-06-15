@@ -34,9 +34,10 @@ import { buildGlowTexture, GLOW_TEXTURE_RADIUS } from './glowTexture'
  *
  * Lifecycle note (issue #4/#9): the spring state already retains a deleted node
  * until it drifts past its retention radius, so keying off that map gives the
- * fade-then-cull behavior for free. The controller (#9) owns advancing the
- * playhead and the springs; this class is a pure projection of their current
- * state onto the screen.
+ * shrink-then-cull behavior for free (a deleted node's visual radius collapses to
+ * zero, then the spring drops it). The controller (#9) owns advancing the playhead
+ * and the springs; this class is a pure projection of their current state onto the
+ * screen.
  */
 export class Scene {
   /** The world container branches are parented into. Drawn under the nodes. */
@@ -255,8 +256,10 @@ export class Scene {
 
     if (appearanceChanged) {
       // The core: a crisp solid disc. Brightness lifts its hue toward white so a
-      // hot/flashing node's core flares; alpha carries presence (seeded dim,
-      // deleted fading). No halo disc here anymore: the soft glow is the sprite.
+      // hot/flashing node's core flares; every persistent node is fully opaque
+      // (nodes differ by color and size, never opacity), and a deleted node leaves
+      // by its radius shrinking to zero rather than by fading. No halo disc here
+      // anymore: the soft glow is the sprite.
       const coreColor = hslToRgbInt(brightenTowardWhite(theme, visual.color, visual.brightness))
       graphics.clear()
       graphics

@@ -1,6 +1,7 @@
 // Copyright © 2026 Jalapeno Labs
 
 import type { Container } from 'pixi.js'
+import type { Vec2 } from '../core/layout'
 import type { RunewoodTheme } from '../core/theme'
 import type { LabelCandidate, LabelLodOptions } from './labels'
 
@@ -17,40 +18,55 @@ import { decideLabels } from './labels'
  * text was crowding the forest. {@link LABEL_FONT_SIZE_SCALE} is the reduction
  * factor, kept as its own constant so the "why 0.75" is documented at the call site.
  *
- * Crucially this is a *screen* size, not a world size: per direct user feedback,
- * every label (file, root, AND actor) must stay the same size on screen as the
- * camera zooms, navigates, and pans, rather than shrinking with the world when the
- * camera pulls out. The world font size is therefore divided by the live `zoom`
- * (see {@link update}), so the rendered glyph lands on exactly this many screen
- * pixels at any zoom. At `zoom === 1` it is exactly this size; at half zoom the
- * world font doubles to keep the screen size constant.
+ * Because labels now live in a SCREEN-SPACE layer (a direct child of the pixi
+ * stage, not inside the camera-zoomed world), this is the glyph's literal font size
+ * in screen pixels at every zoom: the text is rasterized once at this true pixel
+ * size and never magnified by the camera, so it stays crisp when the user zooms in.
+ * There is no longer any `/zoom` counter-scale; the label simply sits at this size
+ * and is re-positioned each frame by projecting its node's world anchor to screen.
  */
 const LABEL_BASE_SCREEN_PX = 16
 const LABEL_FONT_SIZE_SCALE = 0.75
 const LABEL_SCREEN_PX = LABEL_BASE_SCREEN_PX * LABEL_FONT_SIZE_SCALE
 
 /**
- * The retained label layer that sits *above* the forest and the beams (issue #7):
- * one persistent pixi {@link Text} per label, keyed by candidate id, created when
- * a label first appears and torn down once it is culled or fully faded. It mirrors
- * the {@link import('./scene').Scene} and {@link import('./beamScene').BeamScene}
- * pattern: it owns retained pixi objects parented into one world container the
- * backend hands it, updates them in place every frame, and is the only place
- * besides the backend allowed to know about pixi.
+ * Projects a world-space point to screen pixels. This is exactly the pure camera's
+ * `worldToScreen`, narrowed to the one method the label layer needs so the scene
+ * stays decoupled from the camera class (and trivially testable with a plain stub).
+ */
+export type WorldToScreen = (world: Vec2) => Vec2
+
+/**
+ * The retained label layer that sits *above* the forest and the beams (issue #7),
+ * in SCREEN space: one persistent pixi {@link Text} per label, keyed by candidate
+ * id, created when a label first appears and torn down once it is culled or fully
+ * faded. It mirrors the {@link import('./scene').Scene} and
+ * {@link import('./beamScene').BeamScene} pattern (it owns retained pixi objects
+ * parented into one container the backend hands it and updates them in place every
+ * frame), with one deliberate difference: its container is parented straight to the
+ * stage, OUTSIDE the camera-transformed world, so the camera never scales the text.
  *
- * The pure model ({@link decideLabels}) decides *which* labels show, their alpha,
- * their truncated text, and their kind; this class only projects those plain
- * decisions onto pixi {@link Text} objects and positions each at its label's
- * animated world anchor. Everything above stays library-free.
+ * That screen-space placement is the fix for the blurry-label complaint: a
+ * world-space label was rasterized small and then magnified by the camera when
+ * zoomed in, so it blurred; here every glyph is rasterized at its true
+ * {@link LABEL_SCREEN_PX} pixel size and re-positioned each frame by projecting its
+ * node's animated world anchor through the camera's {@link WorldToScreen}. The text
+ * is therefore sharp at any zoom, and being outside the world also keeps it clear of
+ * the world's bloom / beam-blur filters.
  *
- * The controller (#9) owns the playhead, the camera zoom, and assembling the
- * candidate list (file/root nodes from the tree + spring positions, actors from
- * the active window) each frame, then calls {@link update}. Glyphs are kept cheap
- * by retaining and reusing one {@link Text} per id rather than recreating them.
+ * The pure model ({@link decideLabels}) still decides *which* labels show, their
+ * alpha, their truncated text, and their kind; this class only projects those plain
+ * decisions onto pixi {@link Text} objects. Everything above stays library-free.
  */
 export class LabelScene {
-  /** The world container every label glyph is parented into, above the forest and beams. */
+  /** The screen-space container every label glyph is parented into, above the forest and beams. */
   private readonly layer: Container
+  /**
+   * The device pixel ratio the renderer draws at, applied as each {@link Text}'s
+   * `resolution` so glyphs are rasterized at the display's true pixel density and
+   * never look soft on a HiDPI screen.
+   */
+  private readonly resolution: number
   /** Tuning for the pure LOD model, forwarded verbatim each frame. */
   private readonly options: LabelLodOptions
 
@@ -58,11 +74,15 @@ export class LabelScene {
   private readonly textById: Map<string, Text>
 
   /**
-   * @param layer the world container for labels, added above the forest and beam
-   *   layers so label text reads on top of everything.
+   * @param layer the SCREEN-SPACE container for labels (a child of the stage, not
+   *   the world), added above the forest and beam layers so label text reads on top.
+   * @param resolution the renderer's device pixel ratio, used as each glyph's
+   *   `resolution` so the text is crisp on HiDPI displays. A non-positive value
+   *   falls back to 1.
    */
-  constructor(layer: Container, options: LabelLodOptions = {}) {
+  constructor(layer: Container, resolution: number, options: LabelLodOptions = {}) {
     this.layer = layer
+    this.resolution = resolution > 0 ? resolution : 1
     this.options = options
     this.textById = new Map()
   }
@@ -73,24 +93,31 @@ export class LabelScene {
    * the forest and beam scenes so labels layer on top.
    *
    * A visible decision creates or reuses its glyph, sets its text/color/alpha, and
-   * positions it at the label's animated world anchor. An invisible decision (a
-   * culled file label, a faded actor) drops its retained glyph so the layer never
-   * holds a label the model has ruled out.
+   * positions it at its node's world anchor PROJECTED to screen pixels via
+   * `worldToScreen`, so the glyph tracks its node as the camera pans/zooms while
+   * staying a fixed on-screen size. An invisible decision (a culled file label, a
+   * faded actor) drops its retained glyph so the layer never holds a label the model
+   * has ruled out.
    *
-   * @param candidates every label the caller would like drawn this frame.
-   * @param zoom the live camera zoom, used to counter-scale every glyph so each
-   *   label keeps a constant on-screen size regardless of how far the camera pulls
-   *   out (the file-tier LOD is now a pure density gate, independent of zoom).
+   * @param candidates every label the caller would like drawn this frame, at their
+   *   live WORLD positions.
+   * @param worldToScreen the camera's world->screen projection, used to place each
+   *   glyph in the screen-space layer this frame.
    * @param now the playhead time, driving the file touch-flash fade.
    */
-  public update(candidates: LabelCandidate[], zoom: number, now: number, theme: RunewoodTheme): void {
+  public update(
+    candidates: LabelCandidate[],
+    worldToScreen: WorldToScreen,
+    now: number,
+    theme: RunewoodTheme,
+  ): void {
     const decisions = decideLabels(candidates, now, this.options)
     const present = new Set<string>()
 
     for (const decision of decisions) {
       if (!decision.visible || decision.alpha <= 0) {
-        // The model culled it (zoom/density) or it has fully faded: drop the glyph
-        // rather than draw an invisible label.
+        // The model culled it (density) or it has fully faded: drop the glyph rather
+        // than draw an invisible label.
         this.removeLabel(decision.id)
         continue
       }
@@ -98,29 +125,30 @@ export class LabelScene {
 
       let text = this.textById.get(decision.id)
       if (!text) {
-        text = new Text({ text: decision.text })
+        // Rasterize at the device pixel ratio so the glyph is crisp on HiDPI, and at
+        // a fixed screen-pixel font size since the layer is no longer camera-scaled.
+        text = new Text({
+          text: decision.text,
+          resolution: this.resolution,
+          style: { fontSize: LABEL_SCREEN_PX },
+        })
         this.layer.addChild(text)
         this.textById.set(decision.id, text)
       }
       // Update the glyph in place. The label color is a global theme decision, so
-      // every kind shares the theme's label hue; the per-kind distinction is
-      // carried by alpha (subtle roots vs full file/actor flashes).
-      //
-      // Constant on-screen size for EVERY kind: the glyph is authored in world units
-      // that the camera scales by `zoom`, so dividing the screen-pixel target by the
-      // live zoom yields the world font size that lands on exactly `LABEL_SCREEN_PX`
-      // screen pixels at any zoom. File, root, and actor labels therefore never
-      // shrink as the camera pulls out (the user's explicit ask); the LOD model still
-      // governs *which* labels show. A non-positive zoom (degenerate) falls back to
-      // the raw screen size so a label is never lost to a divide-by-zero.
-      const worldFontSize = zoom > 0
-        ? LABEL_SCREEN_PX / zoom
-        : LABEL_SCREEN_PX
+      // every kind shares the theme's label hue; the per-kind distinction is carried
+      // by alpha (subtle roots vs full file/actor flashes). The font size is a fixed
+      // SCREEN-pixel size (no `/zoom`): the layer sits outside the camera transform,
+      // so this is the literal rendered pixel height at any zoom, which is what keeps
+      // the text crisp rather than magnified-and-blurry when zoomed in.
       text.text = decision.text
       text.style.fill = hslToRgbInt(theme.label)
-      text.style.fontSize = worldFontSize
+      text.style.fontSize = LABEL_SCREEN_PX
       text.alpha = decision.alpha
-      text.position.set(decision.position.x, decision.position.y)
+      // Project the node's live world anchor to screen pixels so the glyph tracks its
+      // node through pans and zooms while staying a constant on-screen size.
+      const screen = worldToScreen(decision.position)
+      text.position.set(screen.x, screen.y)
     }
 
     // Cull any retained glyph the model did not keep this frame (a label whose node

@@ -16,10 +16,16 @@ import { colorForPath } from '../core/theme'
  * disc; this module never touches pixi, the DOM, or the clock.
  *
  * `brightness` is kept separate from `alpha` on purpose. `alpha` is how present
- * the node is (a seeded node is faint, a deleted node fades to nothing), while
- * `brightness` is how *hot* it is right now (a freshly touched node spikes white
- * then cools). A backend can map them independently: alpha to the disc's opacity,
- * brightness to how far the core is pushed toward white.
+ * the node is, while `brightness` is how *hot* it is right now (a freshly touched
+ * node spikes white then cools). A backend can map them independently: alpha to
+ * the disc's opacity, brightness to how far the core is pushed toward white.
+ *
+ * Per direct user feedback, every PERSISTENT node (seeded, discovered, directory,
+ * repo/forest root) renders at FULL opacity (`alpha === 1`): nodes differ by color
+ * and size, never by opacity, so a faint "connecting" node can never hide while its
+ * child arms show. The ONE node that changes opacity is a deleted node leaving the
+ * scene, and even there it is removed by a quick radius shrink-to-zero rather than a
+ * lingering fade, so no semi-transparent node is ever left on screen.
  *
  * `glow` is the strength of the single soft additive glow sprite the backend
  * scales under the crisp core (the redesign replaced the old hard-edged middle
@@ -38,7 +44,12 @@ export type NodeVisual = {
   radius: number
   /** Base color: vivid file hue from its extension, or the neutral theme hub color for a directory. */
   color: Hsl
-  /** Presence opacity, `0..1`. Seeded nodes are dim; deleted nodes fade toward 0. */
+  /**
+   * Presence opacity, `0..1`. Every persistent node (seeded, discovered, directory,
+   * root) is a flat `1` so nodes never differ by opacity, only by color and size. A
+   * deleted node also stays at `1` and instead leaves by shrinking its {@link radius}
+   * to zero, so the scene never shows a faint, half-faded node.
+   */
   alpha: number
   /** How far the core is pushed toward white, `0..1`. Rises with heat and spikes on a fresh touch. */
   brightness: number
@@ -58,14 +69,14 @@ export type NodeVisual = {
 export type NodeVisualOptions = {
   /** How heat maps to radius. Forwarded verbatim to {@link nodeHeat}. */
   heat?: HeatOptions
-  /** Opacity of a seeded (known-but-untouched) node. Discovered nodes are fully opaque. */
-  seededAlpha?: number
   /**
-   * How long a deleted node takes to fade from full to invisible, in
-   * milliseconds. The fade is measured from the node's `lastTouchedAt` (the
-   * delete event's time) against `now`.
+   * How long a deleted node takes to shrink from its full baseline radius to zero,
+   * in milliseconds, before the scene culls it. The shrink is measured from the
+   * node's `lastTouchedAt` (the delete event's time) against `now`. A deleted node
+   * leaves by shrinking, NOT by fading, so it never lingers as a faint disc. Kept
+   * short so the removal reads as a quick collapse rather than a slow dissolve.
    */
-  deleteFadeMs?: number
+  deleteShrinkMs?: number
   /**
    * How long a touch flash lasts before it has fully decayed back to baseline,
    * in milliseconds. Within this window after `lastTouchedAt` the node's
@@ -93,8 +104,14 @@ export type NodeVisualOptions = {
   pulseStrength?: number
 }
 
-const DEFAULT_SEEDED_ALPHA = 0.28
-const DEFAULT_DELETE_FADE_MS = 4_000
+/**
+ * How long a deleted node takes to shrink to zero radius before it is culled, in
+ * milliseconds. Deliberately quick (~0.4s) so a removed node collapses out of the
+ * scene snappily rather than lingering: the user's complaint was lingering, faint
+ * nodes, so the delete is a fast shrink, not a slow fade. A judgment call worth
+ * tuning to taste.
+ */
+const DEFAULT_DELETE_SHRINK_MS = 400
 const DEFAULT_FLASH_MS = 1_200
 const DEFAULT_FLASH_STRENGTH = 1
 
@@ -143,9 +160,10 @@ const HEAT_GLOW_WEIGHT = 0.5
  * - **color** is the file's vivid extension hue ({@link colorForPath}) for a leaf,
  *   or the theme's neutral hub color for a directory, so directories read as
  *   structural wood and files as their language.
- * - **alpha** is driven by {@link NodeStatus}: a seeded node is dimmed to
- *   `seededAlpha`, a discovered node is fully present, and a deleted node fades
- *   from full to 0 over `deleteFadeMs` since its delete.
+ * - **alpha** is a flat `1` for every persistent node (seeded, discovered,
+ *   directory, root) AND for a deleted one: nodes never differ by opacity. A
+ *   deleted node leaves by shrinking its radius to zero over `deleteShrinkMs`
+ *   instead of fading, so it never lingers as a faint disc.
  * - **brightness** is a heat-scaled baseline plus a short-lived flash that spikes
  *   on a fresh touch and decays linearly over `flashMs`.
  * - **glow** is the soft additive glow sprite's strength: a (separate) heat-scaled
@@ -159,8 +177,7 @@ export function nodeVisualFor(
   theme: RunewoodTheme,
   options: NodeVisualOptions = {},
 ): NodeVisual {
-  const seededAlpha = options.seededAlpha ?? DEFAULT_SEEDED_ALPHA
-  const deleteFadeMs = options.deleteFadeMs ?? DEFAULT_DELETE_FADE_MS
+  const deleteShrinkMs = options.deleteShrinkMs ?? DEFAULT_DELETE_SHRINK_MS
   const flashMs = options.flashMs ?? DEFAULT_FLASH_MS
   const flashStrength = options.flashStrength ?? DEFAULT_FLASH_STRENGTH
   const pulseMs = options.pulseMs ?? DEFAULT_PULSE_MS
@@ -168,9 +185,12 @@ export function nodeVisualFor(
 
   // `baseRadius` is the calm resting size; it no longer grows with cumulative
   // touches. The transient pulse swells it on a touch and eases it back, so the
-  // node throbs per edit rather than ballooning permanently.
+  // node throbs per edit rather than ballooning permanently. A deleted node then
+  // shrinks toward zero so it collapses out of the scene instead of fading, which
+  // is what keeps every persistent node at full opacity.
   const { heat, radius: baseRadius } = nodeHeat(node, now, options.heat)
-  const radius = baseRadius * (1 + touchPulse(node.lastTouchedAt, now, pulseMs, pulseStrength))
+  const pulsed = baseRadius * (1 + touchPulse(node.lastTouchedAt, now, pulseMs, pulseStrength))
+  const radius = pulsed * deleteShrink(node.status, node.lastTouchedAt, now, deleteShrinkMs)
 
   // Directories carry no language, so they take the theme's neutral, desaturated
   // hub color and read as the structural wood the files hang from. Files take
@@ -179,7 +199,10 @@ export function nodeVisualFor(
     ? colorForPath(node.path)
     : { ...theme.hub }
 
-  const alpha = alphaForStatus(node.status, node.lastTouchedAt, now, seededAlpha, deleteFadeMs)
+  // Every node is fully opaque: persistent nodes never differ by opacity (the
+  // user's explicit ask), and a deleted node leaves by the radius shrink above
+  // rather than a fade, so it too stays at 1 until it is culled at zero size.
+  const alpha = 1
 
   // The touch flash drives both the core's brightness and the glow sprite's
   // strength: it spikes at the instant of a touch and decays linearly to exactly
@@ -198,33 +221,30 @@ export function nodeVisualFor(
 }
 
 /**
- * The presence opacity for a node given its status. Seeded nodes are dimmed to a
- * faint constant; discovered nodes are fully opaque; deleted nodes fade linearly
- * from full to 0 over `deleteFadeMs` measured from their delete time. A deleted
- * node with no recorded touch time (which should not happen, since a delete event
- * stamps `lastTouchedAt`) is treated as fully faded so it never lingers visibly.
+ * The radius multiplier (`0..1`) that shrinks a deleted node out of the scene. A
+ * persistent node (seeded or discovered) is left at full size (`1`); a deleted node
+ * collapses linearly from full to zero over `deleteShrinkMs` measured from its
+ * delete time, so it leaves by shrinking rather than fading and never lingers as a
+ * faint disc. A deleted node with no recorded touch time (which should not happen,
+ * since a delete event stamps `lastTouchedAt`) is treated as fully shrunk so it
+ * never lingers visibly.
  */
-function alphaForStatus(
+function deleteShrink(
   status: NodeStatus,
   lastTouchedAt: number | null,
   now: number,
-  seededAlpha: number,
-  deleteFadeMs: number,
+  deleteShrinkMs: number,
 ): number {
-  if (status === 'seeded') {
-    return seededAlpha
-  }
-  if (status === 'discovered') {
+  if (status !== 'deleted') {
     return 1
   }
 
-  // Deleted: fade out over the window since the delete landed.
   if (lastTouchedAt === null) {
-    console.debug('runewood: deleted node has no lastTouchedAt, treating as fully faded')
+    console.debug('runewood: deleted node has no lastTouchedAt, treating as fully shrunk')
     return 0
   }
   const elapsed = now - lastTouchedAt
-  const remaining = 1 - elapsed / deleteFadeMs
+  const remaining = 1 - elapsed / deleteShrinkMs
   return Math.max(0, Math.min(1, remaining))
 }
 

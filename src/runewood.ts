@@ -793,8 +793,11 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
 
     // Labels can be suppressed wholesale; when off, the scene gets an empty
     // candidate set so it tears its retained text down rather than holding stale.
+    // The label layer is SCREEN-space (outside the camera transform), so it is
+    // handed the camera's world->screen projection to place each glyph at its node's
+    // projected pixel position, keeping the text crisp and a constant on-screen size.
     const candidates = showLabels ? buildLabelCandidates(now, activities) : EMPTY_LABELS
-    labelScene.update(candidates, camera.zoom, now, theme)
+    labelScene.update(candidates, (world) => camera.worldToScreen(world), now, theme)
 
     backend.endFrame()
   }

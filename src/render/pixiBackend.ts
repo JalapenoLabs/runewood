@@ -83,8 +83,14 @@ export class PixiBackend implements RenderBackend {
   private beamLayer: Container | null = null
 
   /**
-   * The world container for the retained label layer (issue #7). Added above the
-   * forest and beam layers so label text reads on top of everything. The
+   * The SCREEN-SPACE container for the retained label layer (issue #7). Unlike the
+   * forest and beam layers, this is parented straight to the pixi stage, NOT into
+   * {@link world}, so the camera transform never scales it: labels are positioned
+   * each frame by projecting their node's world anchor to screen pixels (via the
+   * camera) and are rasterized at a fixed screen-pixel font size, which keeps them
+   * crisp at any zoom instead of being magnified and blurred by the camera. Being
+   * outside {@link world} also keeps them clear of the world's bloom/beam-blur
+   * filters. Added to the stage last so label text reads on top of everything. The
    * {@link LabelScene} this backend hands out parents its glyphs here.
    */
   private labelLayer: Container | null = null
@@ -153,10 +159,14 @@ export class PixiBackend implements RenderBackend {
     const beamLayer = new Container()
     world.addChild(beamLayer)
 
-    // Labels sit above everything else, so they are added last and read on top of
-    // the forest and the activity glow.
+    // Labels live in SCREEN space, not world space: they are parented to the stage
+    // (a sibling of `world`, added after it so it reads on top), NOT into `world`,
+    // so the camera's zoom never scales them. The label scene projects each label's
+    // world anchor to screen pixels every frame and rasterizes at a fixed
+    // screen-pixel font size, so the text stays sharp at any zoom and is never
+    // touched by the world's bloom/beam-blur filters.
     const labelLayer = new Container()
-    world.addChild(labelLayer)
+    application.stage.addChild(labelLayer)
 
     this.application = application
     this.world = world
@@ -200,19 +210,21 @@ export class PixiBackend implements RenderBackend {
   }
 
   /**
-   * Creates a retained {@link LabelScene} parented into this backend's label
-   * layer, which sits above the forest and the beams. The controller (#9) holds
-   * the returned scene, assembles the label candidates (files, repo roots, actors)
-   * each frame, and calls `labelScene.update(...)` after the forest and beam
-   * scenes so the text layers on top. Returns `null` if called before {@link init},
-   * since the layer does not exist yet.
+   * Creates a retained {@link LabelScene} parented into this backend's SCREEN-SPACE
+   * label layer, which sits above the forest and the beams. The controller (#9)
+   * holds the returned scene, assembles the label candidates (files, repo roots,
+   * actors) each frame, and calls `labelScene.update(...)` after the forest and beam
+   * scenes so the text layers on top. The live renderer resolution (device pixel
+   * ratio) is handed in so every glyph is rasterized at the display's true pixel
+   * density and stays crisp. Returns `null` if called before {@link init}, since the
+   * layer does not exist yet.
    */
   public createLabelScene(options?: LabelLodOptions): LabelScene | null {
-    if (!this.labelLayer) {
+    if (!this.labelLayer || !this.application) {
       console.debug('runewood: PixiBackend.createLabelScene called before init, returning null')
       return null
     }
-    return new LabelScene(this.labelLayer, options)
+    return new LabelScene(this.labelLayer, this.application.renderer.resolution, options)
   }
 
   /**

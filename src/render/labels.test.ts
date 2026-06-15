@@ -84,6 +84,16 @@ describe('decideLabels', () => {
       expect(root.alpha).toBeLessThan(file.alpha)
       expect(root.alpha).toBeLessThan(actor.alpha)
     })
+
+    it('defaults to a clearly legible (but still sub-full) opacity', () => {
+      // The user found the old near-invisible root alpha unreadable. The default is
+      // now high enough to read easily, while staying a touch below the full-opacity
+      // file/actor flashes so roots remain the calm orientation layer.
+      const decision = decisionFor(decideLabels([ rootCandidate() ], 1000), 'repo')
+
+      expect(decision.alpha).toBeGreaterThanOrEqual(0.8)
+      expect(decision.alpha).toBeLessThan(1)
+    })
   })
 
   describe('file labels fade with the touch flash', () => {

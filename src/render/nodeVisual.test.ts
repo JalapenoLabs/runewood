@@ -26,43 +26,73 @@ function makeNode(overrides: Partial<TreeNode> = {}): TreeNode {
 }
 
 describe('nodeVisualFor', () => {
-  describe('status drives alpha', () => {
-    it('renders a seeded node dimmer than a discovered one', () => {
+  describe('every persistent node is fully opaque (no opacity differences)', () => {
+    it('renders a seeded node at full opacity, identical to a discovered one', () => {
+      // The user's complaint: faint, low-opacity "connecting" nodes. A seeded node
+      // must NOT be dimmed; it is full opacity just like a discovered one, so an
+      // edge always terminates in a clearly visible dot. Nodes differ by color and
+      // size, never by opacity.
       const seeded = makeNode({ status: 'seeded' })
       const discovered = makeNode({ status: 'discovered' })
 
       const seededVisual = nodeVisualFor(seeded, 1000, defaultTheme)
       const discoveredVisual = nodeVisualFor(discovered, 1000, defaultTheme)
 
-      expect(seededVisual.alpha).toBeLessThan(discoveredVisual.alpha)
+      expect(seededVisual.alpha).toBe(1)
       expect(discoveredVisual.alpha).toBe(1)
     })
 
-    it('honors a custom seeded alpha', () => {
-      const seeded = makeNode({ status: 'seeded' })
-      const visual = nodeVisualFor(seeded, 1000, defaultTheme, { seededAlpha: 0.5 })
-      expect(visual.alpha).toBe(0.5)
+    it('renders a directory at full opacity too', () => {
+      const directory = makeNode({ status: 'seeded', isFile: false, path: 'repo/src', name: 'src' })
+      expect(nodeVisualFor(directory, 1000, defaultTheme).alpha).toBe(1)
     })
 
-    it('fades a deleted node toward zero alpha across the fade window', () => {
+    it('keeps a deleted node fully opaque, leaving it by shrinking rather than fading', () => {
+      // Even a deleted node never goes semi-transparent: it stays at alpha 1 and
+      // leaves the scene by shrinking its radius to zero, so no faint disc lingers.
       const deletedAt = 5000
-      const deleteFadeMs = 4000
       const deleted = makeNode({ status: 'deleted', lastTouchedAt: deletedAt, touchCount: 3 })
 
-      const atDelete = nodeVisualFor(deleted, deletedAt, defaultTheme, { deleteFadeMs })
-      const midFade = nodeVisualFor(deleted, deletedAt + deleteFadeMs / 2, defaultTheme, { deleteFadeMs })
-      const afterFade = nodeVisualFor(deleted, deletedAt + deleteFadeMs, defaultTheme, { deleteFadeMs })
+      const atDelete = nodeVisualFor(deleted, deletedAt, defaultTheme, { deleteShrinkMs: 400 })
+      const midShrink = nodeVisualFor(deleted, deletedAt + 200, defaultTheme, { deleteShrinkMs: 400 })
 
-      // Full at the instant of deletion, half way through, and gone at the end.
-      expect(atDelete.alpha).toBeCloseTo(1, 5)
-      expect(midFade.alpha).toBeCloseTo(0.5, 5)
-      expect(afterFade.alpha).toBe(0)
+      expect(atDelete.alpha).toBe(1)
+      expect(midShrink.alpha).toBe(1)
+    })
+  })
+
+  describe('a deleted node leaves by shrinking its radius to zero', () => {
+    it('shrinks the radius from its baseline to zero across the shrink window', () => {
+      const deletedAt = 5000
+      const deleteShrinkMs = 400
+      const deleted = makeNode({ status: 'deleted', lastTouchedAt: deletedAt, touchCount: 3 })
+
+      const atDelete = nodeVisualFor(deleted, deletedAt, defaultTheme, { deleteShrinkMs })
+      const midShrink = nodeVisualFor(deleted, deletedAt + deleteShrinkMs / 2, defaultTheme, { deleteShrinkMs })
+      const atEnd = nodeVisualFor(deleted, deletedAt + deleteShrinkMs, defaultTheme, { deleteShrinkMs })
+
+      // Shrinking: largest at the delete instant, smaller halfway, zero at the end.
+      expect(atDelete.radius).toBeGreaterThan(midShrink.radius)
+      expect(midShrink.radius).toBeGreaterThan(atEnd.radius)
+      expect(atEnd.radius).toBe(0)
     })
 
-    it('clamps a deleted node past its fade window to zero, not negative', () => {
+    it('clamps a deleted node past its shrink window to zero radius, not negative', () => {
       const deleted = makeNode({ status: 'deleted', lastTouchedAt: 1000 })
-      const visual = nodeVisualFor(deleted, 1000 + 10_000, defaultTheme, { deleteFadeMs: 4000 })
-      expect(visual.alpha).toBe(0)
+      const visual = nodeVisualFor(deleted, 1000 + 10_000, defaultTheme, { deleteShrinkMs: 400 })
+      expect(visual.radius).toBe(0)
+    })
+
+    it('does not shrink a persistent (non-deleted) node', () => {
+      const seeded = makeNode({ status: 'seeded', touchCount: 3, lastTouchedAt: 1000 })
+      const discovered = makeNode({ status: 'discovered', touchCount: 3, lastTouchedAt: 1000 })
+
+      // Sampled well past any pulse window so only the (absent) shrink could differ.
+      const seededVisual = nodeVisualFor(seeded, 1_000_000, defaultTheme)
+      const discoveredVisual = nodeVisualFor(discovered, 1_000_000, defaultTheme)
+
+      expect(seededVisual.radius).toBeGreaterThan(0)
+      expect(seededVisual.radius).toBeCloseTo(discoveredVisual.radius, 5)
     })
   })
 
@@ -291,13 +321,16 @@ describe('nodeVisualFor', () => {
     const statuses: NodeStatus[] = [ 'seeded', 'discovered', 'deleted' ]
     for (const status of statuses) {
       it(`returns finite, bounded params for a ${status} node`, () => {
-        const node = makeNode({ status, touchCount: 2, lastTouchedAt: 9000 })
-        const visual = nodeVisualFor(node, 9500, defaultTheme)
+        const touchedAt = 9000
+        const node = makeNode({ status, touchCount: 2, lastTouchedAt: touchedAt })
+        // Sample within the delete-shrink window so a deleted node still has a
+        // positive (mid-shrink) radius; a fully-shrunk node would legitimately be 0.
+        const visual = nodeVisualFor(node, touchedAt + 100, defaultTheme, { deleteShrinkMs: 400 })
 
         expect(Number.isFinite(visual.radius)).toBe(true)
         expect(visual.radius).toBeGreaterThan(0)
-        expect(visual.alpha).toBeGreaterThanOrEqual(0)
-        expect(visual.alpha).toBeLessThanOrEqual(1)
+        // Every node is fully opaque now, persistent and deleted alike.
+        expect(visual.alpha).toBe(1)
         expect(visual.brightness).toBeGreaterThanOrEqual(0)
         expect(visual.brightness).toBeLessThanOrEqual(1)
         expect(visual.glow).toBeGreaterThanOrEqual(0)
