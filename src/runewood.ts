@@ -364,9 +364,11 @@ export type RunewoodOptions = {
    */
   actorLingerMs?: number
   /**
-   * Tuning for the continuous force-directed layout: spring rest length + stiffness,
-   * sibling repulsion strength, damping, and the integration-step clamp. These are the
-   * knobs that make the forest feel livelier or calmer. See {@link ForceLayoutOptions}.
+   * Tuning for the continuous force-directed layout: spring rest length + stiffness, the
+   * sibling-count ring widening, the gentle outward bias, size-aware collision (stiffness,
+   * margin, the per-kind collision radii), damping, and the integration-step clamp. These are
+   * the knobs that make the forest feel livelier or calmer and control overlap. See
+   * {@link ForceLayoutOptions}.
    */
   physics?: ForceLayoutOptions
   /**

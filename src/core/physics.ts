@@ -3,82 +3,78 @@
 import type { Vec2, NodePhysics } from './layout'
 import type { VisibleNode } from './collapse'
 
+import { nodeHeat } from './layout'
+
 /**
- * The continuous, Gource-style force-directed layout: a living physics simulation
- * that replaces the old deterministic radial tidy-tree. Where {@link computeTargets}
- * sprang every node to a fixed precomputed target and then went perfectly still, this
- * sim is *always* gently reacting and settling: every visible node carries a position
- * and velocity that evolve under a handful of forces each frame, so adding a node makes
- * its local neighborhood push apart and re-settle organically instead of the canvas
- * looking frozen between events.
+ * The continuous, Gource-style force-directed layout: a living physics simulation that
+ * replaces the old deterministic radial tidy-tree. Every visible node carries a position and
+ * velocity that evolve under a handful of forces each frame, so adding a node makes its local
+ * neighborhood drift apart and re-settle organically instead of the canvas looking frozen
+ * between events. The springiness and continuous, smooth settling are deliberate and loved.
  *
- * ### Modeled on Gource's actual layout (`src/dirnode.cpp`)
+ * ### The fluid, self-settling model (this rework)
  *
- * The earlier version of this sim was springy and smooth (which the user loves) but the
- * tree "crossed up": branches grew in random hash-seeded directions and folded back over
- * each other. This version adopts Gource's organizing trick so the forest grows OUTWARD
- * from the center in tidy angular wedges instead. The pieces, mapped to Gource:
+ * The previous version forced every directory toward a precomputed *outward wedge target* with
+ * a firm directional pull, which organized the tree but felt rigid (nodes snapped toward a
+ * radial grid) and still let nodes OVERLAP because the repulsion never knew how big a node was
+ * drawn. This version pivots toward a more fluid, emergent layout where the nodes settle
+ * themselves:
  *
- * - **Outward directional growth** (Gource `setInitialPosition` + the "parent_parent to
- *   parent normal" term in `applyForces`): every directory has a preferred *outward
- *   direction*, the unit vector pointing from its grandparent toward its parent (radially
- *   away from the pinned center for a repo root). A directory is pulled toward a target
- *   that sits one rest-length out from its parent *along that outward direction*, so a
- *   branch grows away from the center and does not fold back across its siblings. This is
- *   the anti-crossing force; see {@link applyDirectionalGrowth} and {@link outwardTargetFor}.
- * - **Sibling arc distribution** (Gource's "dirs should repulse from other dirs of this
- *   parent", scaling sibling repulsion by the parent's circumference / sibling count):
- *   instead of all of a parent's child directories chasing the exact same outward point
- *   (which would stack them on one ray), each sibling is handed its own slice of the
- *   parent's outward-facing arc. The outward target above is rotated by the node's wedge
- *   offset, so N child directories fan across an arc centered on the outward direction,
- *   each subtree getting its own wedge. See {@link siblingWedgeOffset}.
- * - **Files cluster around their directory** (Gource `RFile`, whose position is relative
- *   to its dir and packed into tight concentric rings, never part of the global spread):
- *   a file is a *satellite*. It springs to a short rest length from its directory and
- *   only repels its file-siblings (not the whole forest), so files bunch close to the
- *   directory they belong to while the directories form the spread skeleton. See the file
- *   branches in {@link applyEdgeSprings} / {@link applyRepulsion}.
- * - **Directory-to-directory repulsion** (Gource's quadtree `applyForceDir`): directories
- *   push apart from every *nearby* directory, regardless of parentage, so different
- *   branches separate. Kept over the same uniform spatial grid as before for `O(n)` cost.
+ * - **Real size-aware collision** ({@link applyCollision}) is the headline fix for overlap.
+ *   Every body carries a {@link NodeMeta.collisionRadius} that matches its DRAWN size (captured
+ *   in {@link sync} from the steady base radius, never the transient touch pulse, so it is
+ *   stable). When two bodies sit closer than `radiusA + radiusB + margin` they are pushed apart
+ *   *firmly, in proportion to how deeply they penetrate*, so they end up touching-but-not-
+ *   overlapping; past that gap the force is exactly zero. This replaces the old inverse-square
+ *   repulsion, which had no notion of size and so could never guarantee no-overlap.
+ * - **Sibling-count rest length** ({@link restLengthFor}): a node's spring rest length to its
+ *   parent grows with how many visible siblings share its ring, so a parent with many children
+ *   pushes them out to a bigger ring whose circumference has room for all of them. A lone child
+ *   stays close; six children sit on a noticeably wider ring. See the formula on
+ *   {@link restLengthFor}.
+ * - **A gentle outward bias** ({@link applyOutwardBias}), NOT a rigid wedge target. Directories
+ *   feel a soft nudge directly away from the center (radially outward) so branches grow away
+ *   from the trunk and do not collapse inward or fold back, but there is no per-sibling target
+ *   angle anymore: the collision + sibling-count rest length + springs do the real organizing
+ *   as the nodes settle themselves. A new node spawns near its parent pointing gently outward,
+ *   then drifts and settles via collision.
+ * - **Files cluster around their directory** (Gource `RFile`): a file is a satellite. It springs
+ *   to a short rest length from its directory and collides only with its file-siblings and its
+ *   own directory, so files bunch close to the directory they belong to while the directories
+ *   form the spread skeleton.
  *
- * The forest root (when shown) is **pinned** at the center: fixed position, zero
- * velocity, never integrated, so the whole forest hangs and settles around it.
+ * The forest root (when shown) is **pinned** at the center: fixed position, zero velocity, never
+ * integrated, so the whole forest hangs and settles around it.
  *
- * This is **forward-only visual state**, exactly like the springs it replaces. It is
- * NOT a pure function of the tree, and that is the accepted tradeoff for the
- * always-alive feel: a backward seek re-folds the (pure) tree and then re-syncs the
- * sim, which re-settles rather than reproducing pixel-exact prior positions. The data
- * fold stays replayable and seek-exact; the layout no longer is.
+ * This is **forward-only visual state**. It is NOT a pure function of the tree, and that is the
+ * accepted tradeoff for the always-alive feel: a backward seek re-folds the (pure) tree and then
+ * re-syncs the sim, which re-settles rather than reproducing pixel-exact prior positions.
  *
- * ### Repulsion complexity (uniform spatial grid)
+ * ### Collision complexity (uniform spatial grid)
  *
- * Directory repulsion acts between ALL directories, not just siblings, because
- * sibling-only repulsion let different branches cross and tangle. A naive all-pairs pass
- * would be `O(n^2)` per frame, which would not stay smooth on a large Seraphim forest.
- * Instead the repulsion uses a **uniform-bucket spatial grid** ({@link buildSpatialGrid}):
- * each frame every body is hashed into a square cell of side {@link repulsionCutoff}, and a
- * body only computes repulsion against bodies in its own cell and the eight neighboring
- * cells. Because the force is an inverse-square that has fallen off to a negligible amount
- * past one cell, ignoring far-away cells changes the result imperceptibly while bounding
- * the work to roughly `O(n)`. Building the grid is `O(n)`.
+ * Collision acts between ALL nearby directories (and a file and its directory's satellites), not
+ * just siblings, so different branches separate. A naive all-pairs pass would be `O(n^2)` per
+ * frame. Instead it runs over a **uniform-bucket spatial grid** ({@link buildSpatialGrid}): every
+ * body is hashed into a square cell of side {@link collisionCellSize}, and a body only tests the
+ * bodies in its own cell and the eight neighbors. The cell side is sized at least one largest
+ * collision diameter plus the margin, so any genuinely overlapping pair is guaranteed to share a
+ * cell or sit adjacent and is never missed. Building the grid is `O(n)`.
  */
 export class ForceLayout {
   /** Live per-node physics, keyed by the node's real (full) path. The public read surface. */
   private readonly bodies: Map<string, NodePhysics>
 
   /**
-   * Per-node layout metadata captured on {@link sync} from the collapse, so {@link step}
-   * can apply the directional / spring / clustering forces without re-walking the tree
-   * each frame. Keyed by real node path; the forest root and an un-synced node are absent.
+   * Per-node layout metadata captured on {@link sync} from the collapse, so {@link step} can
+   * apply the spring / outward / collision forces without re-walking the tree each frame. Keyed
+   * by real node path; the forest root and an un-synced node are absent.
    */
   private readonly metaByPath: Map<string, NodeMeta>
 
   /**
-   * The path of the pinned forest root (`''`) when one is shown, else `null`. A pinned
-   * body is held at the center with zero velocity and skipped by the integrator, so
-   * everything else hangs and settles around it.
+   * The path of the pinned forest root (`''`) when one is shown, else `null`. A pinned body is
+   * held at the center with zero velocity and skipped by the integrator, so everything else
+   * hangs and settles around it.
    */
   private pinnedPath: string | null
 
@@ -92,14 +88,14 @@ export class ForceLayout {
       center: options.center ?? { x: 0, y: 0 },
       restLength: options.restLength ?? DEFAULT_REST_LENGTH,
       restLengthDepthScale: options.restLengthDepthScale ?? DEFAULT_REST_LENGTH_DEPTH_SCALE,
+      siblingRestScale: options.siblingRestScale ?? DEFAULT_SIBLING_REST_SCALE,
       springStiffness: options.springStiffness ?? DEFAULT_SPRING_STIFFNESS,
-      directionalStrength: options.directionalStrength ?? DEFAULT_DIRECTIONAL_STRENGTH,
-      siblingArc: options.siblingArc ?? DEFAULT_SIBLING_ARC,
+      outwardBias: options.outwardBias ?? DEFAULT_OUTWARD_BIAS,
       fileRestLength: options.fileRestLength ?? DEFAULT_FILE_REST_LENGTH,
-      fileRepulsionStrength: options.fileRepulsionStrength ?? DEFAULT_FILE_REPULSION_STRENGTH,
-      repulsionStrength: options.repulsionStrength ?? DEFAULT_REPULSION_STRENGTH,
-      repulsionMinDistance: options.repulsionMinDistance ?? DEFAULT_REPULSION_MIN_DISTANCE,
-      repulsionCutoff: options.repulsionCutoff ?? DEFAULT_REPULSION_CUTOFF,
+      collisionStiffness: options.collisionStiffness ?? DEFAULT_COLLISION_STIFFNESS,
+      collisionMargin: options.collisionMargin ?? DEFAULT_COLLISION_MARGIN,
+      directoryRadius: options.directoryRadius ?? DEFAULT_DIRECTORY_RADIUS,
+      fileRadius: options.fileRadius ?? DEFAULT_FILE_RADIUS,
       damping: options.damping ?? DEFAULT_DAMPING,
       maxStepMs: options.maxStepMs ?? DEFAULT_MAX_STEP_MS,
       spawnOffset: options.spawnOffset ?? DEFAULT_SPAWN_OFFSET,
@@ -107,10 +103,10 @@ export class ForceLayout {
   }
 
   /**
-   * The live physics map. The scene, labels, beams, camera, and picking read positions
-   * straight off this, exactly where they used to read the spring state, so the rest of
-   * the controller is unchanged by the switch to forces. Returned by reference (not
-   * copied) because it is read every frame; callers must not mutate it.
+   * The live physics map. The scene, labels, beams, camera, and picking read positions straight
+   * off this, exactly where they used to read the spring state, so the rest of the controller is
+   * unchanged by the switch to forces. Returned by reference (not copied) because it is read
+   * every frame; callers must not mutate it.
    */
   public get state(): Map<string, NodePhysics> {
     return this.bodies
@@ -118,22 +114,20 @@ export class ForceLayout {
 
   /**
    * Reconciles the simulation's bodies with the current visible set (the output of
-   * {@link collapseTree}). This is the structural step, run only when the tree's shape
-   * changed:
+   * {@link collapseTree}). This is the structural step, run only when the tree's shape changed:
    *
-   * - A **new** visible node gets a body spawned at its display-parent's *current*
-   *   position, nudged a small offset along its outward direction so it visibly emerges
-   *   from the parent it hangs off, already pointing away from the center (Gource's
-   *   `setInitialPosition`). A repo root with no live parent falls back to a radial nudge
-   *   from the configured center.
-   * - A node no longer visible has its body **removed**, so a deleted or collapsed-away
-   *   node stops being simulated and drawn.
+   * - A **new** visible node gets a body spawned at its display-parent's *current* position,
+   *   nudged a small offset along its outward direction so it visibly emerges from the parent it
+   *   hangs off, already pointing away from the center. A repo root with no live parent falls
+   *   back to a radial nudge from the configured center.
+   * - A node no longer visible has its body **removed**, so a deleted or collapsed-away node
+   *   stops being simulated and drawn.
    * - The forest root (when present, flagged `isForestRoot`) is **pinned** at the center.
    *
-   * The per-node metadata index ({@link NodeMeta}) is rebuilt here too: each node's
-   * display-parent and grandparent (for the outward direction), whether it is a file, its
-   * depth, and its directory-sibling wedge offset (its slice of the parent's outward arc).
-   * That lets every {@link step} apply the directional, spring, and clustering forces
+   * The per-node metadata index ({@link NodeMeta}) is rebuilt here too: each node's display-
+   * parent, whether it is a file, its depth, its collision radius (matched to the drawn size),
+   * and how many visible siblings share its ring (so the rest length can widen the ring to fit
+   * them all). That lets every {@link step} apply the spring, outward, and collision forces
    * without re-walking the tree.
    */
   public sync(visibleNodes: VisibleNode[]): void {
@@ -165,10 +159,10 @@ export class ForceLayout {
       }
     }
 
-    // The wedge slots are assigned per display-parent, so the directory children of one
-    // parent each get a distinct slice of that parent's outward arc. Built from the live
-    // visible set (deterministic path order) so a re-sync after a rewind is reproducible.
-    const wedgeByPath = assignSiblingWedges(visibleNodes)
+    // How many visible siblings share each display-parent's ring, so the rest length can widen
+    // the ring to give all of them room (counted per kind: directories and files keep separate
+    // rings, since files rest much closer in as satellites).
+    const siblingCounts = countSiblings(visibleNodes)
 
     for (const visible of visibleNodes) {
       if (visible.isForestRoot) {
@@ -179,7 +173,8 @@ export class ForceLayout {
         displayParentPath: visible.displayParentPath,
         isFile: visible.node.isFile,
         depth: visible.depth,
-        wedge: wedgeByPath.get(path) ?? { index: 0, count: 1 },
+        siblingCount: siblingCounts.get(siblingKey(visible)) ?? 1,
+        collisionRadius: collisionRadiusFor(visible, this.options),
       }
       this.metaByPath.set(path, meta)
 
@@ -191,8 +186,8 @@ export class ForceLayout {
       }
     }
 
-    // Drop bodies whose node is no longer visible (deleted or collapsed away), so the
-    // sim and the drawn forest stay in lockstep and the map does not grow without bound.
+    // Drop bodies whose node is no longer visible (deleted or collapsed away), so the sim and
+    // the drawn forest stay in lockstep and the map does not grow without bound.
     for (const path of [ ...this.bodies.keys() ]) {
       if (!livePaths.has(path)) {
         this.bodies.delete(path)
@@ -202,9 +197,9 @@ export class ForceLayout {
 
   /**
    * Clears the whole simulation: every body, index, and the pin. Used on a backward-seek
-   * rebuild, where the controller re-folds the tree and then re-syncs from the rebuilt
-   * visible set, letting the sim re-settle from fresh spawns rather than carrying stale
-   * positions across the rewind.
+   * rebuild, where the controller re-folds the tree and then re-syncs from the rebuilt visible
+   * set, letting the sim re-settle from fresh spawns rather than carrying stale positions across
+   * the rewind.
    */
   public reset(): void {
     this.bodies.clear()
@@ -213,16 +208,16 @@ export class ForceLayout {
   }
 
   /**
-   * Advances the simulation by `deltaMs` of real wall time, applying the forces and
-   * integrating with semi-implicit Euler (update velocity from the force, then move by the
-   * new velocity). Run EVERY frame, continuously, so the forest is always gently alive:
-   * even with no structural change, residual velocity keeps settling and a recent
-   * disturbance keeps propagating and easing out.
+   * Advances the simulation by `deltaMs` of real wall time, applying the forces and integrating
+   * with semi-implicit Euler (update velocity from the force, then move by the new velocity).
+   * Run EVERY frame, continuously, so the forest is always gently alive: even with no structural
+   * change, residual velocity keeps settling and a recent disturbance keeps propagating and
+   * easing out.
    *
-   * The delta is clamped to {@link ForceLayoutOptions.maxStepMs} for stability: a long
-   * stall (a backgrounded tab, a GC pause) must not deliver one giant step that flings
-   * nodes across the canvas. A non-positive or non-finite delta is a no-op so a paused or
-   * malformed frame never corrupts the state.
+   * The delta is clamped to {@link ForceLayoutOptions.maxStepMs} for stability: a long stall (a
+   * backgrounded tab, a GC pause) must not deliver one giant step that flings nodes across the
+   * canvas. A non-positive or non-finite delta is a no-op so a paused or malformed frame never
+   * corrupts the state.
    */
   public step(deltaMs: number): void {
     if (!Number.isFinite(deltaMs) || deltaMs <= 0) {
@@ -235,8 +230,8 @@ export class ForceLayout {
     const clampedMs = Math.min(deltaMs, this.options.maxStepMs)
     const deltaSeconds = clampedMs / 1000
 
-    // Accumulate this frame's forces per body before integrating, so every force reads
-    // the same start-of-frame positions (an explicit, order-independent step).
+    // Accumulate this frame's forces per body before integrating, so every force reads the same
+    // start-of-frame positions (an explicit, order-independent step).
     const forces = new Map<string, Vec2>()
     for (const path of this.bodies.keys()) {
       if (path === this.pinnedPath) {
@@ -246,20 +241,19 @@ export class ForceLayout {
     }
 
     this.applyEdgeSprings(forces)
-    this.applyDirectionalGrowth(forces)
-    this.applyRepulsion(forces)
+    this.applyOutwardBias(forces)
+    this.applyCollision(forces)
     this.integrate(forces, deltaSeconds)
   }
 
   /**
-   * Edge spring: pulls each node toward its display-parent so it settles at roughly the
-   * rest length away, keeping the tree skeleton intact (Gource's gravity-to-parent).
+   * Edge spring: pulls each node toward its display-parent so it settles at roughly the rest
+   * length away, keeping the tree skeleton intact (Gource's gravity-to-parent).
    *
-   * Directories rest a depth-scaled distance out (deeper rings sit progressively further,
-   * so the forest spreads rather than crowding the trunk); files rest at the much shorter
-   * {@link ForceLayoutOptions.fileRestLength}, so they hug the directory they belong to as
-   * a tight satellite cluster instead of spreading like a sub-tree. A node whose
-   * display-parent has no body yet (a repo root hanging off the undrawn center) is pulled
+   * Directories rest a depth-and-sibling-scaled distance out (see {@link restLengthFor}); files
+   * rest at the much shorter {@link ForceLayoutOptions.fileRestLength}, so they hug the directory
+   * they belong to as a tight satellite cluster instead of spreading like a sub-tree. A node
+   * whose display-parent has no body yet (a repo root hanging off the undrawn center) is pulled
    * gently toward the configured center instead, so the repos still arrange around the middle.
    */
   private applyEdgeSprings(forces: Map<string, Vec2>): void {
@@ -276,8 +270,8 @@ export class ForceLayout {
 
       const restLength = this.restLengthFor(meta)
 
-      // Hooke's law toward the anchor: force is proportional to how far the current
-      // separation is from the rest length, directed along the parent->node axis.
+      // Hooke's law toward the anchor: force is proportional to how far the current separation is
+      // from the rest length, directed along the parent->node axis.
       const stretch = distance - restLength
       const pull = this.options.springStiffness * stretch
       force.x -= (offsetX / distance) * pull
@@ -286,120 +280,105 @@ export class ForceLayout {
   }
 
   /**
-   * Outward directional growth: the anti-crossing force, modeled on Gource's
-   * "parent_parent to parent normal" push plus its sibling-arc spread. For each directory
-   * (files are skipped, they are satellites) this pulls the node toward a target one rest
-   * length out from its parent *along the parent's outward direction* (grandparent ->
-   * parent, or radially from center for a repo root), rotated into the node's own slice of
-   * the parent's outward-facing arc. The result is that a parent's child directories fan
-   * across a wedge that faces away from the center, each subtree owning its own angular
-   * band, so branches grow outward and stop folding back over one another.
+   * A gentle outward bias on directories (files are satellites and skip it): a soft, constant-
+   * magnitude nudge pointing directly away from the center, so a branch keeps growing away from
+   * the trunk and never collapses inward or folds back over the center. This is deliberately a
+   * *weak* push, far softer than the old rigid wedge-target pull: it only keeps the tree growing
+   * outward while the collision, the sibling-count rest length, and the springs do the real
+   * organizing as the nodes settle themselves. There is no per-sibling target angle anymore, so
+   * the layout is emergent rather than snapped onto a radial grid.
    *
-   * This is a *soft* pull (its own gentle stiffness, separate from the edge spring) layered
-   * on top of the spring + repulsion, so the springy, always-settling feel is preserved: it
-   * biases where a branch wants to sit without rigidly snapping it to a radial grid.
+   * The bias is scaled by the spring stiffness and rest length so it stays in proportion to the
+   * spring no matter how the forest is tuned: `outwardBias` is the fraction of a unit spring's
+   * pull it contributes. A directory sitting exactly on the center (no defined outward direction)
+   * gets no bias that frame; the spawn nudge and the spring move it off-center first.
    */
-  private applyDirectionalGrowth(forces: Map<string, Vec2>): void {
+  private applyOutwardBias(forces: Map<string, Vec2>): void {
+    const center = this.options.center
     for (const [ path, force ] of forces) {
       const meta = this.metaByPath.get(path)
       if (!meta || meta.isFile) {
-        // Files are satellites of their directory; they get no outward spread, only the
-        // short edge spring and file-sibling repulsion. Directories form the skeleton.
-        continue
-      }
-
-      const target = this.outwardTargetFor(path, meta)
-      if (!target) {
         continue
       }
 
       const body = this.bodies.get(path)!
-      force.x += (target.x - body.position.x) * this.options.directionalStrength
-      force.y += (target.y - body.position.y) * this.options.directionalStrength
+      const offsetX = body.position.x - center.x
+      const offsetY = body.position.y - center.y
+      const distance = Math.hypot(offsetX, offsetY)
+      if (distance < EPSILON) {
+        // On the center exactly: no outward direction yet. The spring + spawn nudge move it off
+        // first, then the bias kicks in next frame.
+        continue
+      }
+
+      // A soft outward push proportional to the spring scale, so branches grow away from the
+      // trunk without the rigid snap of a wedge target.
+      const magnitude = this.options.outwardBias * this.options.springStiffness * this.options.restLength
+      force.x += (offsetX / distance) * magnitude
+      force.y += (offsetY / distance) * magnitude
     }
   }
 
   /**
-   * The point a directory "wants" to sit at: one rest length out from its parent, along the
-   * parent's outward direction, rotated into this node's slice of the parent's outward arc.
-   * Returns `null` when the parent has no live body yet (e.g. a repo root whose forest-root
-   * parent is undrawn), in which case the directional force is simply skipped this frame and
-   * the radial spawn + edge spring still arrange it around the center.
-   */
-  private outwardTargetFor(path: string, meta: NodeMeta): Vec2 | null {
-    const parentBody = this.bodies.get(meta.displayParentPath)
-    if (!parentBody) {
-      return null
-    }
-
-    const outward = this.outwardDirectionFor(meta, parentBody.position)
-    const wedgeOffset = siblingWedgeOffset(meta.wedge, this.options.siblingArc)
-    const angle = Math.atan2(outward.y, outward.x) + wedgeOffset
-    const restLength = this.restLengthFor(meta)
-
-    return {
-      x: parentBody.position.x + Math.cos(angle) * restLength,
-      y: parentBody.position.y + Math.sin(angle) * restLength,
-    }
-  }
-
-  /**
-   * A directory's outward unit direction: grandparent -> parent (Gource's
-   * `parent_edge_normal`), so a branch keeps growing the way it already pointed and away
-   * from the center. A repo root has no live grandparent (its parent is the undrawn forest
-   * center), so its outward direction is radial: center -> parent. When the parent sits
-   * exactly on its own anchor (a fresh spawn, no separation yet) we fall back to a stable
-   * per-path hash direction so the target is always well-defined.
-   */
-  private outwardDirectionFor(meta: NodeMeta, parentPosition: Vec2): Vec2 {
-    const grandparentPath = this.metaByPath.get(meta.displayParentPath)?.displayParentPath
-    const grandparentBody = grandparentPath !== undefined ? this.bodies.get(grandparentPath) : undefined
-    const grandparentPosition = grandparentBody ? grandparentBody.position : this.options.center
-
-    // When parent and grandparent coincide (a fresh spawn, no separation yet) fall back to a
-    // stable outward ray hashed from the parent path, so siblings still fan deterministically
-    // rather than stacking on one point.
-    const fallbackAngle = (hashPath(meta.displayParentPath) / 0xffffffff) * Math.PI * 2
-    const fallback = { x: Math.cos(fallbackAngle), y: Math.sin(fallbackAngle) }
-    return outwardDirection(parentPosition, grandparentPosition, fallback)
-  }
-
-  /**
-   * The rest length for a node: short and flat for a file (a tight satellite radius around
-   * its directory) or depth-scaled for a directory (deeper rings sit further out so the
-   * forest fans rather than crowding the trunk). An un-tracked node (no metadata) falls
-   * back to the base directory rest length.
+   * The rest length for a node: short and flat for a file (a tight satellite radius around its
+   * directory) or, for a directory, scaled by BOTH its depth and how many siblings share its
+   * ring.
+   *
+   * - **Depth**: deeper rings sit progressively further out so the forest fans rather than
+   *   crowding the trunk (the `1 + (depth - 1) * restLengthDepthScale` factor).
+   * - **Sibling count**: the headline of this rework. A ring at radius `R` has circumference
+   *   `2*pi*R`; to seat `n` sibling directories of diameter `d` around it without overlap that
+   *   circumference must be at least `n * (d + margin)`, i.e. `R >= n * (d + margin) / (2*pi)`.
+   *   So the rest length grows linearly with the sibling count: a parent with many children
+   *   pushes its ring outward to where there is room for all of them, while a lone child stays at
+   *   the base rest length. {@link siblingRestScale} tempers how aggressively the ring widens
+   *   (1 = the full geometric requirement; lower packs the ring tighter and leans on collision).
+   *
+   * An un-tracked node (no metadata) falls back to the base directory rest length.
    */
   private restLengthFor(meta: NodeMeta | undefined): number {
     if (meta?.isFile) {
       return this.options.fileRestLength
     }
     const depth = meta?.depth ?? 1
-    return this.options.restLength * (1 + Math.max(0, depth - 1) * this.options.restLengthDepthScale)
+    const depthFactor = 1 + Math.max(0, depth - 1) * this.options.restLengthDepthScale
+    const base = this.options.restLength * depthFactor
+
+    // The ring radius that gives the whole sibling group room: enough circumference at the ring
+    // to seat every sibling's collision diameter plus its margin. `siblingRestScale` dials how
+    // much of that full geometric requirement is honored by the spring vs left to collision.
+    const siblingCount = meta?.siblingCount ?? 1
+    const siblingDiameter = ((meta?.collisionRadius ?? this.options.directoryRadius) * 2) + this.options.collisionMargin
+    const ringRadiusForSiblings = (siblingCount * siblingDiameter) / (2 * Math.PI)
+    const siblingFloor = ringRadiusForSiblings * this.options.siblingRestScale
+
+    // Take whichever is larger: the base depth ring, or the radius the sibling group needs. A
+    // lone child keeps the base; a crowded ring is pushed outward to fit everyone.
+    return Math.max(base, siblingFloor)
   }
 
   /**
-   * Repulsion. Two distinct regimes, mirroring Gource:
+   * Real size-aware collision: the no-overlap force. Over the uniform {@link buildSpatialGrid},
+   * every pair of nearby bodies that may collide is visited once and, when they penetrate (sit
+   * closer than the sum of their collision radii plus the margin), pushed apart in proportion to
+   * how deeply they overlap, so they settle touching-but-not-overlapping. Past that gap the force
+   * is exactly zero, so well-separated nodes feel nothing (no long-range shove that would fight
+   * the spring).
    *
-   * - **Directory <-> directory**: every directory pushes apart from every *nearby*
-   *   directory (within {@link ForceLayoutOptions.repulsionCutoff}), no matter their
-   *   parentage, so branches from different parents separate and stop crossing. Computed
-   *   over the uniform {@link buildSpatialGrid} for `O(n)` cost.
-   * - **File <-> file-sibling**: a file only repels the *other files of the same
-   *   directory*, at a gentler strength, so a directory's files spread into a tidy
-   *   satellite cluster without shoving the whole forest around. A file never repels a
-   *   directory or a file from another directory.
+   * Two regimes, mirroring Gource:
+   * - **Directory <-> directory**: every directory collides with every *nearby* directory, no
+   *   matter their parentage, so branches from different parents separate and never overlap.
+   * - **File**: a file collides with the *other files of the same directory* and with its own
+   *   directory, so a directory's files spread into a tidy non-overlapping satellite cluster that
+   *   stays hugging the directory, without a file ever shoving a stranger directory or a file
+   *   from another directory.
    *
-   * Each unordered pair is visited once (within a cell, only a right index past the left;
-   * across cells, each cross pair once via {@link buildSpatialGrid}'s forward neighbors)
-   * and the equal-and-opposite push applied to both, so the work is halved and forces stay
-   * symmetric. The pinned root is a repulsion *source* (nodes do not pile onto the center)
-   * but, being absent from `forces`, receives none itself.
+   * The pinned root is a collision *source* (nodes do not pile onto the center) but, being absent
+   * from `forces`, receives none itself.
    */
-  private applyRepulsion(forces: Map<string, Vec2>): void {
-    const cutoff = this.options.repulsionCutoff
-    const grid = buildSpatialGrid(this.bodies, cutoff)
-    const cutoffSquared = cutoff * cutoff
+  private applyCollision(forces: Map<string, Vec2>): void {
+    const cellSize = this.collisionCellSize()
+    const grid = buildSpatialGrid(this.bodies, cellSize)
 
     for (const cell of grid.cells.values()) {
       for (const neighborCell of grid.neighborhoodOf(cell.cellX, cell.cellY)) {
@@ -407,9 +386,7 @@ export class ForceLayout {
         for (let leftIndex = 0; leftIndex < cell.members.length; leftIndex++) {
           const startRight = sameCell ? leftIndex + 1 : 0
           for (let rightIndex = startRight; rightIndex < neighborCell.members.length; rightIndex++) {
-            const left = cell.members[leftIndex]
-            const right = neighborCell.members[rightIndex]
-            this.repelPair(forces, left, right, cutoffSquared)
+            this.collidePair(forces, cell.members[leftIndex], neighborCell.members[rightIndex])
           }
         }
       }
@@ -417,65 +394,52 @@ export class ForceLayout {
   }
 
   /**
-   * Applies the symmetric repulsion between one pair of bodies, choosing the regime from
-   * what the two nodes are. A file only interacts with another file in the *same*
-   * directory (the satellite cluster); a pair that mixes a file with a directory, or two
-   * files from different directories, exerts no repulsion, so files never disturb the
-   * directory skeleton. Two directories use the global inverse-square push.
+   * Applies the symmetric collision separation between one pair of bodies, choosing the regime
+   * from what the two nodes are. A file only collides with another file in the *same* directory
+   * or with its own directory (the satellite cluster); a pair that mixes a file with a stranger
+   * directory, or two files from different directories, never collides, so files never disturb
+   * the directory skeleton. Two directories always collide.
+   *
+   * The push is penetration-based: with the two collision radii summed and the margin added, the
+   * force is `collisionStiffness * penetration` along the separating axis, so it grows the deeper
+   * the overlap and vanishes the instant they no longer overlap. That is what lets the pair
+   * settle exactly touching rather than oscillating or drifting through each other.
    */
-  private repelPair(
-    forces: Map<string, Vec2>,
-    left: GridBody,
-    right: GridBody,
-    cutoffSquared: number,
-  ): void {
+  private collidePair(forces: Map<string, Vec2>, left: GridBody, right: GridBody): void {
     const leftMeta = this.metaByPath.get(left.path)
     const rightMeta = this.metaByPath.get(right.path)
-    const leftIsFile = leftMeta?.isFile ?? false
-    const rightIsFile = rightMeta?.isFile ?? false
-
-    let strength: number
-    if (leftIsFile || rightIsFile) {
-      // Files only cluster-repel their own directory's other files; otherwise nothing, so
-      // a file never pushes a directory (or a stranger file) and stays a tight satellite.
-      const sameDirectory
-        = leftIsFile && rightIsFile && leftMeta!.displayParentPath === rightMeta!.displayParentPath
-      if (!sameDirectory) {
-        return
-      }
-      strength = this.options.fileRepulsionStrength
-    }
-    else {
-      strength = this.options.repulsionStrength
-    }
-    if (strength <= 0) {
+    if (!shouldCollide(left.path, leftMeta, right.path, rightMeta)) {
       return
     }
+
+    const leftRadius = leftMeta?.collisionRadius ?? this.options.directoryRadius
+    const rightRadius = rightMeta?.collisionRadius ?? this.options.directoryRadius
+    const minSeparation = leftRadius + rightRadius + this.options.collisionMargin
 
     let offsetX = left.position.x - right.position.x
     let offsetY = left.position.y - right.position.y
-    let distanceSquared = offsetX * offsetX + offsetY * offsetY
-    if (distanceSquared > cutoffSquared) {
-      // Beyond the cutoff the inverse-square force is negligible; skip it so a body only
-      // ever feels its genuine near neighbors (the whole point of the grid).
+    let distance = Math.hypot(offsetX, offsetY)
+    if (distance >= minSeparation) {
+      // No overlap: the collision force is exactly zero past the touch distance, so separated
+      // nodes feel nothing and the spring alone governs them.
       return
     }
 
-    let distance = Math.sqrt(distanceSquared)
-    if (distance < this.options.repulsionMinDistance) {
-      // Two near-coincident nodes: nudge them onto a deterministic axis from a hash of the
-      // pair so they separate the same way every run, never randomly, then clamp the
-      // distance so the inverse-square force stays finite.
+    if (distance < EPSILON) {
+      // Two near-coincident nodes: nudge them onto a deterministic axis from a hash of the pair
+      // so they separate the same way every run, never randomly, then treat them as fully
+      // penetrating so they shove apart hard.
       const nudge = pairNudge(left.path, right.path)
       offsetX = nudge.x
       offsetY = nudge.y
-      distance = this.options.repulsionMinDistance
-      distanceSquared = distance * distance
+      distance = EPSILON
     }
 
-    // Inverse-square magnitude so close nodes shove hard and ones near the cutoff barely
-    // interact, blending smoothly into the hard cutoff with no visible seam.
-    const magnitude = strength / distanceSquared
+    // Penetration depth: how far inside the touch distance they sit. The push is proportional to
+    // it, directed along the separating axis, so the deeper the overlap the firmer the shove and
+    // a just-touching pair feels almost nothing.
+    const penetration = minSeparation - distance
+    const magnitude = this.options.collisionStiffness * penetration
     const pushX = (offsetX / distance) * magnitude
     const pushY = (offsetY / distance) * magnitude
 
@@ -492,17 +456,33 @@ export class ForceLayout {
   }
 
   /**
+   * The spatial grid's cell side for collision: at least the largest collision diameter in the
+   * forest plus the margin, so any genuinely overlapping pair is guaranteed to land in the same
+   * cell or an adjacent one and is never missed by the nine-cell neighborhood test. Floored to a
+   * sane minimum so an empty or tiny forest still bins sensibly.
+   */
+  private collisionCellSize(): number {
+    let largestRadius = this.options.directoryRadius
+    for (const meta of this.metaByPath.values()) {
+      if (meta.collisionRadius > largestRadius) {
+        largestRadius = meta.collisionRadius
+      }
+    }
+    return Math.max(MIN_COLLISION_CELL_SIZE, largestRadius * 2 + this.options.collisionMargin)
+  }
+
+  /**
    * Semi-implicit Euler integration with velocity damping: advance each non-pinned body's
-   * velocity by its accumulated force, bleed off a fraction of that velocity so the system
-   * loses energy and settles, then move the position by the new velocity. Done in this
-   * order (velocity first, then position) because semi-implicit Euler stays stable at the
-   * variable, sometimes large time steps a RAF loop produces, where plain (explicit) Euler
-   * would gain energy and blow up.
+   * velocity by its accumulated force, bleed off a fraction of that velocity so the system loses
+   * energy and settles, then move the position by the new velocity. Done in this order (velocity
+   * first, then position) because semi-implicit Euler stays stable at the variable, sometimes
+   * large time steps a RAF loop produces, where plain (explicit) Euler would gain energy and
+   * blow up.
    */
   private integrate(forces: Map<string, Vec2>, deltaSeconds: number): void {
-    // Per-second damping converted to this step: velocity retains `(1 - damping)^dt` of
-    // itself, so the decay is framerate-independent (a long frame damps proportionally
-    // more than a short one) rather than tied to a fixed step count.
+    // Per-second damping converted to this step: velocity retains `(1 - damping)^dt` of itself,
+    // so the decay is framerate-independent (a long frame damps proportionally more than a short
+    // one) rather than tied to a fixed step count.
     const retained = Math.pow(1 - this.options.damping, deltaSeconds)
 
     for (const [ path, force ] of forces) {
@@ -515,218 +495,221 @@ export class ForceLayout {
   }
 
   /**
-   * Where a brand-new node should be born (Gource's `setInitialPosition`): at its
-   * display-parent's current position, nudged a small spawn offset *along its outward
-   * direction* so it emerges from the branch already pointing away from the center rather
-   * than in a random hash direction that might fold back inward. A small per-path hash jitter
-   * is mixed in so siblings born together fan out instead of stacking on one ray. Falls back
-   * to a radial nudge from the configured center when the display-parent has no body yet (a
-   * repo root hanging off the undrawn forest center).
+   * Where a brand-new node should be born (Gource's `setInitialPosition`): at its display-
+   * parent's current position, nudged a small spawn offset *outward* (directly away from the
+   * center) so it emerges from the branch already pointing away from the trunk rather than in a
+   * random direction that might fold back inward. A small per-path hash jitter is mixed in so
+   * siblings born together fan out instead of stacking on one ray, then drift and settle via
+   * collision. Falls back to a radial nudge from the configured center when the display-parent
+   * has no body yet (a repo root hanging off the undrawn forest center).
    */
   private spawnPositionFor(path: string, meta: NodeMeta): Vec2 {
     const parentBody = this.bodies.get(meta.displayParentPath)
     const anchor = parentBody ? parentBody.position : this.options.center
+    const center = this.options.center
 
-    let directionX: number
-    let directionY: number
-    if (parentBody) {
-      const outward = this.outwardDirectionFor(meta, parentBody.position)
-      // A small deterministic angular jitter off the outward ray so siblings spawned in the
-      // same frame separate rather than landing on the identical point.
-      const jitter = ((hashPath(path) / 0xffffffff) - 0.5) * SPAWN_JITTER_RADIANS
-      const angle = Math.atan2(outward.y, outward.x) + jitter
-      directionX = Math.cos(angle)
-      directionY = Math.sin(angle)
+    // The outward ray: directly away from the center through the parent (or the parent itself
+    // when it sits on the center). A stable per-path hash picks a ray when there is no outward
+    // direction yet, so siblings still fan deterministically rather than stacking.
+    let outwardX = anchor.x - center.x
+    let outwardY = anchor.y - center.y
+    const outwardLength = Math.hypot(outwardX, outwardY)
+    if (outwardLength < EPSILON) {
+      const fallbackAngle = (hashPath(path) / 0xffffffff) * Math.PI * 2
+      outwardX = Math.cos(fallbackAngle)
+      outwardY = Math.sin(fallbackAngle)
     }
     else {
-      // No live parent (repo root): a stable radial ray from the center, hashed per path.
-      const angle = (hashPath(path) / 0xffffffff) * Math.PI * 2
-      directionX = Math.cos(angle)
-      directionY = Math.sin(angle)
+      outwardX /= outwardLength
+      outwardY /= outwardLength
     }
 
+    // A small deterministic angular jitter off the outward ray so siblings spawned in the same
+    // frame separate rather than landing on the identical point, then let collision settle them.
+    const jitter = ((hashPath(path) / 0xffffffff) - 0.5) * SPAWN_JITTER_RADIANS
+    const baseAngle = Math.atan2(outwardY, outwardX) + jitter
+
     return {
-      x: anchor.x + directionX * this.options.spawnOffset,
-      y: anchor.y + directionY * this.options.spawnOffset,
+      x: anchor.x + Math.cos(baseAngle) * this.options.spawnOffset,
+      y: anchor.y + Math.sin(baseAngle) * this.options.spawnOffset,
     }
   }
 }
 
 /**
- * Per-node layout metadata the sim captures once per {@link ForceLayout.sync} and reads
- * every {@link ForceLayout.step}, so no force has to re-walk the tree. Keyed in
- * {@link ForceLayout} by the node's real path.
+ * Per-node layout metadata the sim captures once per {@link ForceLayout.sync} and reads every
+ * {@link ForceLayout.step}, so no force has to re-walk the tree. Keyed in {@link ForceLayout} by
+ * the node's real path.
  */
-type NodeMeta = {
+export type NodeMeta = {
   /** Path of the nearest visible ancestor; `''` for a repo root hanging off the forest center. */
   displayParentPath: string
   /** Whether the node is a file (a satellite of its directory) rather than a directory. */
   isFile: boolean
   /** The node's visible depth (1 for a repo root), used to scale the directory rest length. */
   depth: number
-  /** This node's slot among its directory-siblings, for fanning across the parent's outward arc. */
-  wedge: SiblingWedge
+  /**
+   * How many visible siblings of the SAME kind share this node's display-parent ring, so the
+   * rest length can widen the ring to fit them all. At least 1 (the node itself).
+   */
+  siblingCount: number
+  /**
+   * The node's collision radius, matched to its DRAWN size: captured from the steady base radius
+   * (never the transient touch pulse, so it stays stable), files smaller than directories.
+   */
+  collisionRadius: number
 }
 
 /**
- * A directory's slice of its parent's outward-facing arc: which of `count` sibling
- * directories this is (`index`), so {@link siblingWedgeOffset} can fan them evenly across
- * the arc. A lone child (`count: 1`) gets the exact outward direction (zero offset) so a
- * deep single-child chain grows straight out instead of drifting.
+ * Whether two bodies collide, given their paths and metadata. Two directories always collide (the
+ * global skeleton spread). Two files collide only when they are siblings of the SAME directory
+ * (one satellite cluster), so cross-directory files never interfere. A file and a directory
+ * collide only when the directory is the file's OWN parent (the file's `displayParentPath` equals
+ * the directory's path), so the file is held just outside its own directory disc and never
+ * overlaps it, yet never collides with a stranger directory it merely happens to sit near. Pure,
+ * so the regime choice is one easy-to-read place and the file-cluster invariant is enforced once.
  */
-export type SiblingWedge = {
-  index: number
-  count: number
+export function shouldCollide(
+  leftPath: string,
+  leftMeta: NodeMeta | undefined,
+  rightPath: string,
+  rightMeta: NodeMeta | undefined,
+): boolean {
+  const leftIsFile = leftMeta?.isFile ?? false
+  const rightIsFile = rightMeta?.isFile ?? false
+
+  if (!leftIsFile && !rightIsFile) {
+    return true
+  }
+  if (leftIsFile && rightIsFile) {
+    return leftMeta!.displayParentPath === rightMeta!.displayParentPath
+  }
+  // One file, one directory: collide only when the directory IS the file's own parent.
+  if (leftIsFile) {
+    return leftMeta!.displayParentPath === rightPath
+  }
+  return rightMeta!.displayParentPath === leftPath
 }
 
 /**
- * Assigns each *directory* a {@link SiblingWedge} slot among the directory-children of its
- * display-parent, so the directional force can fan siblings across the parent's outward arc
- * with each subtree owning its own wedge. Files are excluded (they are satellites, not part
- * of the spread) and so are never given a slot.
- *
- * Pure and deterministic: siblings are ordered by path (independent of Map/event order) so a
- * re-sync after a rewind reproduces the same wedge assignment. Mirrors Gource distributing a
- * parent's circumference among its visible child directories.
+ * Counts how many visible siblings of the same kind (directory or file) share each display-
+ * parent, keyed by {@link siblingKey}, so {@link ForceLayout.restLengthFor} can widen a crowded
+ * ring to seat them all. Directories and files are counted separately because they live on
+ * separate rings (files rest much closer in as satellites). Pure and deterministic so a re-sync
+ * after a rewind reproduces the same counts. Files and directories of the forest root are
+ * skipped (the root is not a body).
  */
-export function assignSiblingWedges(visibleNodes: VisibleNode[]): Map<string, SiblingWedge> {
-  const directoryChildrenByParent = new Map<string, string[]>()
+export function countSiblings(visibleNodes: VisibleNode[]): Map<string, number> {
+  const counts = new Map<string, number>()
   for (const visible of visibleNodes) {
-    if (visible.isForestRoot || visible.node.isFile) {
+    if (visible.isForestRoot) {
       continue
     }
-    const siblings = directoryChildrenByParent.get(visible.displayParentPath)
-    if (siblings) {
-      siblings.push(visible.node.path)
-    }
-    else {
-      directoryChildrenByParent.set(visible.displayParentPath, [ visible.node.path ])
-    }
+    const key = siblingKey(visible)
+    counts.set(key, (counts.get(key) ?? 0) + 1)
   }
-
-  const wedgeByPath = new Map<string, SiblingWedge>()
-  for (const siblings of directoryChildrenByParent.values()) {
-    const ordered = [ ...siblings ].sort((left, right) => {
-      return left < right ? -1 : left > right ? 1 : 0
-    })
-    for (const [ index, path ] of ordered.entries()) {
-      wedgeByPath.set(path, { index, count: ordered.length })
-    }
-  }
-  return wedgeByPath
+  return counts
 }
 
 /**
- * The angular offset (in radians) from the parent's outward direction that this sibling
- * should be biased toward, spreading `count` siblings evenly across an arc of total width
- * `arcWidth` centered on the outward direction. A lone child (`count <= 1`) gets `0` so it
- * grows straight outward; otherwise sibling `index` of `count` sits at its slice center,
- * from `-arcWidth/2` to `+arcWidth/2`. Pure, so it is directly unit-testable.
+ * The grouping key for {@link countSiblings}: a node's display-parent plus its kind, so a
+ * directory's directory-siblings and its file-siblings are counted as two separate rings. Pure.
  */
-export function siblingWedgeOffset(wedge: SiblingWedge, arcWidth: number): number {
-  if (wedge.count <= 1) {
-    return 0
-  }
-  const sliceWidth = arcWidth / wedge.count
-  const arcStart = -arcWidth / 2
-  // The slice center: half a slice in, then one slice per index, so the fan is symmetric
-  // about the outward direction (e.g. two siblings land at -arcWidth/4 and +arcWidth/4).
-  return arcStart + sliceWidth * (wedge.index + 0.5)
+function siblingKey(visible: VisibleNode): string {
+  const kind = visible.node.isFile ? 'file' : 'dir'
+  return `${kind}:${visible.displayParentPath}`
 }
 
 /**
- * The preferred outward unit direction for a node given its parent's and grandparent's
- * positions: grandparent -> parent, normalized (Gource's `parent_edge_normal`), so a branch
- * grows the way it already pointed and away from the center. Pass the configured `center` as
- * `grandparentPosition` for a repo root (its grandparent is the undrawn forest center), which
- * makes its outward direction radial: center -> parent. When parent and grandparent coincide
- * the direction is undefined; the caller supplies a `fallback` unit ray (a stable per-path
- * hash) so the result is always well-defined. Pure, so it is directly unit-testable.
+ * The collision radius for a visible node, matched to the size it is DRAWN at. It reads the
+ * node's *steady* base radius from {@link nodeHeat} (passing `now = 0`, which is irrelevant since
+ * the base radius depends only on the saturating touch importance, never recency), so the
+ * collision size is stable and never breathes with the transient touch pulse that animates the
+ * drawn disc. Files take {@link ForceLayoutOptions.fileRadius} of that base (smaller satellites);
+ * directories take {@link ForceLayoutOptions.directoryRadius} (a touch larger, the structural
+ * skeleton). Pure given the node + options, so it is directly unit-testable.
  */
-export function outwardDirection(
-  parentPosition: Vec2,
-  grandparentPosition: Vec2,
-  fallback: Vec2,
-): Vec2 {
-  const directionX = parentPosition.x - grandparentPosition.x
-  const directionY = parentPosition.y - grandparentPosition.y
-  const length = Math.hypot(directionX, directionY)
-  if (length < EPSILON) {
-    return fallback
-  }
-  return { x: directionX / length, y: directionY / length }
+export function collisionRadiusFor(visible: VisibleNode, options: Required<ForceLayoutOptions>): number {
+  // The steady drawn base radius: depends only on the node's touch importance (a saturating bump),
+  // not on `now`, so any time argument yields the same value. This is exactly the resting disc
+  // size the renderer draws before the transient touch pulse swells it.
+  const baseRadius = nodeHeat(visible.node, 0).radius
+  const kindScale = visible.node.isFile ? options.fileRadius : options.directoryRadius
+  return baseRadius * kindScale
 }
 
 /**
- * Tuning for {@link ForceLayout}. Every field has a sensible default, so the common
- * construction is `new ForceLayout()`. These are the knobs the user will reach for to make
- * the forest feel livelier or calmer, or to trade tightness against spread.
+ * Tuning for {@link ForceLayout}. Every field has a sensible default, so the common construction
+ * is `new ForceLayout()`. These are the knobs the user reaches for to make the forest feel
+ * livelier or calmer, or to trade tightness against spread.
  */
 export type ForceLayoutOptions = {
   /** Layout-space center the forest root is pinned at and stray repo roots are drawn toward. Defaults to the origin. */
   center?: Vec2
-  /** Rest length of a depth-1 directory edge (repo root to center) in layout units. Deeper edges scale up from this. */
+  /**
+   * Rest length of a depth-1 directory edge (repo root to center) in layout units. Deeper and
+   * more-crowded rings scale up from this.
+   */
   restLength?: number
   /**
-   * How much the directory rest length grows per visible depth past the first ring, as a
-   * fraction of {@link restLength}. `0.5` makes a depth-3 directory rest twice as far from
-   * its parent as a depth-1 one, so deeper rings spread instead of crowding the trunk.
+   * How much the directory rest length grows per visible depth past the first ring, as a fraction
+   * of {@link restLength}. `0.35` makes a depth-3 directory rest ~70% further from its parent than
+   * a depth-1 one, so deeper rings spread instead of crowding the trunk.
    */
   restLengthDepthScale?: number
+  /**
+   * How aggressively a parent's ring widens to fit its children: the fraction of the full
+   * geometric "enough circumference to seat every sibling's diameter" radius that the spring
+   * honors. `1` widens the ring to the exact no-overlap circumference; lower packs the ring
+   * tighter and leans more on collision to finish separating siblings. This is the knob behind
+   * "six children sit on a wider ring than one child".
+   */
+  siblingRestScale?: number
   /** Edge-spring stiffness: how hard a node is pulled to its rest length from its parent. */
   springStiffness?: number
   /**
-   * Strength of the outward directional pull on directories (Gource's outward-arc force):
-   * how firmly a directory is biased toward the point one rest length out from its parent
-   * along its wedge of the parent's outward direction. Higher gives a crisper radial,
-   * less-crossing tree; lower lets repulsion and the spring dominate for a looser look.
+   * Strength of the GENTLE outward bias on directories, as a fraction of a unit spring's pull.
+   * Just enough that branches grow away from the trunk and never collapse inward or fold back,
+   * but far softer than a rigid radial target so the layout stays fluid and emergent (the
+   * collision + sibling-count rest length + springs do the real organizing). Raise it for a
+   * crisper radial spread, lower for a looser, more clustered look. Set `0` for no outward bias
+   * at all (pure spring + collision).
    */
-  directionalStrength?: number
+  outwardBias?: number
   /**
-   * Total angular width (radians) of the arc a parent's child directories fan across,
-   * centered on the parent's outward direction. Wider lets many siblings spread without
-   * overlapping; narrower keeps a subtree tightly columnar. Kept below `PI` so children
-   * stay on the outward-facing half and never fold back toward the center.
-   */
-  siblingArc?: number
-  /**
-   * Rest length of a file's edge to its directory, in layout units. Much shorter than a
-   * directory edge so files hug their directory as a tight satellite cluster rather than
-   * spreading like a sub-tree.
+   * Rest length of a file's edge to its directory, in layout units. Much shorter than a directory
+   * edge so files hug their directory as a tight satellite cluster rather than spreading like a
+   * sub-tree.
    */
   fileRestLength?: number
   /**
-   * Repulsion strength among the files of one directory (the satellite-cluster spread).
-   * Gentler than the directory repulsion so a directory's files fan into a readable ring
-   * without shoving the directory skeleton around. Files only ever repel their own
-   * directory's other files.
+   * Collision stiffness: the force per unit of penetration depth when two bodies overlap. Firm
+   * enough that overlapping nodes shove apart promptly to touching, soft enough that they settle
+   * there without bouncing. This is the primary knob for "no overlap".
    */
-  fileRepulsionStrength?: number
+  collisionStiffness?: number
   /**
-   * Directory-to-directory repulsion strength: the numerator of the inverse-square push
-   * between any two nearby directories (within {@link repulsionCutoff}). Larger spreads the
-   * forest wider, separating branches more, before the springs rein them back in.
+   * Extra breathing room beyond the two collision radii, in layout units, before two nodes are
+   * considered touching. A small positive margin keeps a visible gap between discs and feeds the
+   * sibling-count ring sizing, so a crowded ring is widened to leave gaps, not just barely-
+   * kissing discs.
    */
-  repulsionStrength?: number
+  collisionMargin?: number
   /**
-   * The closest two nodes are treated as being for the repulsion force, in layout units.
-   * Clamps the inverse-square magnitude so near-coincident spawns get a strong but finite
-   * shove apart rather than an infinite one.
+   * Multiplier on a directory's steady drawn base radius to get its collision radius. `> 1` lets
+   * directories claim a little more space than their drawn disc (the structural skeleton), so
+   * branches keep a readable gap.
    */
-  repulsionMinDistance?: number
+  directoryRadius?: number
   /**
-   * The cutoff radius of the repulsion, in layout units: two nodes farther apart than this
-   * exert no repulsion on each other. It is also the spatial grid's cell side, so a body
-   * only ever tests the bodies in its own and the eight neighboring cells. Sized a few
-   * rest-lengths wide so a node pushes apart from the neighbors that would otherwise cross
-   * or overlap it, while letting distant branches ignore each other (which is both correct,
-   * the force is negligible there, and what keeps the grid cheap).
+   * Multiplier on a file's steady drawn base radius to get its collision radius. Smaller than
+   * {@link directoryRadius} so files pack into a tighter satellite cluster around their directory.
    */
-  repulsionCutoff?: number
+  fileRadius?: number
   /**
-   * Per-second velocity damping in `[0, 1)`: the fraction of a body's speed bled off each
-   * second. Higher settles faster (sluggish at the extreme); lower stays livelier and rings
-   * longer. Tuned so a new node's disturbance eases out over roughly one to two seconds.
+   * Per-second velocity damping in `[0, 1)`: the fraction of a body's speed bled off each second.
+   * Higher settles faster (sluggish at the extreme); lower stays livelier and rings longer. Tuned
+   * so a new node's disturbance eases out over roughly one to two seconds.
    */
   damping?: number
   /**
@@ -746,71 +729,75 @@ export type ForceLayoutOptions = {
 const EPSILON = 1e-6
 
 /**
- * Default rest length of a depth-1 directory edge, in layout units. Comparable to the old
- * radial `ringSpacing` so the forest reads at roughly the same scale.
+ * Default rest length of a depth-1 directory edge, in layout units. Comparable to the old radial
+ * `ringSpacing` so the forest reads at roughly the same scale.
  */
 const DEFAULT_REST_LENGTH = 120
 
-/** Default per-depth rest-length growth: a deeper directory edge rests half-again further out per ring. */
+/** Default per-depth rest-length growth: a deeper directory edge rests a third further out per ring. */
 const DEFAULT_REST_LENGTH_DEPTH_SCALE = 0.35
 
 /**
- * Default edge-spring stiffness. Firm enough to hold the skeleton together against the
- * global directory repulsion, soft enough to settle without ringing hard. The directional
- * pull below shares the spreading job, so this can stay moderate.
+ * Default sibling-count ring scaling: honor the full geometric no-overlap circumference. With
+ * margin folded into the per-sibling diameter, this seats a parent's children on a ring just wide
+ * enough that their collision discs fit around it with breathing room, so a six-child parent sits
+ * on a visibly wider ring than a one-child parent. Lower it to pack rings tighter.
+ */
+const DEFAULT_SIBLING_REST_SCALE = 1
+
+/**
+ * Default edge-spring stiffness. Firm enough to hold the skeleton together against the collision
+ * separation, soft enough to settle without ringing hard.
  */
 const DEFAULT_SPRING_STIFFNESS = 26
 
 /**
- * Default outward-directional strength (the anti-crossing pull). Sized so a directory
- * reliably settles into its outward wedge and branches stop folding back, while staying soft
- * enough that the spring + repulsion keep the motion springy rather than snapping nodes onto
- * a rigid radial grid. This is the primary knob for "more organized" vs "looser".
+ * Default outward bias (the gentle anti-collapse push), as a fraction of a unit spring's pull. A
+ * small value: enough that branches keep growing away from the trunk and never fold back, while
+ * staying soft so the collision + sibling rest length + springs do the real organizing and the
+ * motion stays fluid rather than snapping onto a radial grid. This is the primary knob for "more
+ * directional" vs "looser / more emergent".
  */
-const DEFAULT_DIRECTIONAL_STRENGTH = 12
-
-/**
- * Default sibling arc width, in radians (~150 degrees). A parent's child directories fan
- * across this much of the circle centered on the outward direction. Below `PI` so children
- * stay on the outward-facing half and never fold back toward the center, but wide enough that
- * a parent with many child directories spreads them without piling up.
- */
-const DEFAULT_SIBLING_ARC = (5 / 6) * Math.PI
+const DEFAULT_OUTWARD_BIAS = 0.18
 
 /**
  * Default file rest length, in layout units: well under a directory's {@link DEFAULT_REST_LENGTH}
- * so files orbit close to their directory as a tight satellite cluster rather than spreading
- * like a sub-tree.
+ * so files orbit close to their directory as a tight satellite cluster rather than spreading like
+ * a sub-tree.
  */
 const DEFAULT_FILE_REST_LENGTH = 40
 
 /**
- * Default file-sibling repulsion strength. Much gentler than the directory repulsion so a
- * directory's files fan into a readable little ring around it without disturbing the spread.
+ * Default collision stiffness: the force per unit of penetration depth. Sized well above the
+ * spring stiffness so an overlap is resolved firmly (overlapping nodes shove apart to touching
+ * promptly) while the penetration-proportional falloff lets them settle exactly touching without
+ * bouncing through each other.
  */
-const DEFAULT_FILE_REPULSION_STRENGTH = 6_000
+const DEFAULT_COLLISION_STIFFNESS = 240
 
 /**
- * Default directory-to-directory repulsion strength (the inverse-square numerator). Sized so
- * different branches separate cleanly and stop crossing while the springs and the directional
- * pull still rein the tree in; raise it for an airier forest, lower for denser.
+ * Default collision margin, in layout units: a small gap kept between two discs beyond their radii
+ * so the forest reads as separated orbs with breathing room rather than barely-kissing discs, and
+ * so the sibling-count ring sizing leaves room around a crowded ring.
  */
-const DEFAULT_REPULSION_STRENGTH = 38_000
-
-/** Default minimum repulsion distance, so two near-coincident spawns shove apart finitely. */
-const DEFAULT_REPULSION_MIN_DISTANCE = 8
+const DEFAULT_COLLISION_MARGIN = 10
 
 /**
- * Default repulsion cutoff / grid cell side, in layout units. About two-and-a-half depth-1
- * rest-lengths wide, so a node repels the neighbors close enough to cross or overlap it yet
- * ignores branches that are comfortably far. Doubles as the spatial grid's cell size.
+ * Default directory collision-radius multiplier on the drawn base radius. A touch above 1 so a
+ * directory claims slightly more than its drawn disc, keeping a readable gap between branches.
  */
-const DEFAULT_REPULSION_CUTOFF = 300
+const DEFAULT_DIRECTORY_RADIUS = 1.6
 
 /**
- * Default per-second damping: a body bleeds ~90% of its speed per second (retaining ~10%),
- * so the forest settles in the one-to-two-second range the user asked for: lively, not
- * sluggish, and without a long ringing tail.
+ * Default file collision-radius multiplier on the drawn base radius. Below the directory factor so
+ * files pack into a tighter satellite cluster around their directory without overlapping.
+ */
+const DEFAULT_FILE_RADIUS = 1.1
+
+/**
+ * Default per-second damping: a body bleeds ~90% of its speed per second (retaining ~10%), so the
+ * forest settles in the one-to-two-second range the user asked for: lively, not sluggish, and
+ * without a long ringing tail.
  */
 const DEFAULT_DAMPING = 0.90
 
@@ -821,17 +808,23 @@ const DEFAULT_MAX_STEP_MS = 50
 const DEFAULT_SPAWN_OFFSET = 12
 
 /**
- * The total angular jitter (radians) a freshly spawned node's outward ray is randomized
- * within, so siblings born in the same frame separate slightly instead of landing on one
- * point. Kept small so the spawn still clearly points outward.
+ * The smallest the collision spatial-grid cell may be, in layout units, so an empty or tiny forest
+ * still bins into sensible cells rather than degenerate one-unit buckets.
+ */
+const MIN_COLLISION_CELL_SIZE = 32
+
+/**
+ * The total angular jitter (radians) a freshly spawned node's outward ray is randomized within, so
+ * siblings born in the same frame separate slightly instead of landing on one point, then drift
+ * apart via collision. Kept small so the spawn still clearly points outward.
  */
 const SPAWN_JITTER_RADIANS = Math.PI / 6
 
 /**
- * A deterministic unit-ish separation axis for two coincident nodes, from a hash of their
- * combined paths. So two nodes landing on the exact same point always push apart along the
- * same direction (never a random one), keeping a re-sync after a rewind reproducible.
- * Order-independent so the pair yields the same axis whichever way it is iterated.
+ * A deterministic unit-ish separation axis for two coincident nodes, from a hash of their combined
+ * paths. So two nodes landing on the exact same point always push apart along the same direction
+ * (never a random one), keeping a re-sync after a rewind reproducible. Order-independent so the
+ * pair yields the same axis whichever way it is iterated.
  */
 function pairNudge(leftPath: string, rightPath: string): Vec2 {
   const combined = leftPath < rightPath ? `${leftPath} ${rightPath}` : `${rightPath} ${leftPath}`
@@ -857,9 +850,9 @@ export type GridBody = {
 }
 
 /**
- * One occupied cell of the {@link SpatialGrid}: its integer grid coordinates and the bodies
- * that hashed into it. Empty cells are never materialized, so the grid's size is bounded by
- * the number of *occupied* cells, not the (possibly vast) span of the forest.
+ * One occupied cell of the {@link SpatialGrid}: its integer grid coordinates and the bodies that
+ * hashed into it. Empty cells are never materialized, so the grid's size is bounded by the number
+ * of *occupied* cells, not the (possibly vast) span of the forest.
  */
 export type GridCell = {
   cellX: number
@@ -868,36 +861,36 @@ export type GridCell = {
 }
 
 /**
- * A uniform-bucket spatial index over the live bodies, the backbone of the `O(n)` repulsion.
- * Every body is binned into a square cell of side `cellSize` (the repulsion cutoff), so two
- * bodies that could repel each other (within the cutoff) are guaranteed to share a cell or
- * sit in adjacent cells. The repulsion then only has to test a body against the bodies in its
- * own and the eight neighboring cells.
+ * A uniform-bucket spatial index over the live bodies, the backbone of the `O(n)` collision. Every
+ * body is binned into a square cell of side `cellSize` (at least the largest collision diameter
+ * plus the margin), so two bodies that could collide are guaranteed to share a cell or sit in
+ * adjacent cells. The collision then only has to test a body against the bodies in its own and the
+ * eight neighboring cells.
  *
- * {@link neighborhoodOf} is the careful part: it yields, for a given cell, that cell itself
- * plus only the neighbor cells on the "greater" side, so iterating every cell and its
- * neighborhood visits each unordered cell-pair exactly once.
+ * {@link neighborhoodOf} is the careful part: it yields, for a given cell, that cell itself plus
+ * only the neighbor cells on the "greater" side, so iterating every cell and its neighborhood
+ * visits each unordered cell-pair exactly once.
  */
 export type SpatialGrid = {
   /** The occupied cells, keyed by a packed `cellX,cellY` string. */
   cells: Map<string, GridCell>
   /**
-   * The cell itself plus its forward-side neighbors, chosen so iterating all cells and each
-   * one's neighborhood touches every unordered cell-pair exactly once. The own cell is
-   * yielded first so the caller can special-case the within-cell pairing.
+   * The cell itself plus its forward-side neighbors, chosen so iterating all cells and each one's
+   * neighborhood touches every unordered cell-pair exactly once. The own cell is yielded first so
+   * the caller can special-case the within-cell pairing.
    */
   neighborhoodOf: (cellX: number, cellY: number) => GridCell[]
 }
 
 /**
- * Bins `bodies` into a uniform spatial grid of cell side `cellSize` for the repulsion pass.
- * Pure (no time, no randomness, no mutation of the inputs) and so directly unit-testable: the
- * same bodies + cell size always yield the same buckets and neighborhoods.
+ * Bins `bodies` into a uniform spatial grid of cell side `cellSize` for the collision pass. Pure
+ * (no time, no randomness, no mutation of the inputs) and so directly unit-testable: the same
+ * bodies + cell size always yield the same buckets and neighborhoods.
  *
- * A non-finite or non-positive `cellSize` is a programming error upstream; we log and floor
- * it to `1` rather than divide by it and scatter every body into nonsense cells.
+ * A non-finite or non-positive `cellSize` is a programming error upstream; we log and floor it to
+ * `1` rather than divide by it and scatter every body into nonsense cells.
  *
- * The eight forward neighbor offsets are chosen so that, combined with the own cell, iterating
+ * The four forward neighbor offsets are chosen so that, combined with the own cell, iterating
  * every cell's neighborhood enumerates each unordered cell-pair once (the lower-keyed cell of a
  * pair owns the edge to the higher-keyed one). See {@link FORWARD_NEIGHBOR_OFFSETS}.
  */
@@ -925,8 +918,8 @@ export function buildSpatialGrid(bodies: Map<string, NodePhysics>, cellSize: num
   const neighborhoodOf = (cellX: number, cellY: number): GridCell[] => {
     const ownKey = `${cellX},${cellY}`
     const own = cells.get(ownKey)
-    // The own cell is always present when called from the repulsion loop (we iterate the
-    // grid's own cells), but guard anyway so a stray coordinate never throws.
+    // The own cell is always present when called from the collision loop (we iterate the grid's
+    // own cells), but guard anyway so a stray coordinate never throws.
     const neighborhood: GridCell[] = own ? [ own ] : []
     for (const offset of FORWARD_NEIGHBOR_OFFSETS) {
       const neighbor = cells.get(`${cellX + offset.x},${cellY + offset.y}`)
@@ -942,10 +935,10 @@ export function buildSpatialGrid(bodies: Map<string, NodePhysics>, cellSize: num
 
 /**
  * The four forward neighbor offsets that, paired with each cell's own bucket, let a sweep over
- * every cell's neighborhood visit each adjacent cell-pair exactly once. Of the eight
- * surrounding cells we take only the four on the "greater" side (right, and the three on the
- * row above): the opposite four are covered when *those* cells are the iteration's current
- * cell. This halves the cross-cell work and keeps each repulsion force counted a single time.
+ * every cell's neighborhood visit each adjacent cell-pair exactly once. Of the eight surrounding
+ * cells we take only the four on the "greater" side (right, and the three on the row above): the
+ * opposite four are covered when *those* cells are the iteration's current cell. This halves the
+ * cross-cell work and keeps each collision force counted a single time.
  */
 const FORWARD_NEIGHBOR_OFFSETS = [
   { x: 1, y: 0 },
