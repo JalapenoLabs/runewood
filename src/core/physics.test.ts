@@ -17,6 +17,8 @@ import {
   fanSpreadForces,
   antiFoldbackForce,
   untangleGroupForces,
+  clampSpeed,
+  zoomImpulse,
 } from './physics'
 
 /**
@@ -102,6 +104,7 @@ function defaultedOptions(overrides: ForceLayoutOptions = {}): Required<ForceLay
     damping: 0.9,
     maxStepMs: 50,
     spawnOffset: 12,
+    wobbleMaxSpeed: 220,
     ...overrides,
   }
 }
@@ -851,5 +854,117 @@ describe('untangleGroupForces', () => {
     expect(forces[0].x).toBeGreaterThan(0)
     expect(forces[1].x).toBeGreaterThan(0)
     expect(Math.sign(forces[0].y)).not.toBe(Math.sign(forces[1].y))
+  })
+})
+
+describe('clampSpeed', () => {
+  it('passes a vector under the cap through unchanged', () => {
+    // Magnitude 5 < cap 10, so the gesture's full kick is imparted as-is.
+    expect(clampSpeed({ x: 3, y: 4 }, 10)).toEqual({ x: 3, y: 4 })
+  })
+
+  it('clamps a vector over the cap to the cap magnitude, preserving its direction', () => {
+    // Magnitude 10, capped to 5: the (3, 4)/5 direction is kept while each component halves.
+    const result = clampSpeed({ x: 6, y: 8 }, 5)
+    expect(Math.hypot(result.x, result.y)).toBeCloseTo(5, 10)
+    expect(result.x).toBeCloseTo(3, 10)
+    expect(result.y).toBeCloseTo(4, 10)
+  })
+
+  it('returns a zero kick for a non-finite component (a NaN delta upstream)', () => {
+    expect(clampSpeed({ x: Number.NaN, y: 1 }, 10)).toEqual({ x: 0, y: 0 })
+    expect(clampSpeed({ x: 1, y: Number.POSITIVE_INFINITY }, 10)).toEqual({ x: 0, y: 0 })
+  })
+
+  it('returns a zero kick for a non-positive cap', () => {
+    expect(clampSpeed({ x: 3, y: 4 }, 0)).toEqual({ x: 0, y: 0 })
+    expect(clampSpeed({ x: 3, y: 4 }, -5)).toEqual({ x: 0, y: 0 })
+  })
+})
+
+describe('zoomImpulse', () => {
+  it('pushes the forest outward (away from the anchor) when zooming in', () => {
+    // The center sits to the +x of the anchor (offset (10, 0)); zooming in (factor 2) must kick the
+    // nodes the OTHER way, in -x, away from the anchor, so they spring back outward.
+    const impulse = zoomImpulse({ x: 10, y: 0 }, 2, 1)
+    expect(impulse.x).toBeLessThan(0)
+    expect(impulse.y).toBeCloseTo(0, 10)
+  })
+
+  it('pulls the forest inward (toward the center) when zooming out', () => {
+    // Same geometry, zooming out (factor 0.5) flips the sign: the kick points toward +x (the center).
+    const impulse = zoomImpulse({ x: 10, y: 0 }, 0.5, 1)
+    expect(impulse.x).toBeGreaterThan(0)
+    expect(impulse.y).toBeCloseTo(0, 10)
+  })
+
+  it('scales with the size of the zoom step (a hard zoom kicks harder than a gentle one)', () => {
+    const gentle = zoomImpulse({ x: 10, y: 0 }, 1.1, 1)
+    const hard = zoomImpulse({ x: 10, y: 0 }, 4, 1)
+    expect(Math.abs(hard.x)).toBeGreaterThan(Math.abs(gentle.x))
+  })
+
+  it('returns a zero impulse when the anchor sits on the center (no radial direction)', () => {
+    expect(zoomImpulse({ x: 0, y: 0 }, 2, 1)).toEqual({ x: 0, y: 0 })
+  })
+
+  it('returns a zero impulse for a unit or non-positive factor', () => {
+    expect(zoomImpulse({ x: 10, y: 0 }, 1, 1)).toEqual({ x: 0, y: 0 })
+    expect(zoomImpulse({ x: 10, y: 0 }, 0, 1)).toEqual({ x: 0, y: 0 })
+    expect(zoomImpulse({ x: 10, y: 0 }, -2, 1)).toEqual({ x: 0, y: 0 })
+  })
+})
+
+describe('ForceLayout.applyImpulse', () => {
+  it('adds the kick velocity to every non-pinned body and leaves the pinned root untouched', () => {
+    const layout = new ForceLayout()
+    layout.sync([ rootVisible(), dir('api', '', 1), dir('docs', '', 1) ])
+
+    layout.applyImpulse({ x: 5, y: -3 })
+
+    // The pinned root is held at the center and never integrated, so it must carry no velocity.
+    expect(layout.state.get('')!.velocity).toEqual({ x: 0, y: 0 })
+    // Every non-pinned body, all starting at rest, gained exactly the kick.
+    expect(layout.state.get('api')!.velocity).toEqual({ x: 5, y: -3 })
+    expect(layout.state.get('docs')!.velocity).toEqual({ x: 5, y: -3 })
+  })
+
+  it('caps the imparted velocity at wobbleMaxSpeed so a fast gesture cannot blow up the sim', () => {
+    const layout = new ForceLayout({ wobbleMaxSpeed: 10 })
+    layout.sync([ dir('api', '', 1) ])
+
+    // A requested kick of magnitude 100 along +x must saturate at the cap of 10.
+    layout.applyImpulse({ x: 100, y: 0 })
+
+    const velocity = layout.state.get('api')!.velocity
+    expect(Math.hypot(velocity.x, velocity.y)).toBeCloseTo(10, 10)
+    expect(velocity.x).toBeCloseTo(10, 10)
+  })
+
+  it('settles back to rest after a kick (the springs + damping decay the wobble)', () => {
+    const layout = new ForceLayout()
+    layout.sync([ rootVisible(), dir('api', '', 1), dir('docs', '', 1) ])
+    // Let the spawn arrangement settle first so the only energy measured is the kick's.
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+
+    layout.applyImpulse({ x: 80, y: 80 })
+    const energyRightAfterKick = totalKineticEnergy(layout)
+    expect(energyRightAfterKick).toBeGreaterThan(0)
+
+    // A couple of seconds of stepping must bleed the kick's energy away to a small fraction.
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+    const energyAfterSettling = totalKineticEnergy(layout)
+    expect(energyAfterSettling).toBeLessThan(energyRightAfterKick * 0.05)
+  })
+
+  it('is a no-op for a zero or non-finite impulse', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('api', '', 1) ])
+
+    layout.applyImpulse({ x: 0, y: 0 })
+    expect(layout.state.get('api')!.velocity).toEqual({ x: 0, y: 0 })
+
+    layout.applyImpulse({ x: Number.NaN, y: 0 })
+    expect(layout.state.get('api')!.velocity).toEqual({ x: 0, y: 0 })
   })
 })

@@ -11,9 +11,9 @@ import { colorForActor } from '../core/theme'
  * the file it just touched. This module is the pure, forward-only *visual* model
  * behind that effect. It owns a fixed pool of beams and, given spawns and a
  * playhead time, reports exactly which beams are alive, how wide and bright they are
- * right now, and what color. A backend draws each as a soft additive tapered triangle
- * (wide and bright at the actor, narrowing to the file); nothing here touches pixi,
- * the DOM, the clock, or randomness.
+ * right now, and what color. A backend draws each as a soft, blurred additive cone whose
+ * point sits at the actor and whose wide base fans out onto the file (a flashlight cone
+ * hitting it); nothing here touches pixi, the DOM, the clock, or randomness.
  *
  * ### Live endpoints (the "beams point at the middle and miss" fix)
  *
@@ -270,7 +270,7 @@ type Beam = {
   /** The touched-file path the beam reaches, or `null` for an actor-local pulse. */
   targetPath: string | null
   color: Hsl
-  /** Peak width at the source end, in layout units, before the lifetime fade. */
+  /** Peak width at the target (file) end, in layout units, before the lifetime fade. */
   width: number
 }
 
@@ -281,13 +281,13 @@ type Beam = {
  * `color`. Returned by {@link BeamField.activeBeams}.
  */
 export type ActiveBeam = {
-  /** The actor end of the beam (wide), the actor's live orb position. */
+  /** The actor end of the beam (the cone's point), the actor's live orb position. */
   source: Vec2
-  /** The touched-file end of the beam (the taper's point), the node's live position. */
+  /** The touched-file end of the beam (the cone's wide base), the node's live position. */
   target: Vec2
   /** Presence opacity, `0..1`, fading to 0 by end of life. */
   alpha: number
-  /** Current width at the source end in layout units, thinning toward 0 by end of life. */
+  /** Current width at the target (file) end in layout units, thinning toward 0 by end of life. */
   width: number
   color: Hsl
 }
@@ -313,7 +313,7 @@ export type BeamFieldOptions = {
   capacity?: number
   /** How long a beam lives from its birth, in milliseconds. */
   lifetimeMs?: number
-  /** Peak width at the source (actor) end at birth, in layout units. */
+  /** Peak width at the target (file) end at birth, in layout units. */
   beamWidth?: number
   /** How far a pulse flash reaches off the actor, in layout units. */
   pulseRadius?: number
@@ -330,8 +330,8 @@ const DEFAULT_CAPACITY = 512
 const DEFAULT_LIFETIME_MS = 800
 // Now that actors rest just outside their files, a beam is SHORT (orb to adjacent
 // file). The old wider 14 read as a fat wedge over that short span (and the additive
-// glow layers widen it further still), so the source-end width is trimmed to a slimmer
-// value that reads as a crisp light pulse narrowing onto the file rather than a bar.
+// glow layers widen it further still), so the file-end width is trimmed to a slimmer
+// value that reads as a soft light cone fanning onto the file rather than a bar.
 const DEFAULT_BEAM_WIDTH = 8
 const DEFAULT_PULSE_RADIUS = 26
 const DEFAULT_ACTION_TINT = 0.5

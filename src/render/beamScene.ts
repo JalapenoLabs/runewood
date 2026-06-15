@@ -8,7 +8,7 @@ import type { ActorActivity, ActorVisualOptions } from './actors'
 import type { ActorMotionOptions } from './actorMotion'
 
 // Core
-import { Graphics } from 'pixi.js'
+import { BlurFilter, Graphics } from 'pixi.js'
 
 import { hslToRgbInt } from './color'
 import { BeamField } from './beams'
@@ -28,12 +28,14 @@ import { ActorMotion } from './actorMotion'
  *
  * Two kinds of thing live here, both additively blended for a glow that reads
  * above the forest:
- * - **beams**: the brief tapered flashlight pulses flung from actors to touched
- *   files, drawn from the {@link BeamField}'s active set into one pooled `Graphics`
- *   cleared and refilled each frame. Each beam's endpoints are resolved LIVE every
- *   frame (see below): its source is the firing actor's live eased orb position and
- *   its target is the touched node's live physics position, so the beam flies from the
- *   contributor's orb to the actual file node and tracks it as the sim migrates it.
+ * - **beams**: the brief, soft flashlight cones flung from actors to touched files,
+ *   drawn from the {@link BeamField}'s active set into one pooled `Graphics` cleared
+ *   and refilled each frame, then blurred into a fuzzy glow. The cone's single point
+ *   sits at the actor and it fans out onto the file, like a flashlight hitting it. Each
+ *   beam's endpoints are resolved LIVE every frame (see below): its source is the firing
+ *   actor's live eased orb position and its target is the touched node's live physics
+ *   position, so the beam flies from the contributor's orb to the actual file node and
+ *   tracks it as the sim migrates it.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
  *   when an actor first appears and culled once it has fully faded out. The orb does
  *   not snap to its computed placement; it **swoops in** from the open space and
@@ -99,6 +101,12 @@ export class BeamScene {
     // Additive blend so overlapping beams build toward white, the way real bloom
     // stacks, rather than painting flatly over each other.
     this.beamGraphics.blendMode = 'add'
+    // Soften the whole beam layer with one cheap blur pass so each cone reads as a fuzzy glow of
+    // light fanning onto the file rather than a crisp wedge with hard edges (the "make it blurred"
+    // ask). One filter covers every beam at once (they share this single batched graphic), so it is
+    // far cheaper than blurring per beam, and it rides UNDER the actor orbs, which are separate
+    // children of the layer and stay sharp. See {@link BEAM_BLUR_STRENGTH}.
+    this.beamGraphics.filters = [ new BlurFilter({ strength: BEAM_BLUR_STRENGTH }) ]
     this.layer.addChild(this.beamGraphics)
 
     this.actorGraphics = new Map()
@@ -194,17 +202,20 @@ export class BeamScene {
 
   /**
    * Refills the single batched beam graphic from the active set. Each beam is drawn
-   * as a *stack* of additive tapered triangles rather than one flat one, which is
-   * what turns the old hard "sharp triangle" into a glowy pulse of light: a bright,
-   * thin core triangle with a couple of progressively wider, dimmer triangles layered
-   * under it. Because the layers are additively blended, the overlap sums to a hot
-   * bright core that falls off softly to the sides, the way real light blooms, so the
-   * beam reads as snappy and polished instead of a flat wedge with a hard edge.
+   * as a *stack* of additive tapered triangles rather than one flat one, which (with
+   * the layer's blur filter on top) turns the old hard "sharp triangle" into a glowy
+   * cone of light: a bright, thin core triangle with a couple of progressively wider,
+   * dimmer triangles layered under it. Because the layers are additively blended, the
+   * overlap sums to a hot bright center that falls off softly to the sides, the way
+   * real light blooms, so the beam reads as a soft flashlight cone rather than a flat
+   * wedge with a hard edge.
    *
-   * Each triangle spans the beam's current width at the actor (source) end and
-   * narrows to the touched file (target), so the beam still reads as a flashlight
-   * cone narrowing onto the file. A degenerate zero-length beam (source == target)
-   * is skipped since it has no direction to give width.
+   * The cone now points the OTHER way (the swap): its single APEX vertex sits at the
+   * actor (source) and the two width-spread vertices sit at the touched file (target),
+   * so the beam starts as a point at the contributor and FANS OUT onto the file, like a
+   * flashlight cone hitting it, instead of being wide at the actor and narrowing to the
+   * file. The width is therefore spread at the TARGET end. A degenerate zero-length beam
+   * (source == target) is skipped since it has no direction to give width.
    */
   private drawBeams(beams: ActiveBeam[], theme: RunewoodTheme): void {
     this.beamGraphics.clear()
@@ -216,25 +227,29 @@ export class BeamScene {
         continue
       }
 
-      // The unit perpendicular to the beam, to spread each layer's source-end width
-      // symmetrically across the beam on both sides.
+      // The unit perpendicular to the beam, to spread each layer's width symmetrically
+      // across the beam on both sides at the TARGET (file) end, the cone's wide base.
       const perpendicularX = -directionY / length
       const perpendicularY = directionX / length
       const color = hslToRgbInt(beam.color)
 
       // Stack the soft layers widest-and-dimmest first so the bright thin core lands
       // on top. The additive blend sums the overlap into a hot core with a soft
-      // falloff to the edges. The theme's bloom scales the whole stack so a restrained
-      // theme glows gently; the beam's own lifetime fade rides in `beam.alpha`.
+      // falloff to the edges, and the layer's blur filter softens the whole thing into
+      // a fuzzy glow. The theme's bloom scales the whole stack so a restrained theme
+      // glows gently; the beam's own lifetime fade rides in `beam.alpha`.
+      //
+      // The width is spread at the TARGET (file) end and the single apex sits at the
+      // SOURCE (actor), so the cone fans out onto the file (the swap).
       for (const layer of BEAM_GLOW_LAYERS) {
         const halfWidth = (beam.width * layer.widthScale) / 2
-        const leftX = beam.source.x + perpendicularX * halfWidth
-        const leftY = beam.source.y + perpendicularY * halfWidth
-        const rightX = beam.source.x - perpendicularX * halfWidth
-        const rightY = beam.source.y - perpendicularY * halfWidth
+        const leftX = beam.target.x + perpendicularX * halfWidth
+        const leftY = beam.target.y + perpendicularY * halfWidth
+        const rightX = beam.target.x - perpendicularX * halfWidth
+        const rightY = beam.target.y - perpendicularY * halfWidth
 
         this.beamGraphics
-          .poly([ leftX, leftY, rightX, rightY, beam.target.x, beam.target.y ])
+          .poly([ beam.source.x, beam.source.y, leftX, leftY, rightX, rightY ])
           .fill({ color, alpha: beam.alpha * layer.alphaScale * theme.bloomIntensity })
       }
     }
@@ -385,6 +400,15 @@ const BEAM_GLOW_LAYERS = [
   { widthScale: 1.7, alphaScale: 0.30 },
   { widthScale: 1.0, alphaScale: 0.85 },
 ] as const
+
+/**
+ * The blur radius, in pixels, applied to the whole beam layer so each cone reads as a fuzzy glow of
+ * light fanning onto the file rather than a crisp triangle (the "make it blurred" ask). One pass
+ * over the single batched beam graphic softens every beam at once for the cost of one filter, and it
+ * sits under the (separate, still-sharp) actor orbs. Tuned for a noticeably soft edge without
+ * smearing the cone into a featureless blob; raise it for a fuzzier beam, lower it for a crisper one.
+ */
+const BEAM_BLUR_STRENGTH = 6
 
 /** Construction options for a {@link BeamScene}; forwards tuning to the pure models. */
 export type BeamSceneOptions = {

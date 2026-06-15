@@ -100,6 +100,7 @@ export class ForceLayout {
       damping: options.damping ?? DEFAULT_DAMPING,
       maxStepMs: options.maxStepMs ?? DEFAULT_MAX_STEP_MS,
       spawnOffset: options.spawnOffset ?? DEFAULT_SPAWN_OFFSET,
+      wobbleMaxSpeed: options.wobbleMaxSpeed ?? DEFAULT_WOBBLE_MAX_SPEED,
     }
   }
 
@@ -246,6 +247,41 @@ export class ForceLayout {
     this.applyUntangle(forces)
     this.applyCollision(forces)
     this.integrate(forces, deltaSeconds)
+  }
+
+  /**
+   * Kicks the whole forest with a one-shot velocity impulse so it visibly wobbles and then
+   * springs back to rest, the way a hanging mobile jiggles when you nudge the frame it dangles
+   * from. The controller calls this from the camera's pan and zoom handlers so the nodes feel
+   * like jelly reacting to the user wiggling the view.
+   *
+   * `worldVelocity` is added to every non-pinned body's velocity in WORLD units per second; the
+   * springs + damping + the {@link ForceLayoutOptions.maxStepMs} clamp then settle the kick into a
+   * wobble over the next second or two on their own. The pinned forest root is deliberately left
+   * untouched so the forest hangs and wobbles *around* its fixed center rather than the whole thing
+   * sliding off.
+   *
+   * The kick is capped at {@link ForceLayoutOptions.wobbleMaxSpeed} ({@link clampSpeed}) so a fast
+   * flick of the camera cannot inject a huge velocity that flings nodes across the canvas: past the
+   * cap the magnitude saturates while the direction is preserved. A zero / non-finite impulse is a
+   * no-op, so a degenerate gesture (no movement, a NaN delta) never disturbs the sim.
+   */
+  public applyImpulse(worldVelocity: Vec2): void {
+    const kick = clampSpeed(worldVelocity, this.options.wobbleMaxSpeed)
+    if (kick.x === 0 && kick.y === 0) {
+      // Nothing to impart (a zero gesture or a non-finite delta clamped to zero): leave the sim be.
+      return
+    }
+
+    for (const [ path, body ] of this.bodies) {
+      if (path === this.pinnedPath) {
+        // The pinned center is held fixed and never integrated, so it must not take a kick either,
+        // otherwise it would carry a velocity it can never spend.
+        continue
+      }
+      body.velocity.x += kick.x
+      body.velocity.y += kick.y
+    }
   }
 
   /**
@@ -1008,6 +1044,14 @@ export type ForceLayoutOptions = {
    * visibly off the branch (already pointing outward) rather than spawning exactly on the parent.
    */
   spawnOffset?: number
+  /**
+   * The hard cap, in layout units per second, on the velocity {@link ForceLayout.applyImpulse}
+   * imparts in one kick, so a fast camera pan / zoom cannot inject a runaway velocity that flings
+   * the forest apart. The camera handlers scale the gesture into a gentle impulse; this is the
+   * safety ceiling above which the kick saturates (direction kept, magnitude clamped). Raise it for
+   * a wilder wobble, lower it for a stiffer one.
+   */
+  wobbleMaxSpeed?: number
 }
 
 /** A small floor on a distance so a normalize divide never hits zero for two coincident bodies. */
@@ -1119,6 +1163,14 @@ const DEFAULT_MAX_STEP_MS = 50
 const DEFAULT_SPAWN_OFFSET = 12
 
 /**
+ * Default cap on a single {@link ForceLayout.applyImpulse} kick, in layout units per second. Sized
+ * a little above the resting motion of a freshly-spawned node's disturbance so a hard camera flick
+ * produces a lively-but-contained wobble rather than launching the forest off-screen. The camera
+ * handlers already scale their gesture down well under this; the cap is the backstop.
+ */
+const DEFAULT_WOBBLE_MAX_SPEED = 220
+
+/**
  * The smallest the collision spatial-grid cell may be, in layout units, so an empty or tiny forest
  * still bins into sensible cells rather than degenerate one-unit buckets.
  */
@@ -1130,6 +1182,63 @@ const MIN_COLLISION_CELL_SIZE = 32
  * apart via collision. Kept small so the spawn still clearly points outward.
  */
 const SPAWN_JITTER_RADIANS = Math.PI / 6
+
+/**
+ * The radial wobble impulse for a zoom gesture: a velocity that points from the zoom anchor toward
+ * (or, when zooming out, away from) the forest's current center, so a wheel-zoom nudges the nodes
+ * out/in along the zoom axis and they spring back into a wobble. `centerOffset` is the vector from
+ * the anchor to the sim's center in WORLD units; `factor` is the zoom multiplier (`> 1` zoomed in,
+ * `< 1` zoomed out); `strength` scales the kick. Zooming in pushes the forest outward (away from
+ * the anchor, i.e. opposite the anchor->center direction) and zooming out pulls it inward, both
+ * proportional to how big the zoom step was (`|ln factor|`), so a gentle scroll barely wobbles and
+ * a hard one wobbles more.
+ *
+ * An anchor sitting exactly on the center (no defined radial direction) or a non-positive / unit
+ * `factor` yields a zero impulse. Pure, so the zoom kick is directly unit-testable.
+ */
+export function zoomImpulse(centerOffset: Vec2, factor: number, strength: number): Vec2 {
+  if (!(factor > 0) || factor === 1) {
+    return { x: 0, y: 0 }
+  }
+
+  const distance = Math.hypot(centerOffset.x, centerOffset.y)
+  if (distance < EPSILON) {
+    // The anchor is on the center: no outward direction to kick along this gesture.
+    return { x: 0, y: 0 }
+  }
+
+  // The unit direction from the anchor toward the center. Zooming IN (factor > 1, ln > 0) pushes
+  // the nodes the OTHER way (outward, away from the anchor), so the magnitude carries a leading
+  // minus; zooming out flips it and pulls them inward.
+  const magnitude = -Math.log(factor) * strength
+  return {
+    x: (centerOffset.x / distance) * magnitude,
+    y: (centerOffset.y / distance) * magnitude,
+  }
+}
+
+/**
+ * Caps a velocity vector to a maximum magnitude, preserving its direction. Used by
+ * {@link ForceLayout.applyImpulse} so a fast camera gesture cannot inject a runaway kick: at or
+ * under `maxSpeed` the vector passes through unchanged; above it the magnitude is clamped to
+ * `maxSpeed` while the direction is kept. A non-finite component (a NaN delta upstream) or a
+ * non-positive `maxSpeed` collapses to a zero kick, so a degenerate gesture never disturbs the sim.
+ * Pure (no time, no mutation), so the cap is directly unit-testable.
+ */
+export function clampSpeed(velocity: Vec2, maxSpeed: number): Vec2 {
+  if (!Number.isFinite(velocity.x) || !Number.isFinite(velocity.y) || !(maxSpeed > 0)) {
+    return { x: 0, y: 0 }
+  }
+
+  const speed = Math.hypot(velocity.x, velocity.y)
+  if (speed <= maxSpeed) {
+    return { x: velocity.x, y: velocity.y }
+  }
+
+  // Over the cap: rescale onto the ceiling, keeping the gesture's direction.
+  const scale = maxSpeed / speed
+  return { x: velocity.x * scale, y: velocity.y * scale }
+}
 
 /**
  * A deterministic unit-ish separation axis for two coincident nodes, from a hash of their combined

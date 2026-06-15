@@ -24,7 +24,7 @@ import type { Hsl } from './core/theme'
 // Core
 import { Timeline } from './core/timeline'
 import { HighlightRegistry } from './core/highlight'
-import { ForceLayout } from './core/physics'
+import { ForceLayout, zoomImpulse } from './core/physics'
 import { collapseTree } from './core/collapse'
 import { defaultTheme, mergeTheme, themes } from './core/theme'
 import { createFrameState, stepFrame } from './core/frameStep'
@@ -479,7 +479,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // a backward seek re-folds the (pure) tree and lets the sim re-settle rather than
   // reproducing pixel-exact prior positions. The scene/labels/beams/camera read
   // positions straight off `physics.state`, exactly where they read the old springs.
-  const physics = new ForceLayout(resolvePhysicsOptions(options))
+  const physicsOptions = resolvePhysicsOptions(options)
+  const physics = new ForceLayout(physicsOptions)
+
+  // The world point the forest hangs around (the sim's pinned center, default origin). The zoom
+  // wobble kicks the nodes radially relative to this, so a wheel-zoom nudges the forest out / in
+  // along the zoom axis and it springs back. Captured once: the sim's center never moves.
+  const wobbleCenter: Vec2 = physicsOptions.center ?? { x: 0, y: 0 }
 
   // The sim's live body map, held as a stable binding the helper functions read from
   // (the scene/labels/beams/camera/picking) so they need no awareness of the sim
@@ -1274,6 +1280,16 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       const moveDeltaX = screenPoint.x - dragLast.x
       const moveDeltaY = screenPoint.y - dragLast.y
       camera.panByScreen(moveDeltaX, moveDeltaY)
+      // Jelly wobble (A): nudge the forest so it lags the pan and then springs back. The pan moves
+      // the world to follow the cursor; we kick the nodes the OPPOSITE way (in world units, scaled
+      // by the zoom so the wobble feels the same at any scale) so they trail the gesture and settle.
+      // Skipped under reduced motion, where the forest should not jiggle at all.
+      if (!prefersReducedMotion()) {
+        physics.applyImpulse({
+          x: (-moveDeltaX / camera.zoom) * PAN_WOBBLE_STRENGTH,
+          y: (-moveDeltaY / camera.zoom) * PAN_WOBBLE_STRENGTH,
+        })
+      }
       dragLast = screenPoint
       return
     }
@@ -1328,8 +1344,17 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const screenAnchor = screenPointOf(wheelEvent, canvas)
     // deltaY < 0 is a scroll up (zoom in); raising the factor above 1 zooms in.
     const factor = wheelEvent.deltaY < 0 ? WHEEL_ZOOM_STEP : 1 / WHEEL_ZOOM_STEP
+    // Resolve the anchor to world space BEFORE the zoom changes the transform, so the radial kick
+    // is measured from where the cursor actually sits in the forest.
+    const anchorWorld = camera.screenToWorld(screenAnchor)
     camera.zoomBy(factor, screenAnchor)
     cameraMode = 'manual'
+    // Jelly wobble (A): a small radial impulse from the zoom anchor toward the forest center, so the
+    // nodes get nudged out (zoom in) or in (zoom out) and spring back. Skipped under reduced motion.
+    if (!prefersReducedMotion()) {
+      const centerOffset = { x: wobbleCenter.x - anchorWorld.x, y: wobbleCenter.y - anchorWorld.y }
+      physics.applyImpulse(zoomImpulse(centerOffset, factor, ZOOM_WOBBLE_STRENGTH))
+    }
   }
 
   /**
@@ -1616,6 +1641,23 @@ const CLICK_DRAG_THRESHOLD_PX = 4
  * that still moves perceptibly per notch.
  */
 const WHEEL_ZOOM_STEP = 1.1
+
+/**
+ * How strongly a manual pan nudges the forest into a wobble (the jelly reaction to dragging the
+ * view). The per-move world-space pan delta is multiplied by this to get the velocity kick imparted
+ * to every node opposite the pan, so the forest lags the gesture and springs back. Kept well under 1
+ * so the wobble is a subtle jiggle, not a lurch; the sim's {@link ForceLayoutOptions.wobbleMaxSpeed}
+ * caps a fast flick regardless. Tune up for a wobblier forest, down for a stiffer one.
+ */
+const PAN_WOBBLE_STRENGTH = 0.6
+
+/**
+ * How strongly a wheel zoom nudges the forest into a radial wobble. Scales the per-notch zoom
+ * impulse ({@link zoomImpulse}, itself proportional to the zoom step) into a velocity kick along the
+ * anchor->center axis, so a scroll nudges the nodes out / in and they spring back. Sized so one notch
+ * is a gentle pulse; the sim's {@link ForceLayoutOptions.wobbleMaxSpeed} caps a fast scroll burst.
+ */
+const ZOOM_WOBBLE_STRENGTH = 90
 
 /**
  * The default highlight ring color when a host calls
