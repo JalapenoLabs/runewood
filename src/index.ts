@@ -12,7 +12,7 @@ export type {
   SpringParams,
   HeatOptions,
 } from './core/layout'
-export type { ForceLayoutOptions } from './core/physics'
+export type { ForceLayoutOptions, SiblingWedge } from './core/physics'
 export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
 export type {
   HighlightGroup,
@@ -32,7 +32,7 @@ export { applyEvent, createTree, seedTree } from './core/tree'
 export { collapseTree } from './core/collapse'
 export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
-export { ForceLayout } from './core/physics'
+export { ForceLayout, assignSiblingWedges, siblingWedgeOffset, outwardDirection } from './core/physics'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
 export { Emitter } from './core/emitter'
 export { HighlightRegistry, highlightPulse } from './core/highlight'
