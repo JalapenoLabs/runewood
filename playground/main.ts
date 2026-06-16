@@ -456,7 +456,9 @@ function parseExcludePatterns(raw: string): string[] {
  */
 function wireHoverTooltip(controller: ReturnType<typeof createRunewood>, tooltip: HTMLDivElement): void {
   controller.on('nodeHover', (payload) => {
-    if (payload === null) {
+    // The shared root node has an empty path, so it would render as a blank
+    // tooltip box; treat an empty path like no hover and hide it.
+    if (payload === null || !payload.path) {
       tooltip.style.display = 'none'
       return
     }
