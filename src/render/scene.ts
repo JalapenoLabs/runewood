@@ -280,7 +280,7 @@ export class Scene {
       // (nodes differ by color and size, never opacity), and a deleted node leaves
       // by its radius shrinking to zero rather than by fading. No halo disc here
       // anymore: the soft glow is the sprite.
-      const coreColor = hslToRgbInt(brightenTowardWhite(theme, visual.color, visual.brightness))
+      const coreColor = hslToRgbInt(brightenTowardWhite(visual.color, visual.brightness))
       graphics.clear()
       graphics
         .circle(0, 0, visual.radius)
@@ -873,18 +873,32 @@ const HIGHLIGHT_AURA_SCALE = 5.0
 const HIGHLIGHT_AURA_ALPHA = 0.5
 
 /**
- * Lifts a node's base color toward white by its brightness, so a flashing or hot
- * node visibly blooms rather than just changing opacity. Mixes lightness up
- * toward 1 and bleeds a little saturation out, which is how a real additive glow
- * pushes a hue toward white. The theme's `bloomIntensity` caps how far a full
- * brightness can push, so a restrained theme (parchment) blooms gently.
+ * How far a full-brightness flash lightens a node's core, hard-capped so the core
+ * never washes out to a colorless white. This used to be `brightness *
+ * theme.bloomIntensity`, which on a frequently-touched file (heat pegged near 1)
+ * under a strong-bloom theme pushed the core to a desaturated near-white, so the
+ * file looked blank. Now the lift is small and capped, the hue and most of the
+ * saturation are kept, and the additive glow sprite (plus the optional bloom
+ * post-process) carry the bright white flare instead.
  */
-function brightenTowardWhite(theme: RunewoodTheme, color: { h: number, s: number, l: number }, brightness: number) {
-  const lift = brightness * theme.bloomIntensity
+const CORE_BRIGHTEN_STRENGTH = 0.35
+
+/** Lightness ceiling a brightened core may reach; below pure white so the hue always reads. */
+const CORE_BRIGHTEN_CEIL = 0.82
+
+/**
+ * Brightens a node's core a little on heat/flash WITHOUT washing out its color, so
+ * a hot or flashing node reads as a vivid, brighter version of its own hue rather
+ * than a blank white dot. The hue is always preserved, only a sliver of saturation
+ * is bled, and the lightness rises by a small capped amount toward (not to) white.
+ * The big white bloom is the glow sprite's job, not the core's.
+ */
+function brightenTowardWhite(color: { h: number, s: number, l: number }, brightness: number) {
+  const lift = Math.min(1, Math.max(0, brightness)) * CORE_BRIGHTEN_STRENGTH
   return {
     h: color.h,
-    s: color.s * (1 - lift * 0.5),
-    l: color.l + (1 - color.l) * lift,
+    s: color.s * (1 - lift * 0.25),
+    l: Math.min(CORE_BRIGHTEN_CEIL, color.l + (1 - color.l) * lift),
   }
 }
 
