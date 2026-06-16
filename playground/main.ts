@@ -51,17 +51,27 @@ const LEGEND_FILE_SAMPLES = [
 const STATE_READOUT_INTERVAL_MS = 250
 
 /**
- * How long the simulated CI run keeps its PR files glowing before it auto-clears,
- * standing in for "CI finished". The operator can also click the button again to
- * clear early.
+ * How long the simulated CI run keeps its PR files glowing amber ("CI running")
+ * before it flips them green ("passed"). The operator can also click the button
+ * again to clear early.
  */
-const SIMULATED_CI_DURATION_MS = 6_000
+const SIMULATED_CI_RUNNING_MS = 5_000
+
+/**
+ * How long the files stay green ("CI passed") after the run finishes before the
+ * highlight auto-clears, so the operator sees the running -> passed transition land
+ * before it disappears.
+ */
+const SIMULATED_CI_PASSED_MS = 2_500
 
 /** How many current files a simulated PR "touches", chosen at random from the live forest. */
 const SIMULATED_PR_FILE_COUNT = 6
 
-/** The amber attention color the simulated-CI highlight uses, matching the library's default. */
+/** The amber attention color the simulated-CI highlight uses while CI is "running", matching the library's default. */
 const CI_HIGHLIGHT_COLOR = { h: 38, s: 0.95, l: 0.58 } as const
+
+/** The green color the simulated-CI highlight flips to when CI "passes", so the demo shows the success transition. */
+const CI_PASSED_COLOR = { h: 140, s: 0.85, l: 0.5 } as const
 
 /**
  * Exponential-smoothing weight for the FPS readout: each frame blends this much of
@@ -149,8 +159,10 @@ function main(): void {
   // very events it ingests. Seeded so the button works before the stream warms up.
   const seenFilePaths = new Set<string>(seedPaths())
 
-  // The active simulated-CI highlight handle + its auto-clear timer, so a second
-  // button click (or a rebuild / reset) can clear it early and tear the timer down.
+  // The active simulated-CI highlight handle + its phase timer, so a second button
+  // click (or a rebuild / reset) can clear it early and tear the timer down. The timer
+  // first flips the highlight from amber ("running") to green ("passed"), then a second
+  // scheduled timer clears it, so the demo plays out the running -> passed -> done arc.
   let ciHighlight: RunewoodHighlight | null = null
   let ciClearTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -179,9 +191,12 @@ function main(): void {
   }
 
   // The simulated-CI demo (issue #180): on the first click, pick a handful of current
-  // files (a fake PR's touched set), highlight them amber, and auto-clear after a few
-  // seconds (CI "finished"). A second click clears early. This mirrors exactly how a
-  // host like Seraphim drives the feature: highlight on CI start, clear on CI finish.
+  // files (a fake PR's touched set) and highlight them amber ("CI running"). After a few
+  // seconds the run "passes": the same files are re-highlighted GREEN (re-using the
+  // `simulated-ci` id replaces the group's color in place), so the operator watches the
+  // reticle's running -> passed transition, and then it auto-clears. A second click
+  // clears early. This mirrors exactly how a host like Seraphim drives the feature:
+  // highlight on CI start, recolor on result, clear when done.
   simulateCiButton.addEventListener('click', () => {
     if (ciHighlight) {
       stopSimulatedCi()
@@ -194,7 +209,13 @@ function main(): void {
     }
     ciHighlight = controller.highlight(prFiles, { color: CI_HIGHLIGHT_COLOR, id: 'simulated-ci' })
     simulateCiButton.textContent = 'CI running... (click to clear)'
-    ciClearTimer = setTimeout(() => stopSimulatedCi(), SIMULATED_CI_DURATION_MS)
+    ciClearTimer = setTimeout(() => {
+      // CI "passed": flip the same group to green so the reticle turns green in place,
+      // then schedule the final clear once the operator has seen the success state.
+      controller.highlight(prFiles, { color: CI_PASSED_COLOR, id: 'simulated-ci' })
+      simulateCiButton.textContent = 'CI passed! (click to clear)'
+      ciClearTimer = setTimeout(() => stopSimulatedCi(), SIMULATED_CI_PASSED_MS)
+    }, SIMULATED_CI_RUNNING_MS)
   })
 
   // The synthetic stream is held in a mutable binding (not a const) so the Reset

@@ -17,6 +17,13 @@ import { nodeVisualFor } from './nodeVisual'
 import { edgeVisualFor } from './edgeVisual'
 import { hslToRgbInt } from './color'
 import { buildGlowTexture, GLOW_TEXTURE_RADIUS } from './glowTexture'
+import {
+  ringRotation,
+  sparkOrbitPosition,
+  sparkTwinkle,
+  leadingEdgeShine,
+  auraBreathScale,
+} from './highlightEffect'
 
 /**
  * The retained forest scene: one persistent pixi {@link Graphics} per node and
@@ -60,13 +67,25 @@ export class Scene {
   /** Retained branch graphics, keyed by the *child* node path that owns the edge. */
   private readonly edgeGraphics: Map<string, Graphics>
   /**
-   * Retained highlight-ring graphics, keyed by node path. A ring exists only while
-   * its node is in an active highlight group (issue #180's live "watch this" / CI
-   * overlay); it is created when a node first becomes highlighted and torn down the
-   * moment it leaves every group. Each is re-stroked every frame it is shown so it
-   * breathes via {@link highlightPulse}, independent of the playhead.
+   * Retained highlight-reticle graphics, keyed by node path. The reticle is the
+   * souped-up "watch this" / CI overlay (issue #180): a single {@link Graphics} onto
+   * which every animated layer EXCEPT the aura is drawn each frame (the counter-
+   * rotating gapped spinner rings with their shining leading edges, and the orbiting
+   * twinkling sparks). It exists only while its node is in an active highlight group,
+   * created when the node first becomes highlighted and torn down the moment it leaves
+   * every group. Re-drawn every frame it is shown since it spins, breathes, and
+   * sparkles on the wall clock, independent of the playhead.
    */
   private readonly highlightRings: Map<string, Graphics>
+  /**
+   * Retained highlight-aura sprites, keyed by node path: the soft additive glow halo
+   * behind each highlighted node, reusing the shared {@link glowTexture} tinted to the
+   * group color and breathing on {@link highlightPulse}. Kept as a Sprite (not part of
+   * the reticle Graphics) so the aura is one cheap additive blit under the spinner.
+   * Created and torn down in lockstep with the reticle. Absent on a headless scene with
+   * no glow texture (the reticle still draws; only the aura is skipped).
+   */
+  private readonly highlightAuras: Map<string, Sprite>
 
   /**
    * The params each retained node was last *drawn* with, keyed by path. A node is
@@ -98,6 +117,7 @@ export class Scene {
     this.glowSprites = new Map()
     this.edgeGraphics = new Map()
     this.highlightRings = new Map()
+    this.highlightAuras = new Map()
     this.lastNodeDraw = new Map()
     this.lastEdgeDraw = new Map()
     this.nodeOptions = options.node ?? {}
@@ -179,10 +199,10 @@ export class Scene {
       // the wall clock, not the playhead, so it animates through pause/seek.
       const resolution = hasHighlights ? highlights.highlightFor(path) : null
       if (resolution) {
-        this.drawHighlightRing(path, physics.position, visual.radius, resolution.color, pulse)
+        this.drawHighlight(path, physics.position, visual.radius, resolution.color, pulse, highlightTimeMs, zoom)
       }
       else {
-        this.removeHighlightRing(path)
+        this.removeHighlight(path)
       }
     }
   }
@@ -440,50 +460,218 @@ export class Scene {
   }
 
   /**
-   * Updates (or creates) the live highlight ring over a node (issue #180). The ring
-   * is a deliberately distinct "watch this" halo: a stroked open circle drawn OUT
-   * past the soft glow, breathing between dim and bright on the wall-clock pulse, so
-   * it reads as a steady, intentional marker rather than the brief touch flash or
-   * the idle glow. It rides the node's live spring position and scales off its
-   * baseline radius so it tracks the node as it moves and throbs.
+   * Updates (or creates) the live highlight reticle over a node (issue #180): the
+   * souped-up "watch this" / CI effect, a glowing sci-fi targeting reticle that spins,
+   * breathes, and sparkles around the file. It replaces the old flat bordered ring with
+   * a layered, animated effect, all driven by the WALL-CLOCK `animationTimeMs` (so it
+   * spins and breathes through pause/seek) and tinted by the group `color` (amber =
+   * running, green = passed, red = failed all read correctly):
    *
-   * It is re-stroked every frame it is shown (the pulse changes the alpha and radius
-   * continuously, so caching would not save a redraw), then parented at the top of
-   * the node layer so it sits cleanly over both the glow and the core. A scene built
-   * without a renderer still draws the ring (it is a plain `Graphics`, no texture),
-   * so the highlight is visible even in the no-glow headless fallback.
+   * 1. **Breathing glow aura** ({@link drawHighlightAura}): a soft additive halo behind
+   *    the node, swelling and brightening on the {@link highlightPulse} breath, so the
+   *    whole file area softly glows in the group color.
+   * 2. **Counter-rotating spinner rings** ({@link drawSpinnerRing}): {@link HIGHLIGHT_RING_COUNT}
+   *    gapped arc rings at stepped radii, each turning at a different speed and adjacent
+   *    ones in OPPOSITE directions, each arc flaring near-white at its leading tip so it
+   *    reads as motion and shine.
+   * 3. **Orbiting sparks** ({@link drawHighlightSparks}): {@link HIGHLIGHT_SPARK_COUNT}
+   *    bright additive dots travelling around the reticle, twinkling as they go.
+   *
+   * Every layer pulses subtly on the breath. The reticle is re-drawn every frame it is
+   * shown (it animates continuously, so caching would save nothing), parented at the top
+   * of the node layer so it sits cleanly over the core and glow. The on-screen size is
+   * floored via the live `zoom` so the reticle stays readable when the camera is pulled
+   * far out. A scene built without a renderer still draws the rings + sparks (plain
+   * `Graphics`); only the textured aura is skipped.
    */
-  private drawHighlightRing(path: string, position: Vec2, radius: number, color: Hsl, pulse: number): void {
-    let ring = this.highlightRings.get(path)
-    if (!ring) {
-      ring = new Graphics()
-      // On top of every core and glow so the "watch this" halo is never occluded by
-      // the node it marks; the node layer is drawn last, so adding here puts the ring
-      // above the discs.
-      this.nodeLayer.addChild(ring)
-      this.highlightRings.set(path, ring)
+  private drawHighlight(
+    path: string,
+    position: Vec2,
+    radius: number,
+    color: Hsl,
+    pulse: number,
+    animationTimeMs: number,
+    zoom: number,
+  ): void {
+    // Floor the reticle's working radius at a constant on-screen size: world units are
+    // scaled by `zoom`, so far out the node's own radius collapses to a few pixels and
+    // the reticle would vanish. Taking the max with `MIN_SCREEN_PX / zoom` keeps the
+    // reticle at least that many screen pixels across however far the camera pulls back,
+    // while up close the node's real radius wins and nothing changes.
+    const minWorldRadius = zoom > 0 ? HIGHLIGHT_MIN_SCREEN_PX / zoom : radius
+    const baseRadius = Math.max(radius, minWorldRadius)
+
+    this.drawHighlightAura(path, position, baseRadius, color, pulse)
+
+    let reticle = this.highlightRings.get(path)
+    if (!reticle) {
+      reticle = new Graphics()
+      // On top of every core and glow so the reticle is never occluded by the node it
+      // marks; the node layer is drawn last, so adding here puts it above the discs.
+      this.nodeLayer.addChild(reticle)
+      this.highlightRings.set(path, reticle)
     }
 
-    // The ring sits a fixed multiple out past the core and breathes a little wider at
-    // the peak of the pulse, so it visibly pulls in and out around the node. Its
-    // stroke alpha breathes on the same pulse, between a floor and full, so it always
-    // stays clearly lit while CI runs but still reads as a living breath.
-    const ringRadius = radius * HIGHLIGHT_RING_SCALE * (1 + pulse * HIGHLIGHT_RING_BREATH)
-    const ringWidth = Math.max(HIGHLIGHT_RING_MIN_WIDTH, radius * HIGHLIGHT_RING_WIDTH_SCALE)
+    reticle.clear()
+    reticle.position.set(position.x, position.y)
+    const colorInt = hslToRgbInt(color)
 
-    ring.clear()
-    ring.position.set(position.x, position.y)
-    ring
-      .circle(0, 0, ringRadius)
-      .stroke({ color: hslToRgbInt(color), width: ringWidth, alpha: pulse })
+    // The spinner rings, innermost out: each steps a little further from the core and
+    // turns at its own speed, with adjacent rings counter-rotating, so the set reads as
+    // a mechanism turning rather than one rigid wheel.
+    for (let ringIndex = 0; ringIndex < HIGHLIGHT_RING_COUNT; ringIndex += 1) {
+      this.drawSpinnerRing(reticle, ringIndex, baseRadius, colorInt, pulse, animationTimeMs)
+    }
+
+    this.drawHighlightSparks(reticle, baseRadius, colorInt, pulse, animationTimeMs)
   }
 
-  /** Tears down a node's highlight ring if one exists (it left every highlight group, or the node departed). */
-  private removeHighlightRing(path: string): void {
-    const ring = this.highlightRings.get(path)
-    if (ring) {
-      ring.destroy()
+  /**
+   * Updates (or creates) the breathing glow aura behind a highlighted node: a soft
+   * additive halo reusing the shared glow texture, tinted to the group color, swelling
+   * and brightening on the breath {@link highlightPulse} so the file area glows. Sized
+   * off the (zoom-floored) reticle radius so it tracks the node and stays visible far
+   * out. A headless scene with no glow texture skips the aura (the spinner + sparks
+   * still draw), exactly as the node glow does.
+   */
+  private drawHighlightAura(path: string, position: Vec2, radius: number, color: Hsl, pulse: number): void {
+    if (!this.glowTexture) {
+      return
+    }
+
+    let aura = this.highlightAuras.get(path)
+    if (!aura) {
+      aura = new Sprite(this.glowTexture)
+      aura.anchor.set(0.5)
+      // Additive so the aura reads as light layering over the forest rather than paint,
+      // matching the node glow. Parented at index 0 of the node layer so it sits beneath
+      // every crisp disc and under the reticle's rings and sparks.
+      aura.blendMode = 'add'
+      this.nodeLayer.addChildAt(aura, 0)
+      this.highlightAuras.set(path, aura)
+    }
+
+    aura.tint = hslToRgbInt(color)
+    // Breathe the aura's reach and brightness together on the pulse: it swells a little
+    // wider and brightens toward full at the peak, so the glow visibly inhales/exhales.
+    aura.alpha = HIGHLIGHT_AURA_ALPHA * pulse
+    const auraRadius = radius * HIGHLIGHT_AURA_SCALE * auraBreathScale(pulse)
+    aura.scale.set(auraRadius / GLOW_TEXTURE_RADIUS)
+    aura.position.set(position.x, position.y)
+  }
+
+  /**
+   * Strokes one gapped spinner ring of the reticle onto the shared `reticle` graphics
+   * (already seated at the node). The ring is {@link HIGHLIGHT_RING_ARC_SEGMENTS} short
+   * arc segments with gaps between them (a loading-spinner look), rotated as a whole by
+   * the wall-clock {@link ringRotation} for this ring index, so it sweeps around. Each
+   * arc's leading tip flares near-white via {@link leadingEdgeShine}, sub-stroked as a
+   * few bright sub-arcs at the head, so the motion shines like a comet. The ring's radius
+   * steps out per index and breathes on the pulse; its alpha breathes too so it stays lit
+   * while CI runs but still pulses.
+   */
+  private drawSpinnerRing(
+    reticle: Graphics,
+    ringIndex: number,
+    radius: number,
+    colorInt: number,
+    pulse: number,
+    animationTimeMs: number,
+  ): void {
+    // Each ring sits a step further out and breathes a little wider at the peak so it
+    // pulls in and out around the node.
+    const ringRadius = radius * (HIGHLIGHT_RING_BASE_SCALE + ringIndex * HIGHLIGHT_RING_STEP)
+      * (1 + pulse * HIGHLIGHT_RING_BREATH)
+    const ringWidth = Math.max(HIGHLIGHT_RING_MIN_WIDTH, radius * HIGHLIGHT_RING_WIDTH_SCALE)
+    const rotation = ringRotation(animationTimeMs, ringIndex)
+
+    // Lay the gapped arcs around the circle: each segment spans `arcSpan` of its slot and
+    // leaves the rest as a gap, so the ring reads as a loading spinner. The base of each
+    // arc is the group color at a breathing alpha; the leading tip is sub-stroked
+    // near-white so the sweep shines.
+    const slot = (Math.PI * 2) / HIGHLIGHT_RING_ARC_SEGMENTS
+    const arcSpan = slot * HIGHLIGHT_RING_ARC_FRACTION
+    const baseAlpha = HIGHLIGHT_RING_ALPHA_FLOOR + (1 - HIGHLIGHT_RING_ALPHA_FLOOR) * pulse
+
+    for (let segment = 0; segment < HIGHLIGHT_RING_ARC_SEGMENTS; segment += 1) {
+      const arcStart = rotation + segment * slot
+      const arcEnd = arcStart + arcSpan
+
+      // The dim body of the arc in the plain group color.
+      reticle
+        .arc(0, 0, ringRadius, arcStart, arcEnd)
+        .stroke({ color: colorInt, width: ringWidth, alpha: baseAlpha })
+
+      // The shining leading edge: a handful of short sub-arcs at the head of the arc,
+      // each mixed further toward white and brighter the closer it is to the tip, so the
+      // last sliver flares like a comet head leading the sweep.
+      for (let step = 0; step < HIGHLIGHT_EDGE_STEPS; step += 1) {
+        const nearTip = (step + 1) / HIGHLIGHT_EDGE_STEPS
+        const shine = leadingEdgeShine(nearTip)
+        const subStart = arcStart + arcSpan * (1 - HIGHLIGHT_EDGE_FRACTION) + arcSpan * HIGHLIGHT_EDGE_FRACTION
+          * (step / HIGHLIGHT_EDGE_STEPS)
+        const subEnd = arcStart + arcSpan * (1 - HIGHLIGHT_EDGE_FRACTION) + arcSpan * HIGHLIGHT_EDGE_FRACTION
+          * ((step + 1) / HIGHLIGHT_EDGE_STEPS)
+        reticle
+          .arc(0, 0, ringRadius, subStart, subEnd)
+          .stroke({ color: mixTowardWhite(colorInt, shine), width: ringWidth, alpha: baseAlpha })
+      }
+    }
+  }
+
+  /**
+   * Draws the orbiting sparks of the reticle onto the shared `reticle` graphics: a few
+   * bright dots travelling around the rings, their angle advancing with the wall clock
+   * ({@link sparkOrbitPosition}) and their brightness twinkling ({@link sparkTwinkle}),
+   * each with a near-white core and a small additive-feeling halo so they sparkle. The
+   * orbit radius sits between the inner and outer rings and breathes on the pulse so the
+   * sparks ride the breathing mechanism.
+   */
+  private drawHighlightSparks(
+    reticle: Graphics,
+    radius: number,
+    colorInt: number,
+    pulse: number,
+    animationTimeMs: number,
+  ): void {
+    // Orbit between the inner and outer rings so the sparks read as energy threading
+    // through the mechanism, breathing wider with the rings on the pulse.
+    const orbitRadius = radius * HIGHLIGHT_SPARK_ORBIT_SCALE * (1 + pulse * HIGHLIGHT_RING_BREATH)
+    const sparkRadius = Math.max(HIGHLIGHT_SPARK_MIN_RADIUS, radius * HIGHLIGHT_SPARK_RADIUS_SCALE)
+
+    for (let sparkIndex = 0; sparkIndex < HIGHLIGHT_SPARK_COUNT; sparkIndex += 1) {
+      const point = sparkOrbitPosition(animationTimeMs, sparkIndex, HIGHLIGHT_SPARK_COUNT, orbitRadius)
+      const twinkle = sparkTwinkle(animationTimeMs, sparkIndex)
+
+      // A soft tinted halo around the spark so it has a little glow, then a bright
+      // near-white core on top so it shines. Both ride the twinkle, lifted by the breath
+      // so the sparks brighten as the whole reticle inhales.
+      const sparkAlpha = Math.min(1, twinkle * (HIGHLIGHT_SPARK_ALPHA_BASE + pulse * HIGHLIGHT_SPARK_ALPHA_PULSE))
+      reticle
+        .circle(point.x, point.y, sparkRadius * HIGHLIGHT_SPARK_HALO_SCALE)
+        .fill({ color: colorInt, alpha: sparkAlpha * HIGHLIGHT_SPARK_HALO_ALPHA })
+      reticle
+        .circle(point.x, point.y, sparkRadius)
+        .fill({ color: mixTowardWhite(colorInt, HIGHLIGHT_SPARK_CORE_SHINE), alpha: sparkAlpha })
+    }
+  }
+
+  /**
+   * Tears down a node's highlight reticle + aura if they exist (it left every highlight
+   * group, or the node departed).
+   */
+  private removeHighlight(path: string): void {
+    const reticle = this.highlightRings.get(path)
+    if (reticle) {
+      reticle.destroy()
       this.highlightRings.delete(path)
+    }
+    const aura = this.highlightAuras.get(path)
+    if (aura) {
+      // Destroy the sprite but NOT its texture: the glow texture is shared and reused for
+      // the scene's whole life.
+      aura.destroy()
+      this.highlightAuras.delete(path)
     }
   }
 
@@ -495,7 +683,7 @@ export class Scene {
       this.nodeGraphics.delete(path)
     }
     this.removeGlow(path)
-    this.removeHighlightRing(path)
+    this.removeHighlight(path)
     this.lastNodeDraw.delete(path)
     this.removeEdge(path)
   }
@@ -598,29 +786,91 @@ const MIN_EDGE_SCREEN_PX = 1.5
 const GLOW_SCALE = 3.2
 
 /**
- * How far out the live highlight ring sits from the core, as a multiple of the node
- * radius. Pushed well past the {@link GLOW_SCALE} reach so the "watch this" ring
- * reads as its own deliberate halo clearly outside the soft glow, not as part of
- * the node's own bloom.
+ * The minimum on-screen size, in screen pixels, the highlight reticle's working radius
+ * is floored at. The reticle is sized in world units (scaled by the camera zoom), so
+ * far out a small node would shrink it to nothing; flooring the radius at
+ * `HIGHLIGHT_MIN_SCREEN_PX / zoom` keeps the whole reticle readable however far the
+ * camera pulls back, while up close the node's real radius wins.
  */
-const HIGHLIGHT_RING_SCALE = 4.2
+const HIGHLIGHT_MIN_SCREEN_PX = 18
+
+/** How many counter-rotating gapped spinner rings the reticle draws. Three reads as a rich mechanism, no clutter. */
+const HIGHLIGHT_RING_COUNT = 3
 
 /**
- * How much wider the highlight ring swells at the peak of its breath, as a fraction
- * of its resting radius. The pulse drives this, so the ring gently pulls in and out
- * around the node rather than just changing opacity.
+ * The radius of the innermost spinner ring as a multiple of the (zoom-floored) node
+ * radius. Pushed out past the {@link GLOW_SCALE} node glow so the reticle reads as its
+ * own deliberate marker clearly outside the node's own bloom.
  */
-const HIGHLIGHT_RING_BREATH = 0.18
+const HIGHLIGHT_RING_BASE_SCALE = 3.2
+
+/** How much further out each successive spinner ring sits, as a multiple of the node radius, so the rings nest. */
+const HIGHLIGHT_RING_STEP = 1.0
 
 /**
- * The highlight ring's stroke width as a fraction of the node radius, so a bigger
- * node carries a proportionally bolder ring. Floored by {@link HIGHLIGHT_RING_MIN_WIDTH}
- * so a tiny node's ring is still a visible stroke.
+ * How much wider the rings (and the spark orbit) swell at the peak of the breath, as a
+ * fraction of their resting radius. The pulse drives this, so the reticle gently pulls
+ * in and out around the node rather than only changing opacity.
  */
-const HIGHLIGHT_RING_WIDTH_SCALE = 0.35
+const HIGHLIGHT_RING_BREATH = 0.12
 
-/** The thinnest the highlight ring is ever stroked, in world units, so a small node's ring still reads. */
+/**
+ * A spinner ring's stroke width as a fraction of the node radius, so a bigger node
+ * carries a proportionally bolder ring. Floored by {@link HIGHLIGHT_RING_MIN_WIDTH} so a
+ * tiny node's ring still reads.
+ */
+const HIGHLIGHT_RING_WIDTH_SCALE = 0.22
+
+/** The thinnest a spinner ring is ever stroked, in world units, so a small node's ring still reads. */
 const HIGHLIGHT_RING_MIN_WIDTH = 1.5
+
+/** How many gapped arc segments make up one spinner ring (the loading-spinner look). */
+const HIGHLIGHT_RING_ARC_SEGMENTS = 3
+
+/** What fraction of each arc slot is drawn as arc; the rest is the gap. ~0.55 leaves a clear spinner gap. */
+const HIGHLIGHT_RING_ARC_FRACTION = 0.55
+
+/** The dimmest a spinner ring's arc is ever drawn, `0..1`, lifted toward full by the breath pulse. */
+const HIGHLIGHT_RING_ALPHA_FLOOR = 0.45
+
+/** What fraction of each arc's length, at its leading end, is sub-stroked as the shining comet head. */
+const HIGHLIGHT_EDGE_FRACTION = 0.4
+
+/** How many bright sub-arcs make up the shining leading edge: more is a smoother flare at a small draw cost. */
+const HIGHLIGHT_EDGE_STEPS = 4
+
+/** How many sparks orbit the reticle. A handful sparkles richly without reading as clutter. */
+const HIGHLIGHT_SPARK_COUNT = 5
+
+/** The spark orbit radius as a multiple of the node radius: between the inner and outer spinner rings. */
+const HIGHLIGHT_SPARK_ORBIT_SCALE = 4.0
+
+/** A spark's core radius as a fraction of the node radius, floored by {@link HIGHLIGHT_SPARK_MIN_RADIUS}. */
+const HIGHLIGHT_SPARK_RADIUS_SCALE = 0.16
+
+/** The smallest a spark's core is ever drawn, in world units, so a spark on a tiny node still reads. */
+const HIGHLIGHT_SPARK_MIN_RADIUS = 1.2
+
+/** A spark's soft tinted halo radius as a multiple of its core radius, giving it a little glow. */
+const HIGHLIGHT_SPARK_HALO_SCALE = 2.4
+
+/** The alpha of a spark's soft halo relative to its core alpha, so the halo reads as a faint glow, not a disc. */
+const HIGHLIGHT_SPARK_HALO_ALPHA = 0.35
+
+/** How far a spark's core color is mixed toward white, `0..1`, so the spark shines near-white at its center. */
+const HIGHLIGHT_SPARK_CORE_SHINE = 0.7
+
+/** A spark's base alpha (before the breath lift), multiplied by its twinkle, so it always reads as a bright point. */
+const HIGHLIGHT_SPARK_ALPHA_BASE = 0.7
+
+/** How much the breath pulse lifts a spark's alpha at its peak, so the sparks brighten as the reticle inhales. */
+const HIGHLIGHT_SPARK_ALPHA_PULSE = 0.3
+
+/** The reach of the highlight aura halo as a multiple of the node radius, before the breath swell is applied. */
+const HIGHLIGHT_AURA_SCALE = 5.0
+
+/** The aura halo's peak alpha (at full breath); the breath pulse scales it down toward the trough between breaths. */
+const HIGHLIGHT_AURA_ALPHA = 0.5
 
 /**
  * Lifts a node's base color toward white by its brightness, so a flashing or hot
@@ -636,4 +886,22 @@ function brightenTowardWhite(theme: RunewoodTheme, color: { h: number, s: number
     s: color.s * (1 - lift * 0.5),
     l: color.l + (1 - color.l) * lift,
   }
+}
+
+/**
+ * Mixes a packed `0xRRGGBB` color toward white by `amount` (`0..1`): each channel is
+ * lerped toward 255, so 0 is the original color and 1 is pure white. Used by the
+ * highlight reticle to make a rotating arc's leading edge and a spark's core flare
+ * near-white, which is what sells the shine under additive-feeling blending. Pure and
+ * self-contained so it stays cheap to call per sub-arc and per spark each frame.
+ */
+function mixTowardWhite(color: number, amount: number): number {
+  const clamped = Math.min(Math.max(amount, 0), 1)
+  const red = (color >> 16) & 0xff
+  const green = (color >> 8) & 0xff
+  const blue = color & 0xff
+  const mixedRed = Math.round(red + (255 - red) * clamped)
+  const mixedGreen = Math.round(green + (255 - green) * clamped)
+  const mixedBlue = Math.round(blue + (255 - blue) * clamped)
+  return (mixedRed << 16) | (mixedGreen << 8) | mixedBlue
 }
