@@ -69,13 +69,19 @@ export class ForceLayout {
   private readonly bodies: Map<string, NodePhysics>
 
   /**
-   * Per-directory sleep state, keyed by real node path (files are never bodies, so they are never
-   * here). A directory whose velocity AND net force stay below {@link SLEEP_*} thresholds for
-   * {@link SLEEP_DWELL_MS} of accumulated quiet time goes {@link SleepState.asleep}, after which the
+   * Per-directory sleep AND cooling state, keyed by real node path (files are never bodies, so they
+   * are never here). Each body carries its OWN cooling {@link SleepState.temperature} (the former
+   * global `alpha`, now localized) plus its sleep bookkeeping: a directory whose velocity AND
+   * movement stay below {@link SLEEP_*} thresholds for {@link SLEEP_DWELL_MS} of accumulated quiet
+   * time, and whose temperature has cooled to rest, goes {@link SleepState.asleep}, after which the
    * integrator skips it entirely until something wakes it (a force above the wake threshold, a
    * camera impulse, or a structural change near it). This is the convergence + scale-perf win: a
    * settled forest does almost no integration work, and its nodes stop micro-moving so the scene's
    * skip-redraw actually triggers. Absent for the pinned root (never integrated anyway).
+   *
+   * Localizing the temperature per body is the core fix for the whole-tree pulse-spin: a structural
+   * change re-heats ONLY the bodies near the disturbance (see {@link sync}), so an already-settled
+   * forest is not re-energized on every incoming event the way a single global temperature was.
    */
   private readonly sleepByPath: Map<string, SleepState>
 
@@ -95,23 +101,11 @@ export class ForceLayout {
 
   private readonly options: Required<ForceLayoutOptions>
 
-  /**
-   * The global cooling temperature (d3-force-style `alpha`), in `[0, 1]`. Every directory's force
-   * step is scaled by it, and it decays toward 0 each step ({@link ALPHA_DECAY_PER_SECOND}). This is
-   * the convergence schedule on top of the per-body sleeping: it shrinks the residual jitter of a
-   * deep, competing force network frame by frame until each body's realized step drops below the
-   * sleep threshold and the whole forest goes static, instead of limit-cycling forever. It is
-   * REHEATED to 1 by any disturbance (a structural change on {@link sync} or a camera
-   * {@link applyImpulse}) so the layout re-anneals when it actually needs to move.
-   */
-  private alpha: number
-
   constructor(options: ForceLayoutOptions = {}) {
     this.bodies = new Map()
     this.sleepByPath = new Map()
     this.metaByPath = new Map()
     this.pinnedPath = null
-    this.alpha = 1
     this.options = {
       center: options.center ?? { x: 0, y: 0 },
       gravity: options.gravity ?? DEFAULT_GRAVITY,
@@ -148,6 +142,13 @@ export class ForceLayout {
    * The per-node metadata index ({@link NodeMeta}) is rebuilt here: each node's display-parent,
    * whether it is a file, its depth, its content radius, and (for files) its packed ring slot. That
    * lets every {@link step} apply the forces without re-walking the tree.
+   *
+   * The re-heat is LOCAL, not global: only the directories actually disturbed by this change (each
+   * newly-added directory, its display-parent, and that parent's visible directory children) have
+   * their cooling temperature reset to full and are woken. Every other directory keeps its current
+   * (cooled, ~0) temperature and stays asleep, so one event re-anneals just its own neighborhood and
+   * the rest of an already-settled forest stays put. This replaces the former global `alpha = 1`
+   * reheat that re-energized the whole forest on every event (the whole-tree pulse-spin bug).
    */
   public sync(visibleNodes: VisibleNode[]): void {
     this.metaByPath.clear()
@@ -160,6 +161,11 @@ export class ForceLayout {
         this.pinForestRoot(visible.node.path)
       }
     }
+
+    // The directory paths this sync newly added, collected so the reheat can be scoped to just their
+    // neighborhood (the added node + its display-parent + that parent's directory children) rather
+    // than the whole forest.
+    const newlyAddedDirectoryPaths: string[] = []
 
     // Pre-compute each directory's content radius, its direct visible file count (for the
     // parent-radius rest gap), and each file's packed ring slot, so the spring rest distances and
@@ -194,46 +200,123 @@ export class ForceLayout {
           position: this.spawnPositionFor(path, meta, initialPlacement),
           velocity: { x: 0, y: 0 },
         })
-      }
-      else {
-        // An existing directory gains/keeps a body. A structural change (a sibling appeared, a
-        // child was added under it) disturbs its force balance, so wake it to re-settle; a file is
-        // not an integrated body and needs no waking.
         if (!meta.isFile) {
-          this.wake(path)
+          newlyAddedDirectoryPaths.push(path)
         }
       }
-      // Every tracked directory must have a sleep record; create one (awake) for a fresh body.
-      if (!meta.isFile && !this.sleepByPath.has(path)) {
-        this.sleepByPath.set(path, { asleep: false, restMs: 0, lastStepDistance: 0 })
+      // Every tracked directory must have a sleep record; create one (asleep + cold) for a fresh
+      // body. The local reheat below is what actually heats and wakes the disturbed neighborhood, so
+      // a freshly-spawned directory starts cold here and is energized only if it is in that region
+      // (which a newly-added directory always is). The display-parent is refreshed every sync so a
+      // removal can find a node's parent after its meta is gone.
+      if (!meta.isFile) {
+        const sleep = this.sleepByPath.get(path)
+        if (sleep) {
+          sleep.displayParentPath = meta.displayParentPath
+        }
+        else {
+          this.sleepByPath.set(path, {
+            asleep: true,
+            restMs: 0,
+            temperature: 0,
+            lastStepDistance: 0,
+            lastStepX: 0,
+            lastStepY: 0,
+            displayParentPath: meta.displayParentPath,
+          })
+        }
       }
     }
 
     // Drop bodies (and their sleep state) whose node is no longer visible, so the sim and the drawn
-    // forest stay in lockstep, and wake any directory that lost a neighbor so the gap re-settles.
+    // forest stay in lockstep. The display-parent of any removed directory leaves a gap its
+    // remaining siblings should close, so it is treated as a disturbed region too (reheated below).
+    // The removed node's own meta was cleared at the top of sync, so its parent is taken from the
+    // sleep record captured at its last sync.
+    const removedDirectoryParents: string[] = []
     for (const path of [ ...this.bodies.keys() ]) {
-      if (!livePaths.has(path)) {
-        this.bodies.delete(path)
-        this.sleepByPath.delete(path)
+      if (livePaths.has(path)) {
+        continue
       }
+      const removedParent = this.sleepByPath.get(path)?.displayParentPath
+      if (removedParent !== undefined) {
+        removedDirectoryParents.push(removedParent)
+      }
+      this.bodies.delete(path)
+      this.sleepByPath.delete(path)
     }
 
-    // A structural change (the only time the controller calls `sync`) disturbs the force balance, so
-    // reheat the cooling schedule to full: the layout re-anneals from whatever it was, then cools
-    // back to rest. Without this, a node added after the forest cooled would never get the energy to
-    // find its place.
-    this.alpha = 1
+    // Localize the reheat: only the directories actually disturbed by this structural change are
+    // re-energized, so an already-settled forest is not pulse-spun on every incoming event. The
+    // disturbed set is each newly-added directory, its display-parent, and that parent's visible
+    // directory children (its siblings), plus the surviving parents of any removed directories.
+    // Everything else keeps its cooled temperature and stays asleep.
+    this.reheatDisturbedRegion(newlyAddedDirectoryPaths, removedDirectoryParents)
   }
 
   /**
-   * Wakes a sleeping directory so the integrator resumes moving it: clears its asleep flag and its
-   * accumulated quiet time. Called when something disturbs the layout near it (a structural change
-   * on {@link sync}, a strong force, or a camera {@link applyImpulse}). A no-op for a path with no
-   * sleep record (a file, the pinned root, or an untracked node).
+   * Re-energizes only the neighborhood of a structural change so a settled forest is not woken
+   * wholesale. For each newly-added directory we reheat the node itself, its display-parent, and
+   * that parent's visible directory children (its siblings, which must re-fan to make room); for a
+   * removed directory we reheat its display-parent (its remaining siblings should close the gap).
+   * "Reheat" sets the body's cooling temperature back to full and wakes it; an undisturbed body is
+   * left at its current (cooled) temperature and asleep, so the disturbance does not cascade across
+   * the whole tree.
    */
-  private wake(path: string): void {
+  private reheatDisturbedRegion(addedDirectoryPaths: string[], removedDirectoryParents: string[]): void {
+    const disturbed = new Set<string>()
+    const childrenByParent = this.directoryChildrenByParent()
+
+    const reheatParentAndSiblings = (parentPath: string): void => {
+      disturbed.add(parentPath)
+      for (const siblingPath of childrenByParent.get(parentPath) ?? []) {
+        disturbed.add(siblingPath)
+      }
+    }
+
+    for (const addedPath of addedDirectoryPaths) {
+      disturbed.add(addedPath)
+      const parentPath = this.metaByPath.get(addedPath)?.displayParentPath
+      if (parentPath !== undefined) {
+        reheatParentAndSiblings(parentPath)
+      }
+    }
+    for (const parentPath of removedDirectoryParents) {
+      reheatParentAndSiblings(parentPath)
+    }
+
+    for (const path of disturbed) {
+      this.reheat(path)
+    }
+  }
+
+  /** Groups every tracked directory body's path under its display-parent, for the local reheat. */
+  private directoryChildrenByParent(): Map<string, string[]> {
+    const childrenByParent = new Map<string, string[]>()
+    for (const [ path, meta ] of this.metaByPath) {
+      if (meta.isFile) {
+        continue
+      }
+      const existing = childrenByParent.get(meta.displayParentPath)
+      if (existing) {
+        existing.push(path)
+      }
+      else {
+        childrenByParent.set(meta.displayParentPath, [ path ])
+      }
+    }
+    return childrenByParent
+  }
+
+  /**
+   * Reheats one directory body: sets its cooling temperature back to full and wakes it, so the
+   * integrator re-anneals it from full force-energy and then cools it back to rest. A no-op for a
+   * path with no sleep record (a file, the pinned root, or an untracked node).
+   */
+  private reheat(path: string): void {
     const sleep = this.sleepByPath.get(path)
     if (sleep) {
+      sleep.temperature = 1
       sleep.asleep = false
       sleep.restMs = 0
     }
@@ -281,7 +364,6 @@ export class ForceLayout {
     this.sleepByPath.clear()
     this.metaByPath.clear()
     this.pinnedPath = null
-    this.alpha = 1
   }
 
   /**
@@ -326,16 +408,12 @@ export class ForceLayout {
     this.applyParentEdgeNudge(accelerations)
     this.applySiblingSpread(accelerations)
     this.integrateDirectories(accelerations, clampedMs, deltaSeconds)
+    this.deSpinAwakeBodies(accelerations)
     this.easeFiles(deltaSeconds)
 
-    // Cool the global temperature toward rest, framerate-independently. As alpha shrinks, each
-    // body's force step shrinks with it, so a deep, competing force network anneals to stillness
-    // (its residual jitter falls under the sleep threshold) instead of limit-cycling forever. Files
-    // are not cooled (they ease deterministically and always reach their slot).
-    this.alpha *= Math.pow(ALPHA_DECAY_PER_SECOND, deltaSeconds)
-    if (this.alpha < ALPHA_FLOOR) {
-      this.alpha = 0
-    }
+    // The per-body cooling now happens inside integrateDirectories: each awake directory decays its
+    // OWN temperature framerate-independently, so a disturbance re-anneals only its own neighborhood
+    // and a settled forest stays cold (no global temperature to pulse the whole tree on every event).
   }
 
   /**
@@ -370,13 +448,11 @@ export class ForceLayout {
       }
       body.velocity.x += kick.x
       body.velocity.y += kick.y
-      // A kicked body has velocity to spend, so wake it (and let the wobble settle it back to sleep).
-      this.wake(path)
+      // A kicked body has velocity to spend, so reheat it: wake it AND restore its force-energy so
+      // the kicked forest re-settles into a tidy arrangement after the wobble, rather than the kick
+      // just sliding cooled-flat bodies around. The wobble then settles each body back to sleep.
+      this.reheat(path)
     }
-
-    // Reheat the cooling schedule so the kicked forest has the force-energy to re-settle into a tidy
-    // arrangement after the wobble, rather than the kick just sliding cooled-flat bodies around.
-    this.alpha = 1
   }
 
   /**
@@ -675,19 +751,21 @@ export class ForceLayout {
 
     for (const [ path, acceleration ] of accelerations) {
       const body = this.bodies.get(path)!
+      const sleepState = this.sleepByPath.get(path)
       const startX = body.position.x
       const startY = body.position.y
 
-      // Gource's momentumless force response: step straight toward the force balance, scaled by the
-      // global cooling temperature `alpha` so a deep, competing force network anneals to rest rather
-      // than limit-cycling forever (the convergence schedule). The step is also CLAMPED to a
-      // fraction of the node's own radius per frame ({@link maxStepFractionOfRadius}), so a strong,
-      // stiff force (deep in a big forest the gravity + edge terms can be large) can never carry the
-      // node past its equilibrium and set up a perpetual overshoot. Capping plus cooling keeps every
-      // frame a sub-equilibrium relaxation, so the forest converges to rest, while a settled node
-      // (tiny force) is unaffected.
-      const stepX = acceleration.x * deltaSeconds * this.alpha
-      const stepY = acceleration.y * deltaSeconds * this.alpha
+      // Gource's momentumless force response: step straight toward the force balance, scaled by this
+      // body's OWN cooling temperature (the localized former `alpha`) so a disturbed neighborhood
+      // anneals to rest rather than limit-cycling forever, while an undisturbed, cooled body does no
+      // force work at all (its temperature is ~0, so its step is ~0). The step is also CLAMPED to a
+      // fraction of the node's own radius per frame ({@link MAX_STEP_FRACTION_OF_RADIUS}), so a
+      // strong, stiff force (deep in a big forest the gravity + edge terms can be large) can never
+      // carry the node past its equilibrium and set up a perpetual overshoot. Capping plus cooling
+      // keeps every frame a sub-equilibrium relaxation, so the forest converges to rest.
+      const temperature = sleepState?.temperature ?? 0
+      const stepX = acceleration.x * deltaSeconds * temperature
+      const stepY = acceleration.y * deltaSeconds * temperature
       const stepLength = Math.hypot(stepX, stepY)
       const maxStep = Math.max(this.radiusOf(path), MIN_DIR_STEP) * MAX_STEP_FRACTION_OF_RADIUS
       if (stepLength > maxStep) {
@@ -706,26 +784,40 @@ export class ForceLayout {
       body.velocity.x *= retained
       body.velocity.y *= retained
 
-      // Record how far the body actually moved this step, so the overlap-wake can tell a real
-      // intruder (a moving body) from a settled neighbor resting with standing overlap.
-      const sleepState = this.sleepByPath.get(path)
-      if (sleepState) {
-        sleepState.lastStepDistance = Math.hypot(body.position.x - startX, body.position.y - startY)
-      }
-
-      // Sleep bookkeeping (convergence + the scale perf win): a directory whose actual per-step
-      // MOVEMENT and residual wobble velocity both sit below the sleep thresholds is quiet.
-      // Accumulate that quiet time; once it clears the dwell, the body sleeps and the integrator
-      // skips it next frame (so it stops micro-moving and the scene's skip-redraw triggers). Any
-      // disturbance above the thresholds resets the dwell, keeping the body awake while it still has
-      // settling to do. Keying on the realized step (not the raw force) means a body resting in a
-      // standing-overlap equilibrium, where opposing forces nearly cancel into a tiny net step, is
-      // correctly recognized as quiet and allowed to sleep.
       if (!sleepState) {
         continue
       }
+
+      // Record how far the body actually moved this step (magnitude for the overlap-wake, which tells
+      // a real intruder from a settled neighbor resting with standing overlap; and the vector for the
+      // de-spin, which needs the realized displacement to measure the group's net rotation).
+      const movedX = body.position.x - startX
+      const movedY = body.position.y - startY
+      sleepState.lastStepDistance = Math.hypot(movedX, movedY)
+      sleepState.lastStepX = movedX
+      sleepState.lastStepY = movedY
+
+      // Cool this body's own temperature toward rest, framerate-independently. As it shrinks, the
+      // body's force step shrinks with it, so a freshly-reheated neighborhood anneals to stillness
+      // (its residual jitter falls under the sleep threshold) and the rest of the forest, never
+      // reheated, stays cold. This is the per-body half of the localized-reheat fix.
+      sleepState.temperature *= Math.pow(TEMPERATURE_DECAY_PER_SECOND, deltaSeconds)
+      if (sleepState.temperature < TEMPERATURE_FLOOR) {
+        sleepState.temperature = 0
+      }
+
+      // Sleep bookkeeping (convergence + the scale perf win): a directory is ready to sleep when it
+      // has cooled (its temperature has bottomed out, so it would do no further force work) AND its
+      // actual per-step movement and residual wobble velocity both sit below the sleep thresholds.
+      // Accumulate that quiet time; once it clears the dwell, the body sleeps and the integrator
+      // skips it next frame (so it stops micro-moving and the scene's skip-redraw triggers). Any
+      // disturbance above the thresholds, or a fresh reheat, resets the dwell. Keying on the realized
+      // step (not the raw force) means a body resting in a standing-overlap equilibrium, where
+      // opposing forces nearly cancel into a tiny net step, is correctly recognized as quiet.
       const speed = Math.hypot(body.velocity.x, body.velocity.y)
-      if (sleepState.lastStepDistance < SLEEP_STEP_THRESHOLD && speed < SLEEP_SPEED_THRESHOLD) {
+      const cooled = sleepState.temperature === 0
+      const quiet = sleepState.lastStepDistance < SLEEP_STEP_THRESHOLD && speed < SLEEP_SPEED_THRESHOLD
+      if (cooled && quiet) {
         sleepState.restMs += deltaMs
         if (sleepState.restMs >= SLEEP_DWELL_MS) {
           sleepState.asleep = true
@@ -739,6 +831,102 @@ export class ForceLayout {
         sleepState.restMs = 0
       }
     }
+  }
+
+  /**
+   * Removes the net angular velocity of the awake bodies about the center, so the forest can never
+   * accumulate a coherent system-wide spin even if a force term carries a tiny rotational bias (the
+   * whole-tree pulse-spin the user saw). This is a cheap safeguard, secondary to the localized
+   * reheat: one pass over the awake bodies computes the mean angular displacement of their last step
+   * about the pin (or, unpinned, their centroid), then subtracts that uniform rotation's tangential
+   * component back out of each body's position.
+   *
+   * Mass-less and rotation-only: it cancels the COHERENT spin shared by the whole group, not the
+   * legitimate radial settling or the local shuffles, which average out and so contribute ~nothing to
+   * the net rotation. A single awake body (no group to spin) and a zero net rotation are both no-ops.
+   */
+  private deSpinAwakeBodies(accelerations: Map<string, Vec2>): void {
+    const center = this.systemCenter()
+
+    // Sum each awake body's tangential displacement about the center as the cross product of its
+    // lever arm (offset from the center) and its realized last-step displacement, normalized by the
+    // summed squared lever arm. That is the least-squares mean angular velocity of the group: a
+    // coherent rotation, where every body's tangential move shares one sign, accumulates here, while
+    // the radial settling and uncorrelated local shuffles average toward zero.
+    let sumCross = 0
+    let sumLeverSquared = 0
+    let awakeCount = 0
+    for (const [ path, body ] of this.bodies) {
+      const sleepState = this.sleepByPath.get(path)
+      if (!accelerations.has(path) || !sleepState) {
+        continue
+      }
+      const offsetX = body.position.x - center.x
+      const offsetY = body.position.y - center.y
+      const leverSquared = offsetX * offsetX + offsetY * offsetY
+      if (leverSquared < EPSILON) {
+        continue
+      }
+      sumCross += offsetX * sleepState.lastStepY - offsetY * sleepState.lastStepX
+      sumLeverSquared += leverSquared
+      awakeCount++
+    }
+
+    if (awakeCount < 2 || sumLeverSquared < EPSILON) {
+      return
+    }
+
+    // The mean angular velocity (radians this step) shared by the group; subtract the matching
+    // rigid rotation from each awake body so the coherent spin is removed but the radial settling and
+    // uncorrelated local moves (which sum to ~0 here) are left intact.
+    const meanAngle = sumCross / sumLeverSquared
+    if (Math.abs(meanAngle) < EPSILON) {
+      return
+    }
+    for (const [ path, body ] of this.bodies) {
+      if (!accelerations.has(path)) {
+        continue
+      }
+      const offsetX = body.position.x - center.x
+      const offsetY = body.position.y - center.y
+      // Subtract the tangential component of the shared rotation: a rotation by `-meanAngle` about
+      // the center, linearized for the tiny per-step angle (cos ~ 1, sin ~ angle).
+      body.position.x += meanAngle * offsetY
+      body.position.y -= meanAngle * offsetX
+    }
+  }
+
+  /**
+   * The center the de-spin measures rotation about: the pinned forest root when one is shown (the
+   * forest hangs and turns about it), else the centroid of the awake directory bodies (an unpinned
+   * forest turns about its own middle).
+   */
+  private systemCenter(): Vec2 {
+    if (this.pinnedPath !== null) {
+      const rootBody = this.bodies.get(this.pinnedPath)
+      if (rootBody) {
+        return { x: rootBody.position.x, y: rootBody.position.y }
+      }
+    }
+    let sumX = 0
+    let sumY = 0
+    let count = 0
+    for (const [ path, meta ] of this.metaByPath) {
+      if (meta.isFile || this.sleepByPath.get(path)?.asleep) {
+        continue
+      }
+      const body = this.bodies.get(path)
+      if (!body) {
+        continue
+      }
+      sumX += body.position.x
+      sumY += body.position.y
+      count++
+    }
+    if (count === 0) {
+      return { x: this.options.center.x, y: this.options.center.y }
+    }
+    return { x: sumX / count, y: sumY / count }
   }
 
   /**
@@ -840,9 +1028,11 @@ export class ForceLayout {
 }
 
 /**
- * The internal sleep state of one directory body, keyed by path in {@link ForceLayout.sleepByPath}.
- * A body accumulates {@link restMs} of below-threshold quiet time and, once it clears
- * {@link SLEEP_DWELL_MS}, flips {@link asleep} so the integrator skips it until something wakes it.
+ * The internal sleep AND cooling state of one directory body, keyed by path in
+ * {@link ForceLayout.sleepByPath}. Each body carries its own {@link temperature} (the localized
+ * former global `alpha`) plus its sleep bookkeeping: it accumulates {@link restMs} of below-threshold
+ * quiet time and, once it has cooled and clears {@link SLEEP_DWELL_MS}, flips {@link asleep} so the
+ * integrator skips it until something reheats it.
  */
 type SleepState = {
   /** Whether the integrator currently skips this body (it has settled). */
@@ -850,11 +1040,28 @@ type SleepState = {
   /** Accumulated quiet (below-threshold) time since the body was last disturbed, in milliseconds. */
   restMs: number
   /**
+   * This body's own cooling temperature in `[0, 1]` (the localized former global `alpha`): the
+   * integrator scales the body's force step by it and decays it toward 0 each awake step
+   * ({@link TEMPERATURE_DECAY_PER_SECOND}). A structural change near the body or a camera impulse
+   * reheats it to 1; an undisturbed, cooled body sits at 0 and does no force work, which is what
+   * keeps a settled forest from re-energizing on every event.
+   */
+  temperature: number
+  /**
    * How far this body moved on its last integrated step, in layout units. Drives the overlap-wake:
    * only a body that genuinely moved (a real intruder, not a settled body resting with standing
    * overlap) wakes the sleeping neighbors it overlaps. Zero for a sleeping or never-stepped body.
    */
   lastStepDistance: number
+  /** The x component of the last integrated step's displacement, in layout units. Drives the de-spin. */
+  lastStepX: number
+  /** The y component of the last integrated step's displacement, in layout units. Drives the de-spin. */
+  lastStepY: number
+  /**
+   * The body's display-parent path at the last sync, kept so a removal can find a node's parent to
+   * reheat after the node's {@link NodeMeta} has been cleared. Mirrors {@link NodeMeta.displayParentPath}.
+   */
+  displayParentPath: string
 }
 
 /**
@@ -969,23 +1176,24 @@ const MAX_STEP_FRACTION_OF_RADIUS = 4
 const MIN_DIR_STEP = 8
 
 /**
- * The per-SECOND multiplier the global cooling temperature `alpha` decays by (framerate-independent:
- * `alpha *= ALPHA_DECAY_PER_SECOND ^ deltaSeconds` each step). At `0.08` the temperature roughly
- * halves every ~0.27s, so a freshly-(re)heated forest anneals from full energy to effectively cold
- * in a few seconds, after which the residual force steps are tiny and every body sleeps. This is the
- * convergence schedule that breaks the deep-tree limit cycle the raw force model otherwise sits in.
- * Lower cools faster (snappier settle, less organic glide); higher cools slower (more lingering
- * motion). Reheated to 1 by any structural change ({@link ForceLayout.sync}) or camera impulse.
+ * The per-SECOND multiplier each body's cooling temperature decays by (framerate-independent:
+ * `temperature *= TEMPERATURE_DECAY_PER_SECOND ^ deltaSeconds` each awake step). At `0.08` the
+ * temperature roughly halves every ~0.27s, so a freshly-reheated neighborhood anneals from full
+ * energy to effectively cold in a few seconds, after which its residual force steps are tiny and its
+ * bodies sleep. This is the per-body convergence schedule that breaks the deep-tree limit cycle the
+ * raw force model otherwise sits in. Lower cools faster (snappier settle, less organic glide); higher
+ * cools slower (more lingering motion). A tuning knob. Reset to 1 by a local reheat (a structural
+ * change near the body in {@link ForceLayout.sync}) or a camera impulse.
  */
-const ALPHA_DECAY_PER_SECOND = 0.08
+const TEMPERATURE_DECAY_PER_SECOND = 0.08
 
 /**
- * The temperature below which `alpha` snaps to exactly 0, so a cooled forest does no residual force
- * stepping at all (the force step becomes literally zero) and every body reliably sleeps rather than
- * creeping by ever-smaller-but-nonzero amounts forever. Small enough that the layout is visually at
- * rest well before it trips.
+ * The temperature below which a body's temperature snaps to exactly 0, so a cooled body does no
+ * residual force stepping at all (its force step becomes literally zero) and reliably sleeps rather
+ * than creeping by ever-smaller-but-nonzero amounts forever. Small enough that the body is visually
+ * at rest well before it trips. A tuning knob.
  */
-const ALPHA_FLOOR = 0.002
+const TEMPERATURE_FLOOR = 0.002
 
 /**
  * The realized per-step movement (layout units) below which a directory counts as quiet for

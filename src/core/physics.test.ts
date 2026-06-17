@@ -873,6 +873,156 @@ describe('clampSpeed', () => {
   })
 })
 
+describe('ForceLayout: localized reheat (no whole-tree re-energize on every event)', () => {
+  /** Snapshots every body's current position so a later state can be diffed against it. */
+  function snapshotPositions(layout: ForceLayout): Map<string, { x: number, y: number }> {
+    const snapshot = new Map<string, { x: number, y: number }>()
+    for (const [ path, body ] of layout.state) {
+      snapshot.set(path, { x: body.position.x, y: body.position.y })
+    }
+    return snapshot
+  }
+
+  /** How far one body moved between a snapshot and the current state. */
+  function movedSince(snapshot: Map<string, { x: number, y: number }>, layout: ForceLayout, path: string): number {
+    const before = snapshot.get(path)!
+    const after = layout.state.get(path)!.position
+    return Math.hypot(after.x - before.x, after.y - before.y)
+  }
+
+  it('adding a node in ONE region leaves the distant, already-settled directories at rest', () => {
+    // Two well-separated repos. Once both settle apart, an add under one cannot legitimately move the
+    // other through any real force; only the OLD global reheat (alpha = 1 for the whole forest) would
+    // have re-energized the distant repo and drifted it. This is the core regression test.
+    const initial: VisibleNode[] = [
+      rootVisible(),
+      dir('alpha', '', 1),
+      dir('alpha/src', 'alpha', 2),
+      dir('alpha/docs', 'alpha', 2),
+      file('alpha/src/one.ts', 'alpha/src', 3),
+      file('alpha/src/two.ts', 'alpha/src', 3),
+      file('alpha/docs/intro.md', 'alpha/docs', 3),
+      dir('omega', '', 1),
+      dir('omega/lib', 'omega', 2),
+      dir('omega/test', 'omega', 2),
+      file('omega/lib/a.ts', 'omega/lib', 3),
+      file('omega/lib/b.ts', 'omega/lib', 3),
+      file('omega/test/a.test.ts', 'omega/test', 3),
+    ]
+    const layout = new ForceLayout()
+    layout.sync(initial)
+    stepTimes(layout, FIXED_DELTA_MS, 1200)
+
+    // The forest is now at rest. Snapshot, then add a node under `alpha` only.
+    const settled = snapshotPositions(layout)
+    const distant = [ 'omega', 'omega/lib', 'omega/test' ]
+    for (const path of distant) {
+      expect(settled.has(path)).toBe(true)
+    }
+
+    const grown: VisibleNode[] = [
+      ...initial,
+      dir('alpha/extra', 'alpha', 2),
+      file('alpha/extra/new.ts', 'alpha/extra', 3),
+    ]
+    layout.sync(grown)
+    stepTimes(layout, FIXED_DELTA_MS, 1200)
+
+    // The distant `omega` subtree, untouched by the structural change, did not move (sub-pixel).
+    for (const path of distant) {
+      expect(movedSince(settled, layout, path)).toBeLessThan(0.5)
+    }
+    // And the disturbed region actually accommodated the new node.
+    expect(layout.state.has('alpha/extra')).toBe(true)
+  })
+
+  it('repeated structural changes over time stay bounded and end mostly asleep (no perpetual churn)', () => {
+    const visible: VisibleNode[] = [
+      dir('repo', '', 1),
+      dir('repo/src', 'repo', 2),
+      dir('repo/docs', 'repo', 2),
+      file('repo/src/a.ts', 'repo/src', 3),
+      file('repo/docs/x.md', 'repo/docs', 3),
+    ]
+    const layout = new ForceLayout()
+    layout.sync(visible)
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+
+    // Drip in new files one at a time, settling a little between each, like a busy live instance.
+    for (let index = 0; index < 12; index++) {
+      visible.push(file(`repo/src/gen-${index}.ts`, 'repo/src', 3))
+      layout.sync(visible)
+      stepTimes(layout, FIXED_DELTA_MS, 120)
+    }
+
+    // After a long quiet tail the whole forest is still: nothing keeps churning.
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+    const tail = displacementOver(layout, FIXED_DELTA_MS, 120)
+    expect(tail.max).toBeLessThan(0.5)
+
+    // And every position is finite (bounded): nothing exploded off.
+    for (const body of layout.state.values()) {
+      expect(Number.isFinite(body.position.x)).toBe(true)
+      expect(Number.isFinite(body.position.y)).toBe(true)
+    }
+  })
+
+  it('has no net rotation about the center after a disturbance settles (de-spin safeguard)', () => {
+    // A ring of sibling repos: the de-spin must keep any coherent system-wide turn out of the
+    // re-settle, so the net rotation about the centroid stays near zero even though bodies move.
+    const initial: VisibleNode[] = [ rootVisible() ]
+    for (let index = 0; index < 8; index++) {
+      const repoPath = `r${index}`
+      initial.push(dir(repoPath, '', 1))
+      initial.push(dir(`${repoPath}/a`, repoPath, 2))
+      initial.push(dir(`${repoPath}/b`, repoPath, 2))
+    }
+    const layout = new ForceLayout()
+    layout.sync(initial)
+    stepTimes(layout, FIXED_DELTA_MS, 1200)
+
+    // Snapshot, find the centroid of the awake-able directory bodies, then disturb several regions.
+    const before = snapshotPositions(layout)
+    let sumX = 0
+    let sumY = 0
+    let count = 0
+    for (const [ path, position ] of before) {
+      if (path === '') {
+        continue
+      }
+      sumX += position.x
+      sumY += position.y
+      count++
+    }
+    const center = { x: sumX / count, y: sumY / count }
+
+    const grown: VisibleNode[] = [ ...initial, dir('r0/c', 'r0', 2), dir('r3/c', 'r3', 2), dir('r6/c', 'r6', 2) ]
+    layout.sync(grown)
+    stepTimes(layout, FIXED_DELTA_MS, 1200)
+
+    // The lever-arm-normalized summed tangential displacement (the mean angle the whole forest turned
+    // about its center). A coherent pulse-spin would make this clearly non-zero; de-spun it is tiny.
+    let sumCross = 0
+    let sumLeverSquared = 0
+    for (const [ path, position ] of before) {
+      if (path === '') {
+        continue
+      }
+      const offsetX = position.x - center.x
+      const offsetY = position.y - center.y
+      const leverSquared = offsetX * offsetX + offsetY * offsetY
+      if (leverSquared < 1e-6) {
+        continue
+      }
+      const after = layout.state.get(path)!.position
+      sumCross += offsetX * (after.y - position.y) - offsetY * (after.x - position.x)
+      sumLeverSquared += leverSquared
+    }
+    const meanAngle = sumCross / sumLeverSquared
+    expect(Math.abs(meanAngle)).toBeLessThan(0.02)
+  })
+})
+
 describe('zoomImpulse', () => {
   it('zooming in pushes the nodes outward (away from the anchor)', () => {
     // centerOffset points from anchor to center; zooming in (factor > 1) flips it outward.
