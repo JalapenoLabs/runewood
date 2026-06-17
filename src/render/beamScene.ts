@@ -4,16 +4,14 @@ import type { Container } from 'pixi.js'
 import type { Vec2 } from '../core/layout'
 import type { RunewoodTheme } from '../core/theme'
 import type { BeamFieldOptions, ActiveBeam, BeamEndpointResolver } from './beams'
-import type { ActorActivity, ActorVisualOptions } from './actors'
-import type { ActorMotionOptions } from './actorMotion'
+import type { ActorActivity, ActorUserOptions } from './actors'
 
 // Core
 import { BlurFilter, Graphics } from 'pixi.js'
 
 import { hslToRgbInt } from './color'
 import { BeamField } from './beams'
-import { actorVisualFor, separateActorTargets } from './actors'
-import { ActorMotion } from './actorMotion'
+import { ActorUser } from './actors'
 
 /**
  * The retained beam/particle layer that sits *above* the forest (issue #6, and as
@@ -21,10 +19,9 @@ import { ActorMotion } from './actorMotion'
  * `drawBeam`). It mirrors the {@link import('./scene').Scene} pattern: it owns
  * persistent pixi {@link Graphics} parented into a single world container the
  * backend hands it, redraws them in place every frame, and is the only place
- * besides the backend allowed to know about pixi. The pure simulation
- * ({@link BeamField}), the pure actor placement model ({@link actorVisualFor}), and
- * the pure actor motion model ({@link ActorMotion}) decide *what* to draw; this class
- * only translates that onto pixi objects.
+ * besides the backend allowed to know about pixi. The pure beam simulation
+ * ({@link BeamField}) and the Gource actor physics ({@link ActorUser}) decide *what* to
+ * draw; this class only translates that onto pixi objects.
  *
  * Two kinds of thing live here, both additively blended for a glow that reads
  * above the forest:
@@ -33,25 +30,27 @@ import { ActorMotion } from './actorMotion'
  *   and refilled each frame, then blurred into a fuzzy glow. The cone's single point
  *   sits at the actor and it fans out onto the file, like a flashlight hitting it. Each
  *   beam's endpoints are resolved LIVE every frame (see below): its source is the firing
- *   actor's live eased orb position and its target is the touched node's live physics
+ *   actor's live user position and its target is the touched node's live physics
  *   position, so the beam flies from the contributor's orb to the actual file node and
  *   tracks it as the sim migrates it.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
- *   when an actor first appears and culled once it has fully faded out. The orb does
- *   not snap to its computed placement; it **swoops in** from the open space and
- *   **glides** to rest there via a retained {@link ActorMotion} (the Gource-style
- *   arrival), then stays put until it acts again.
+ *   when an actor first appears and culled once it has fully faded out. The orb is a
+ *   Gource {@link ActorUser}: a physics body that accelerates toward the files it is
+ *   acting on, brakes to rest just beside them, separates from other actors, and rolls
+ *   to a stop under friction, fading out after it goes idle.
  *
- * ### Actor motion (the "actors teleport and freeze" fix)
+ * ### Actor motion (the faithful Gource `RUser` port)
  *
- * The placement model ({@link actorVisualFor}) gives each actor the *target* it wants
- * to rest at (the outward recency anchor) plus its presence (lingering fade + idle
- * breath). Rather than snapping the orb there every frame, each actor carries an
- * {@link ActorMotion} that eases its drawn position toward that target with an
- * ease-out and ramps its opacity in on appearance. So an orb fades in fast, glides
- * inward from the open space, comes gently to rest, and then holds (the idle breath
- * still plays on top). The motion is driven by the real frame delta, like the
- * force-directed node sim it rides above.
+ * Each actor is an {@link ActorUser} (the port of Gource's `src/user.cpp`): a retained
+ * physics body with a position and an acceleration. Every frame the controller hands it
+ * the live positions of the files it is acting on (resolved from the node sim) and the
+ * other actors; the user accelerates toward the average of its files when beyond its
+ * beam distance, brakes within its action distance, repels actors inside its personal
+ * space, clamps to its max speed, integrates its position, and bleeds the acceleration
+ * off by friction. So an actor naturally flies to its file and eases to rest beside it
+ * (a short beam) with no hand-authored animation, and coasts to a stop and fades when it
+ * goes quiet. The motion is driven by the real frame delta, like the force-directed node
+ * sim it rides above; only the fade is a pure function of the playhead.
  *
  * The controller (#9) owns the playhead and the active event window; it spawns
  * beams via {@link spawn}/{@link spawnPulse}, supplies actor activity + the live node
@@ -63,28 +62,20 @@ export class BeamScene {
   private readonly layer: Container
   /** The pure particle simulation. This class never re-implements its math. */
   private readonly field: BeamField
-  /** Tuning for the actor placement model, forwarded verbatim each frame. */
-  private readonly actorOptions: ActorVisualOptions
-  /** Tuning for the actor motion (glide + opacity ramp + swoop), forwarded to each {@link ActorMotion}. */
-  private readonly motionOptions: ActorMotionOptions
-  /**
-   * The personal-space distance, in world units, two actor orbs are kept apart by
-   * each frame (Gource's user-to-user repulsion). `0` disables the separation. See
-   * {@link separateActorTargets}.
-   */
-  private readonly personalSpace: number
+  /** Tuning for the actor physics + fade (Gource's `RUser` constants), forwarded to each {@link ActorUser}. */
+  private readonly actorOptions: ActorUserOptions
 
   /** One batched graphic holding every live beam this frame, cleared and refilled. */
   private readonly beamGraphics: Graphics
   /** Retained actor orb graphics, keyed by actor id. */
   private readonly actorGraphics: Map<string, Graphics>
   /**
-   * Retained per-actor motion state (the eased drawn position + opacity ramp), keyed
-   * by actor id. Holds the orb's live position so a beam fired by this actor can
-   * resolve its source from where the orb actually is, and so the orb glides rather
+   * Retained per-actor physics bodies (Gource `RUser`s), keyed by actor id. Each holds
+   * its live position so a beam fired by this actor can resolve its source from where
+   * the orb actually is, and so the orb flies and rolls to rest under the physics rather
    * than teleporting. Culled in lockstep with {@link actorGraphics}.
    */
-  private readonly actorMotion: Map<string, ActorMotion>
+  private readonly actorUsers: Map<string, ActorUser>
 
   /**
    * @param layer the world container for beams/actors, added above the forest
@@ -94,8 +85,6 @@ export class BeamScene {
     this.layer = layer
     this.field = new BeamField(options.beams)
     this.actorOptions = options.actors ?? {}
-    this.motionOptions = options.motion ?? {}
-    this.personalSpace = options.personalSpace ?? DEFAULT_ACTOR_PERSONAL_SPACE
 
     this.beamGraphics = new Graphics()
     // Additive blend so overlapping beams build toward white, the way real bloom
@@ -110,19 +99,18 @@ export class BeamScene {
     this.layer.addChild(this.beamGraphics)
 
     this.actorGraphics = new Map()
-    this.actorMotion = new Map()
+    this.actorUsers = new Map()
   }
 
   /**
-   * The live, eased drawn position of an actor's orb this frame, or `null` if the actor
-   * has no live orb (it has not appeared yet or has fully faded). This is the EXACT
-   * position the orb is drawn at, read straight off the same retained {@link ActorMotion}
-   * the draw uses, so a caller anchoring the actor's label here lands it precisely on the
-   * orb rather than on the touched-files centroid (which the orb glides away from). It is
-   * valid only after {@link update} has advanced the motion this frame.
+   * The live position of an actor's orb this frame, or `null` if the actor has no live
+   * orb (it has not appeared yet or has fully faded). This is the EXACT position the orb
+   * is drawn at, read straight off the same retained {@link ActorUser} the draw uses, so
+   * a caller anchoring the actor's label here lands it precisely on the orb. It is valid
+   * only after {@link update} has stepped the physics this frame.
    */
   public actorOrbPosition(actor: string): Vec2 | null {
-    return this.actorMotion.get(actor)?.drawnPosition ?? null
+    return this.actorUsers.get(actor)?.position ?? null
   }
 
   /** Spawns a beam from an actor to a touched file (by path; resolved live). See {@link BeamField.spawn}. */
@@ -176,7 +164,7 @@ export class BeamScene {
     // track it. An actor with no live orb (faded out) or a missing target node ends
     // the beam gracefully (the resolver returns null and the field drops it).
     const resolver: BeamEndpointResolver = {
-      actorSource: (actor) => this.actorMotion.get(actor)?.drawnPosition ?? null,
+      actorSource: (actor) => this.actorUsers.get(actor)?.position ?? null,
       nodePosition,
     }
     this.drawBeams(this.field.activeBeams(now, resolver), theme)
@@ -256,16 +244,16 @@ export class BeamScene {
   }
 
   /**
-   * Reconciles the retained actor orbs with the supplied activity: glides each orb
-   * toward its modeled target (rather than snapping it there), draws it at its eased
-   * position and ramped-in opacity, and culls any retained actor no longer present in
-   * `activities` or fully faded so the layer never keeps a dead orb around.
+   * Steps and draws the retained actor users from the supplied activity (Gource's
+   * `RUser` loop). For each actor it gets-or-creates an {@link ActorUser}, applies the
+   * pull toward the files it is acting on and the repulsion from the other actors, steps
+   * the physics by the real frame delta, then draws the orb at the user's live position
+   * with its idle fade. Any retained actor no longer present in `activities` or fully
+   * faded is culled so the layer never keeps a dead orb around.
    *
-   * The placement model gives the orb its *target* (the outward recency anchor) and
-   * presence (lingering fade + idle breath); the retained {@link ActorMotion} eases
-   * the drawn position toward that target and ramps opacity in on appearance, so the
-   * orb swoops in and glides to rest rather than teleporting. A reappearing actor
-   * (its motion was culled when it fully faded) starts a fresh swoop.
+   * Forces are applied to every user FIRST and the bodies stepped SECOND (Gource's
+   * order), so a frame's separation reads the start-of-frame positions and the users
+   * move together rather than in a position-dependent sequence.
    */
   private drawActors(
     activities: ActorActivity[],
@@ -287,48 +275,41 @@ export class BeamScene {
       ? MIN_ACTOR_SCREEN_PX / zoom
       : 0
 
-    // Compute every visible actor's modeled visual once, then gently separate their
-    // resting targets so two contributors working on top of each other do not stack
-    // into one orb (Gource's personal-space repulsion). The separated targets feed the
-    // glide below; presence/size/color stay as modeled. Fully-faded actors are culled
-    // here so they neither separate nor draw.
-    const visible: { activity: ActorActivity, visual: ReturnType<typeof actorVisualFor> }[] = []
+    // Resolve (and spawn) the live user for every actor reported this frame. A
+    // brand-new actor spawns at the average of the files it is acting on (Gource spawns
+    // a user at a file position) so it appears beside its work and flies in from there;
+    // with no resolvable file it spawns at the origin and the forces carry it out.
+    const stepping: { activity: ActorActivity, user: ActorUser }[] = []
     for (const activity of activities) {
-      const visual = actorVisualFor(activity, now, this.actorOptions)
+      present.add(activity.actor)
+      let user = this.actorUsers.get(activity.actor)
+      if (!user) {
+        user = new ActorUser(activity.actor, spawnPositionFor(activity.touched), this.actorOptions)
+        this.actorUsers.set(activity.actor, user)
+      }
+      stepping.push({ activity, user })
+    }
+
+    // Apply this frame's forces to every user before stepping any of them, so the
+    // user-to-user separation reads the start-of-frame positions (Gource's order).
+    for (const { activity, user } of stepping) {
+      user.applyForceToActions(activity.touched)
+      for (const other of stepping) {
+        user.applyForceUser(other.user)
+      }
+    }
+
+    // Integrate every user, then draw it at its live position with its idle fade.
+    const deltaSeconds = deltaMs / 1000
+    for (const { activity, user } of stepping) {
+      user.step(deltaSeconds)
+      const visual = user.visualAt(now, activity.lastActiveAt)
       if (visual.alpha <= 0) {
-        // Fully faded: cull it (and its motion) rather than draw an invisible orb. A
-        // later reappearance starts a fresh swoop from the open space.
+        // Fully faded: cull it rather than draw an invisible orb. A later reappearance
+        // spawns a fresh user beside its new work.
         this.removeActor(activity.actor)
         continue
       }
-      visible.push({ activity, visual })
-    }
-
-    const separated = separateActorTargets(
-      visible.map((entry) => ({ actor: entry.activity.actor, position: entry.visual.position })),
-      this.personalSpace,
-    )
-
-    for (let index = 0; index < visible.length; index++) {
-      const { activity, visual } = visible[index]
-      present.add(activity.actor)
-
-      // The target the orb wants to rest at this frame: the placement model's outward
-      // recency position, nudged apart from any co-located actor. The retained motion
-      // eases the drawn position toward it.
-      const target = separated[index]
-      let motion = this.actorMotion.get(activity.actor)
-      if (!motion) {
-        // First appearance (or a reappearance after a full fade): start OUT in the
-        // open space and swoop in.
-        motion = new ActorMotion(target, this.motionOptions)
-        this.actorMotion.set(activity.actor, motion)
-      }
-      // Glide the drawn position toward the target and ramp opacity in. The ramp
-      // multiplies the modeled presence so the orb fades in as it swoops, then rides
-      // the model's lingering fade + idle breath once arrived.
-      const rampAlpha = motion.advance(target, deltaMs)
-      const drawn = motion.drawnPosition
 
       let graphics = this.actorGraphics.get(activity.actor)
       if (!graphics) {
@@ -343,8 +324,8 @@ export class BeamScene {
       graphics.clear()
       graphics
         .circle(0, 0, radius)
-        .fill({ color, alpha: visual.alpha * rampAlpha * theme.bloomIntensity })
-      graphics.position.set(drawn.x, drawn.y)
+        .fill({ color, alpha: visual.alpha * theme.bloomIntensity })
+      graphics.position.set(visual.position.x, visual.position.y)
     }
 
     // Cull retained actors the controller no longer reports at all (their window
@@ -356,17 +337,36 @@ export class BeamScene {
     }
   }
 
-  /** Tears down one actor's retained orb graphic and its motion state. */
+  /** Tears down one actor's retained orb graphic and its physics body. */
   private removeActor(actor: string): void {
     const graphics = this.actorGraphics.get(actor)
     if (graphics) {
       graphics.destroy()
       this.actorGraphics.delete(actor)
     }
-    // Drop the motion too so a reappearance swoops in fresh rather than resuming from
-    // a stale drawn position.
-    this.actorMotion.delete(actor)
+    // Drop the user too so a reappearance spawns fresh rather than resuming from a stale
+    // physics body.
+    this.actorUsers.delete(actor)
   }
+}
+
+/**
+ * Where a brand-new actor user spawns: the average of the files it is acting on this
+ * frame, so it appears beside its work and the action forces fly it in from there. With
+ * no resolvable file (it reported activity with nothing touched yet) it spawns at the
+ * origin and is carried out by the forces as its files resolve.
+ */
+function spawnPositionFor(touched: Vec2[]): Vec2 {
+  if (touched.length === 0) {
+    return { x: 0, y: 0 }
+  }
+  let sumX = 0
+  let sumY = 0
+  for (const target of touched) {
+    sumX += target.x
+    sumY += target.y
+  }
+  return { x: sumX / touched.length, y: sumY / touched.length }
 }
 
 /**
@@ -376,15 +376,6 @@ export class BeamScene {
  * "who is doing what" orb readable as the forest grows around it.
  */
 const MIN_ACTOR_SCREEN_PX = 9
-
-/**
- * The default personal-space distance, in world units, two actor orbs are kept apart
- * by each frame (Gource's user-to-user repulsion, {@link separateActorTargets}). Sized
- * a little above an orb's own draw size so two contributors on the same file read as
- * two distinct dudes rather than one. A judgment call worth tuning to taste; set to `0`
- * via {@link BeamSceneOptions.personalSpace} to disable.
- */
-const DEFAULT_ACTOR_PERSONAL_SPACE = 28
 
 /**
  * The additive layers each beam is drawn from, widest-and-dimmest first so the
@@ -413,13 +404,10 @@ const BEAM_BLUR_STRENGTH = 6
 /** Construction options for a {@link BeamScene}; forwards tuning to the pure models. */
 export type BeamSceneOptions = {
   beams?: BeamFieldOptions
-  actors?: ActorVisualOptions
-  /** Tuning for the actor swoop-in / glide / ease-to-rest motion. See {@link ActorMotionOptions}. */
-  motion?: ActorMotionOptions
   /**
-   * The personal-space distance, in world units, two actor orbs are kept apart by each
-   * frame (Gource's user-to-user repulsion). Defaults to {@link DEFAULT_ACTOR_PERSONAL_SPACE};
-   * `0` disables the separation so co-located orbs rely on their hashed drift alone.
+   * Tuning for the actor physics + idle fade (the Gource `RUser` constants: beam /
+   * action / personal-space distances, max speed, friction, idle and fade times). Every
+   * field defaults to Gource's own value. See {@link ActorUserOptions}.
    */
-  personalSpace?: number
+  actors?: ActorUserOptions
 }

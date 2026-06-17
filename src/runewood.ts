@@ -6,7 +6,7 @@ import type { ForceLayoutOptions } from './core/physics'
 import type { RunewoodTheme, RunewoodThemeOverrides } from './core/theme'
 import type { WorldBounds } from './render/camera'
 import type { FrameState, BeamSpawnRequest, PulseSpawnRequest } from './core/frameStep'
-import type { ActorActivity, ActorVisualOptions } from './render/actors'
+import type { ActorActivity, ActorUserOptions } from './render/actors'
 import type { LabelCandidate } from './render/labels'
 import type { BloomQuality } from './render/bloom'
 import type { SceneOptions } from './render/scene'
@@ -38,7 +38,7 @@ import { Camera, autoFrame } from './render/camera'
 import { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
 import { resolveBloomQuality } from './render/bloom'
 import { PixiBackend } from './render/pixiBackend'
-import { actorVisualFor } from './render/actors'
+import { actorAlpha } from './render/actors'
 
 /**
  * The public, imperative controller for a Runewood visualization (issue #9). This
@@ -352,15 +352,15 @@ export type RunewoodOptions = {
    */
   rootLabel?: string
   /**
-   * How long an actor lingers parked at its last node before it fades, in
-   * milliseconds (Part C, the lingering knob). An LLM agent edits a file then often
-   * pauses before the next edit; with a long linger the actor STAYS at its last node
-   * (gently idle-pulsing) across that gap instead of dissolving after a few seconds.
-   * Defaults to a very long window (effectively "stays for the whole session"); set
-   * it shorter to make a quiet contributor dissolve sooner. Seraphim integration
-   * (#180) should leave it long for a live agent feed. Forwarded to the actor visual
-   * model as its `lingerMs`; finer actor tuning (idle-pulse depth, fade) is available
-   * via {@link beams}`.actors`.
+   * How long an actor stays fully present after its last action before it begins
+   * fading, in milliseconds: Gource's `RUser` idle time. An LLM agent edits a file then
+   * often pauses before the next edit; with a longer idle time the actor STAYS at its
+   * file (coasted to rest under the physics) across that gap instead of dissolving after
+   * Gource's default few seconds. Defaults to Gource's three seconds; raise it for a
+   * live agent feed (Seraphim integration, #180) so a paused agent stays put, or lower
+   * it to make a quiet contributor dissolve sooner. Forwarded to the actor physics model
+   * as its `idleMs`; finer actor tuning (friction, max speed, beam / action distances,
+   * fade) is available via {@link beams}`.actors`.
    */
   actorLingerMs?: number
   /**
@@ -581,7 +581,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // controller can compute an actor label's presence from the very same model the
   // orb uses, keeping the label exactly as present as its orb through the linger and
   // idle pulse. The beam scene is constructed from the same resolved options.
-  const actorVisualOptions: ActorVisualOptions = resolveBeamSceneOptions(options).actors ?? {}
+  const actorVisualOptions: ActorUserOptions = resolveBeamSceneOptions(options).actors ?? {}
 
   // Click hit slop in screen pixels, converted to world units per click via zoom.
   const hitRadiusPx = options.hitRadius ?? DEFAULT_HIT_RADIUS_PX
@@ -861,7 +861,32 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     return { x: sumX / count, y: sumY / count }
   }
 
-  /** Turns the reducer's actor tracking into drawable activity, resolving paths to physics positions. */
+  /** Mean of a set of vectors; the origin when empty. The label's one-frame anchor before the orb spawns. */
+  function centroidOfVecs(positions: Vec2[]): Vec2 {
+    if (positions.length === 0) {
+      return { x: 0, y: 0 }
+    }
+    let sumX = 0
+    let sumY = 0
+    for (const position of positions) {
+      sumX += position.x
+      sumY += position.y
+    }
+    return { x: sumX / positions.length, y: sumY / positions.length }
+  }
+
+  /**
+   * Turns the reducer's actor tracking into drawable activity for the Gource `RUser`
+   * physics (the actor's action targets + last-active time). It resolves the actor's
+   * touched paths to their live physics positions: these are the files the user
+   * accelerates toward this frame. An actor whose every touched file has no body yet
+   * (brand-new this frame) still emits an empty-touched activity so its retained user
+   * keeps coasting and fading rather than vanishing; the user's position is the physics
+   * body, never re-derived here.
+   *
+   * It also keeps each actor's parked `lastCentroid` current (used by the follow camera
+   * to frame a quiet actor at where it last worked).
+   */
   function buildActorActivities(): ActorActivity[] {
     const activities: ActorActivity[] = []
     for (const track of frameState.actors.values()) {
@@ -872,60 +897,18 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
           touched.push(body.position)
         }
       }
-      const lastCentroid = touched.length > 0 ? centroidOfPaths(track.touchedPaths) : track.lastCentroid
-      // Remember where the actor last worked so it stays parked there as it fades.
+      // Remember where the actor last worked so the follow camera keeps it framed there
+      // while it is quiet and fading.
       if (touched.length > 0) {
-        track.lastCentroid = lastCentroid
-      }
-      // Resolve the actor's most-recently-touched file to its live physics position
-      // so the orb can anchor on where the work is *now* (out at the leaves), not the
-      // centroid of everything it has touched. When the file's own body has not spawned
-      // yet (a brand-new file this same frame) we fall back to the file's PARENT body,
-      // so the actor still anchors out at that directory near the periphery rather than
-      // collapsing to the centroid/center. Undefined only once the actor has gone quiet
-      // (the window cleared `recentPath`).
-      const recent = track.recentPath ? resolveRecentPosition(track.recentPath) : undefined
-      // The actor's current drawn orb position, so the pure model can HOLD it where it
-      // already is on a frame that resolves no file at all, never yanking it to center.
-      const hold = beamScene?.actorOrbPosition(track.actor) ?? undefined
-      // If nothing resolves this frame (no live file, no parent, no parked centroid, no
-      // orb yet), there is genuinely no non-center place to put the actor: skip it for
-      // this frame rather than emit an activity that would anchor at the origin. It
-      // reappears (and swoops in) the instant any of its files gets a body.
-      if (!recent && touched.length === 0 && !lastCentroid && !hold) {
-        continue
+        track.lastCentroid = centroidOfPaths(track.touchedPaths)
       }
       activities.push({
         actor: track.actor,
         touched,
-        recent,
         lastActiveAt: track.lastActiveAt,
-        lastCentroid,
-        hold,
       })
     }
     return activities
-  }
-
-  /**
-   * The live position to anchor an actor's orb on for its most-recent file: the file's
-   * own physics body when it has spawned, otherwise the body of its PARENT directory.
-   * A brand-new file has no body for a frame or two while the sim spawns it; anchoring
-   * on the parent keeps the actor out at that directory near the periphery in the
-   * meantime instead of falling back toward the tree center. `undefined` only when
-   * neither the file nor its parent has a body yet.
-   */
-  function resolveRecentPosition(path: string): Vec2 | undefined {
-    const body = bodies.get(path)
-    if (body) {
-      return body.position
-    }
-    const lastSlash = path.lastIndexOf('/')
-    if (lastSlash <= 0) {
-      return undefined
-    }
-    const parentPath = path.slice(0, lastSlash)
-    return bodies.get(parentPath)?.position
   }
 
   /**
@@ -985,24 +968,28 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
 
     for (const activity of activities) {
-      // The actor label rides EXACTLY on its orb: anchor it on the orb's live eased
-      // drawn position (read straight off the beam scene's retained motion, the same
-      // position the orb is drawn at this frame), so the label sits on the orb instead
-      // of drifting off to the touched-files centroid the orb has glided away from.
-      // Before the orb has a live motion (its very first frame, or while fully faded)
-      // fall back to the placement model's target so the label still has a sensible
+      // The actor label rides EXACTLY on its orb: anchor it on the user's live physics
+      // position (read straight off the beam scene's retained {@link ActorUser}, the
+      // same position the orb is drawn at this frame), so the label sits on the orb.
+      // Before the user has a live body (its very first frame, or while fully faded)
+      // fall back to the centroid of its touched files so the label still has a sensible
       // anchor for that one frame.
       const orbPosition = beamScene?.actorOrbPosition(activity.actor)
-        ?? actorVisualFor(activity, now, actorVisualOptions).position
+        ?? centroidOfVecs(activity.touched)
       candidates.push({
         kind: 'actor',
         id: activity.actor,
         text: activity.actor,
         position: orbPosition,
-        // Drive the label's presence from the very same actor visual model the orb
-        // uses (lingering fade + idle breath), so the label lingers and breathes in
-        // exact lockstep with its orb rather than fading on its own short timer.
-        actorAlpha: actorVisualFor(activity, now, actorVisualOptions).alpha,
+        // Drive the label's presence from the very same idle fade the orb uses (Gource's
+        // `RUser::getAlpha`), so the label fades in lockstep with its orb rather than on
+        // its own timer.
+        actorAlpha: actorAlpha(
+          activity.lastActiveAt,
+          now,
+          actorVisualOptions.idleMs,
+          actorVisualOptions.fadeMs,
+        ),
       })
     }
 
@@ -1171,10 +1158,10 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     }
 
     scene = backend.createScene(options.scene)
-    // Fold the top-level `actorLingerMs` knob (Part C) into the beam scene's actor
-    // options, while leaving any finer per-actor tuning the host passed via
-    // `beams.actors` intact. An explicit `beams.actors.lingerMs` wins, since it is
-    // the more specific surface.
+    // Fold the top-level `actorLingerMs` knob into the beam scene's actor options as the
+    // Gource `RUser` idle time, while leaving any finer per-actor tuning the host passed
+    // via `beams.actors` intact. An explicit `beams.actors.idleMs` wins, since it is the
+    // more specific surface.
     beamScene = backend.createBeamScene(resolveBeamSceneOptions(options))
     labelScene = backend.createLabelScene(options.labels)
 
@@ -1712,10 +1699,12 @@ function resolvePhysicsOptions(options: RunewoodOptions): ForceLayoutOptions {
 const REDUCED_MOTION_STEP_SCALE = 4
 
 /**
- * Folds the top-level {@link RunewoodOptions.actorLingerMs} knob into the beam
- * scene's actor options as `lingerMs`, leaving every other actor / beam tuning the
- * host supplied via `beams` intact. An explicit `beams.actors.lingerMs` is the more
- * specific surface and wins; the top-level knob only fills it in when absent.
+ * Folds the top-level {@link RunewoodOptions.actorLingerMs} knob into the beam scene's
+ * actor options as the Gource `RUser` idle time (`idleMs`), leaving every other actor /
+ * beam tuning the host supplied via `beams` intact. An explicit `beams.actors.idleMs`
+ * is the more specific surface and wins; the top-level knob only fills it in when
+ * absent. This is the agent-pause use case: a live agent feed raises the idle time so a
+ * paused contributor stays present rather than fading after Gource's default few seconds.
  */
 function resolveBeamSceneOptions(options: RunewoodOptions): BeamSceneOptions {
   const beams = options.beams ?? {}
@@ -1725,7 +1714,7 @@ function resolveBeamSceneOptions(options: RunewoodOptions): BeamSceneOptions {
   return {
     ...beams,
     actors: {
-      lingerMs: options.actorLingerMs,
+      idleMs: options.actorLingerMs,
       ...beams.actors,
     },
   }

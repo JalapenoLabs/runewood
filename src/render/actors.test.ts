@@ -1,468 +1,282 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { ActorActivity } from './actors'
+import type { Vec2 } from '../core/layout'
+import type { ActorUserOptions } from './actors'
 
 // Core
 import { describe, expect, it } from 'vitest'
 
 import { colorForActor } from '../core/theme'
-import { actorVisualFor, separateActorTargets } from './actors'
+import { actorAlpha, ActorUser } from './actors'
 
-/** A baseline actor activity the tests tweak per case. */
-function makeActivity(overrides: Partial<ActorActivity> = {}): ActorActivity {
-  return {
-    actor: overrides.actor ?? 'agent-1',
-    touched: overrides.touched ?? [{ x: 0, y: 0 }],
-    recent: overrides.recent,
-    lastActiveAt: overrides.lastActiveAt ?? 1000,
-    lastCentroid: overrides.lastCentroid,
-    hold: overrides.hold,
+/**
+ * Drives a user's physics forward over many small fixed frames, applying the action
+ * pull toward `targets` each frame, then returns the settled position. A fixed delta is
+ * used so the run is deterministic. With no targets the user simply coasts to rest.
+ */
+function settle(user: ActorUser, targets: Vec2[], frames: number, deltaSeconds = 1 / 60): void {
+  for (let frame = 0; frame < frames; frame++) {
+    user.applyForceToActions(targets)
+    user.step(deltaSeconds)
   }
 }
 
-describe('actorVisualFor', () => {
-  describe('anchor tracks the actor\'s recent work, not its all-time centroid', () => {
-    it('places the actor at the centroid of its touched files when no recent touch is set', () => {
-      const touched = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 50, y: 150 }]
-      const activity = makeActivity({ actor: 'agent-1', touched })
-
-      // The raw centroid of the three points.
-      const expectedCentroid = { x: 50, y: 50 }
-      // With no drift and no outward offset, the actor sits exactly on the centroid;
-      // here we assert the anchor direction by reading the angle.
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
-
-      // Anchor angle is the centroid's angle from the origin.
-      const expectedAngle = Math.atan2(expectedCentroid.y, expectedCentroid.x)
-      const actorAngle = Math.atan2(visual.position.y, visual.position.x)
-      expect(actorAngle).toBeCloseTo(expectedAngle, 5)
-    })
-
-    it('rides out toward the most-recent file even when the centroid is the tree center', () => {
-      // The bug: a contributor touching files spread across the tree has a centroid
-      // that averages back to the origin, so it used to sit dead-center. With a recent
-      // touch out at a leaf, the anchor must lean hard toward that leaf instead.
-      const touched = [{ x: -300, y: 0 }, { x: 300, y: 0 }, { x: 0, y: 300 }, { x: 0, y: -300 }]
-      const recent = { x: 300, y: 0 }
-      const spread = makeActivity({ actor: 'agent-1', touched, recent })
-
-      const visual = actorVisualFor(spread, 1000, { drift: 0, outwardOffset: 0 })
-
-      // The centroid of the four points is the origin, so the old behavior would put
-      // the actor at the center. Anchoring on the recent file pushes it out to the
-      // right (toward +x), nowhere near the origin.
-      expect(visual.position.x).toBeGreaterThan(200)
-      expect(Math.abs(visual.position.y)).toBeLessThan(50)
-    })
-
-    it('ends up near its recent file, not at the origin/center', () => {
-      // The actor must float close to where it is actively working.
-      const recent = { x: 400, y: 0 }
-      const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 30 })
-
-      const distanceFromOrigin = Math.hypot(visual.position.x, visual.position.y)
-      const distanceFromRecentFile = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
-
-      // Far from the origin (out where the work is)...
-      expect(distanceFromOrigin).toBeGreaterThan(400)
-      // ...and right next to its recent file (just the short fixed offset past it).
-      expect(distanceFromRecentFile).toBeCloseTo(30, 5)
-    })
-
-    it('holds at the last centroid when the actor is touching nothing', () => {
-      const quiet = makeActivity({ touched: [], recent: undefined, lastCentroid: { x: 200, y: 90 }})
-      const visual = actorVisualFor(quiet, 1000, { drift: 0, outwardOffset: 0 })
-
-      // No touched cluster, so the push reduces to the anchor (the parked centroid).
-      expect(visual.position.x).toBeCloseTo(200, 5)
-      expect(visual.position.y).toBeCloseTo(90, 5)
-    })
-
-    it('holds at its current orb position (never the origin) when no file and no parked centroid resolve', () => {
-      // The brand-new-file gap: the live file body has not spawned yet, nothing is
-      // touched, and there is no parked centroid. The actor must HOLD where it already
-      // is (its orb position), NOT snap to the tree center. This is the core "never in
-      // the middle" guarantee for the one-frame gap before a node spawns.
-      const held = { x: 480, y: -120 }
-      const activity = makeActivity({ touched: [], recent: undefined, lastCentroid: undefined, hold: held })
-
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
-
-      expect(visual.position.x).toBeCloseTo(held.x, 5)
-      expect(visual.position.y).toBeCloseTo(held.y, 5)
-      // And nowhere near the origin.
-      expect(Math.hypot(visual.position.x, visual.position.y)).toBeGreaterThan(400)
-    })
-
-    it('prefers the parked last centroid over the held orb position when both exist', () => {
-      // A quiet, fading actor parks at where it last worked (its last centroid), not at
-      // wherever its orb has drifted; `hold` is only the deeper fallback below that.
-      const activity = makeActivity({
-        touched: [],
-        recent: undefined,
-        lastCentroid: { x: 200, y: 0 },
-        hold: { x: 999, y: 999 },
-      })
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 0 })
-
-      expect(visual.position.x).toBeCloseTo(200, 5)
-      expect(visual.position.y).toBeCloseTo(0, 5)
-    })
-
-    it('follows its file outward: as the live file migrates out, the actor travels out with it', () => {
-      // Gource's core reason users are never central: the actor target tracks the LIVE
-      // file position, so as the layout pushes the file outward the actor rides out too.
-      const inner = makeActivity({ actor: 'agent-1', touched: [{ x: 100, y: 0 }], recent: { x: 100, y: 0 }})
-      const outer = makeActivity({ actor: 'agent-1', touched: [{ x: 900, y: 0 }], recent: { x: 900, y: 0 }})
-
-      const innerVisual = actorVisualFor(inner, 1000, { drift: 0, outwardOffset: 60 })
-      const outerVisual = actorVisualFor(outer, 1000, { drift: 0, outwardOffset: 60 })
-
-      const innerRadius = Math.hypot(innerVisual.position.x, innerVisual.position.y)
-      const outerRadius = Math.hypot(outerVisual.position.x, outerVisual.position.y)
-      // The actor moved out with its file (and stays the short offset beyond it).
-      expect(outerRadius).toBeGreaterThan(innerRadius)
-      expect(outerRadius).toBeCloseTo(900 + 60, 5)
-    })
-
-    it('gives co-located actors distinct drift so their orbs do not stack exactly', () => {
-      const shared = { x: 0, y: 0 }
-      const first = makeActivity({ actor: 'agent-a', touched: [ shared ]})
-      const second = makeActivity({ actor: 'agent-b', touched: [ shared ]})
-
-      const firstVisual = actorVisualFor(first, 1000)
-      const secondVisual = actorVisualFor(second, 1000)
-
-      const distance = Math.hypot(
-        firstVisual.position.x - secondVisual.position.x,
-        firstVisual.position.y - secondVisual.position.y,
-      )
-      expect(distance).toBeGreaterThan(0)
-    })
+describe('actorAlpha', () => {
+  it('is fully present right up to the end of the idle window', () => {
+    const lastActiveAt = 1_000
+    expect(actorAlpha(lastActiveAt, lastActiveAt, 3_000, 1_000)).toBe(1)
+    // One millisecond before the idle window closes: still full.
+    expect(actorAlpha(lastActiveAt, lastActiveAt + 2_999, 3_000, 1_000)).toBe(1)
+    expect(actorAlpha(lastActiveAt, lastActiveAt + 3_000, 3_000, 1_000)).toBe(1)
   })
 
-  describe('actor floats a SHORT fixed offset just outside its file (hugs its work)', () => {
-    it('sits a short fixed distance past its recent file, with a short beam between', () => {
-      // The Gource-style placement: a contributor hugs the file it is editing with a
-      // short beam, not flung to the periphery. The orb lands exactly `offset` past the
-      // file along the file's outward ray, so the orb-to-file gap IS that short offset.
-      const recent = { x: 320, y: 40 }
-      const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      // Disable drift so the only displacement off the anchor is the outward offset.
-      const offset = 60
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: offset })
+  it('fades linearly from full to zero over the fade window once idle', () => {
+    const lastActiveAt = 0
+    const idleMs = 3_000
+    const fadeMs = 1_000
 
-      const recentDistance = Math.hypot(recent.x, recent.y)
-      const actorDistance = Math.hypot(visual.position.x, visual.position.y)
-      const orbToFile = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
-
-      // Strictly farther out than the file (it stepped outward)...
-      expect(actorDistance).toBeGreaterThan(recentDistance)
-      // ...by exactly the short fixed offset, so the beam is short.
-      expect(actorDistance).toBeCloseTo(recentDistance + offset, 5)
-      expect(orbToFile).toBeCloseTo(offset, 5)
-    })
-
-    it('does NOT scale to the tree: the orb-to-file beam stays short however far out the work is', () => {
-      // The bug it fixes: the old tree-scaled push flung the orb to the periphery (a
-      // huge beam) when the file sat far from center. A fixed offset keeps the orb a
-      // constant short step off its file at any distance from the origin.
-      const offset = 60
-      const nearCenter = { x: 80, y: 0 }
-      const farOut = { x: 4_000, y: 0 }
-      const near = makeActivity({ actor: 'agent-1', touched: [ nearCenter ], recent: nearCenter })
-      const far = makeActivity({ actor: 'agent-1', touched: [ farOut ], recent: farOut })
-
-      const nearVisual = actorVisualFor(near, 1000, { drift: 0, outwardOffset: offset })
-      const farVisual = actorVisualFor(far, 1000, { drift: 0, outwardOffset: offset })
-
-      const nearBeam = Math.hypot(nearVisual.position.x - nearCenter.x, nearVisual.position.y - nearCenter.y)
-      const farBeam = Math.hypot(farVisual.position.x - farOut.x, farVisual.position.y - farOut.y)
-
-      // Both beams are the same short length regardless of how far the file is from center.
-      expect(nearBeam).toBeCloseTo(offset, 5)
-      expect(farBeam).toBeCloseTo(offset, 5)
-    })
-
-    it('keeps the orb-to-file distance bounded and small (never flung to a huge global radius)', () => {
-      // A spread-out cluster used to throw the orb out past its FARTHEST file (a long
-      // beam). Now the orb hugs its RECENT file by the short offset no matter the spread.
-      const recent = { x: 200, y: 0 }
-      const spreadCluster = [ recent, { x: 1_500, y: 0 }, { x: 0, y: 1_500 }, { x: -1_500, y: 0 }]
-      const activity = makeActivity({ actor: 'agent-1', touched: spreadCluster, recent })
-      const offset = 60
-
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: offset })
-
-      const orbToRecent = Math.hypot(visual.position.x - recent.x, visual.position.y - recent.y)
-      // The orb sits just outside its recent file, NOT pushed out past the 1500-unit
-      // farthest file. The beam is short, a small multiple of the offset, never huge.
-      expect(orbToRecent).toBeLessThan(offset * 2)
-    })
-
-    it('steps farther out for a larger offset', () => {
-      const recent = { x: 200, y: 200 }
-      const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-
-      const near = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 40 })
-      const far = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 160 })
-
-      const nearDistance = Math.hypot(near.position.x, near.position.y)
-      const farDistance = Math.hypot(far.position.x, far.position.y)
-      expect(farDistance).toBeCloseTo(nearDistance + 120, 5)
-    })
-
-    it('keeps the actor on the same outward ray as its anchor', () => {
-      // The offset is purely radial, so the actor's direction from the origin matches
-      // its anchor's direction (it just sits a short step farther along the same line).
-      const recent = { x: 100, y: 50 }
-      const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 70 })
-
-      const anchorAngle = Math.atan2(50, 100)
-      const actorAngle = Math.atan2(visual.position.y, visual.position.x)
-      expect(actorAngle).toBeCloseTo(anchorAngle, 5)
-    })
-
-    it('still escapes the origin when the anchor is dead-center', () => {
-      // A contributor whose anchor is the tree center has no outward ray; it must not
-      // stay pinned at the origin. The hashed fallback direction steps it out by the
-      // short offset deterministically.
-      const activity = makeActivity({ actor: 'agent-1', touched: [{ x: 0, y: 0 }], recent: { x: 0, y: 0 }})
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 90 })
-
-      const distance = Math.hypot(visual.position.x, visual.position.y)
-      expect(distance).toBeCloseTo(90, 5)
-    })
-
-    it('respects a custom origin the actor steps away from', () => {
-      // The outward direction is measured from the supplied origin, not a hardcoded (0,0).
-      const origin = { x: 500, y: 500 }
-      const recent = { x: 600, y: 500 }
-      const activity = makeActivity({ actor: 'agent-1', touched: [ recent ], recent })
-      const visual = actorVisualFor(activity, 1000, { drift: 0, outwardOffset: 50, origin })
-
-      // The recent file is 100 to the right of the origin; stepping 50 further out
-      // lands 150 to the right of the origin along the same ray.
-      expect(visual.position.x).toBeCloseTo(650, 5)
-      expect(visual.position.y).toBeCloseTo(500, 5)
-    })
+    // Halfway through the fade (which begins only after the idle window): half present.
+    expect(actorAlpha(lastActiveAt, idleMs + fadeMs / 2, idleMs, fadeMs)).toBeCloseTo(0.5, 5)
+    // At the end of the fade: fully gone.
+    expect(actorAlpha(lastActiveAt, idleMs + fadeMs, idleMs, fadeMs)).toBe(0)
   })
 
-  describe('lingers on its last node through idle gaps (Part C)', () => {
-    it('stays fully present through a brief idle gap, well past the old short fade', () => {
-      // The bug: an LLM agent edits a file then pauses, and the actor used to fade out
-      // after a few seconds. With a long linger it must STAY parked at full presence.
-      const lastActiveAt = 5_000
-      const activity = makeActivity({ lastActiveAt })
-
-      // Eight seconds idle (past the old 3s fade) but well inside a long linger:
-      // still fully present (no idle pulse configured, so exactly 1).
-      const visual = actorVisualFor(activity, lastActiveAt + 8_000, {
-        lingerMs: 60_000,
-        idlePulseDepth: 0,
-      })
-      expect(visual.alpha).toBe(1)
-    })
-
-    it('only begins fading after the configured long linger, not the fade window', () => {
-      const lastActiveAt = 0
-      const lingerMs = 10_000
-      const fadeMs = 2_000
-      const activity = makeActivity({ lastActiveAt })
-
-      // At the end of the linger it is still full; the fade has not started.
-      const atLingerEnd = actorVisualFor(activity, lingerMs, { lingerMs, fadeMs, idlePulseDepth: 0 })
-      expect(atLingerEnd.alpha).toBe(1)
-
-      // Halfway through the fade (which starts only after the linger): half present.
-      const midFade = actorVisualFor(activity, lingerMs + fadeMs / 2, { lingerMs, fadeMs, idlePulseDepth: 0 })
-      expect(midFade.alpha).toBeCloseTo(0.5, 5)
-
-      // Past the linger + fade: fully gone.
-      const afterFade = actorVisualFor(activity, lingerMs + fadeMs, { lingerMs, fadeMs, idlePulseDepth: 0 })
-      expect(afterFade.alpha).toBe(0)
-    })
-
-    it('breathes a gentle, bounded idle pulse once parked (size and alpha dip together)', () => {
-      const lastActiveAt = 0
-      const idleAfterMs = 500
-      const idlePulseMs = 2_000
-      const idlePulseDepth = 0.2
-      const lingerMs = 60_000
-      const baseSize = 10
-      const activity = makeActivity({ lastActiveAt })
-      const tuning = { lingerMs, idleAfterMs, idlePulseMs, idlePulseDepth, size: baseSize }
-
-      // Still active (under idleAfterMs): no breathing, full size and alpha.
-      const fresh = actorVisualFor(activity, idleAfterMs, tuning)
-      expect(fresh.alpha).toBe(1)
-      expect(fresh.size).toBeCloseTo(baseSize, 6)
-
-      // At the trough of the first breath (half a period after idling starts): the
-      // size and alpha dip by exactly the depth, never more.
-      const trough = actorVisualFor(activity, idleAfterMs + idlePulseMs / 2, tuning)
-      expect(trough.alpha).toBeCloseTo(1 - idlePulseDepth, 5)
-      expect(trough.size).toBeCloseTo(baseSize * (1 - idlePulseDepth), 5)
-
-      // Back at the top of the breath one full period later: returned to full.
-      const peak = actorVisualFor(activity, idleAfterMs + idlePulseMs, tuning)
-      expect(peak.alpha).toBeCloseTo(1, 5)
-      expect(peak.size).toBeCloseTo(baseSize, 5)
-    })
-
-    it('keeps the idle breath bounded within [1 - depth, 1] across the whole cycle', () => {
-      const idlePulseDepth = 0.3
-      const tuning = { lingerMs: 60_000, idleAfterMs: 0, idlePulseMs: 1_000, idlePulseDepth, size: 10 }
-      const activity = makeActivity({ lastActiveAt: 0 })
-
-      // Sample the breath densely over two full cycles; it must never brighten past
-      // full nor dim below the configured depth.
-      for (let nowMs = 0; nowMs <= 2_000; nowMs += 37) {
-        const visual = actorVisualFor(activity, nowMs, tuning)
-        expect(visual.alpha).toBeLessThanOrEqual(1 + 1e-9)
-        expect(visual.alpha).toBeGreaterThanOrEqual(1 - idlePulseDepth - 1e-9)
-      }
-    })
-
-    it('parks at its last centroid while lingering quiet, stepped just outside it', () => {
-      // After the recency window clears the touched files, a lingering actor falls
-      // back to its parked last-centroid (still stepped outward by the short offset), so
-      // it stays floating just outside its last work rather than snapping to the origin.
-      const quiet = makeActivity({ touched: [], recent: undefined, lastCentroid: { x: 300, y: 0 }})
-      const visual = actorVisualFor(quiet, 1_000, { drift: 0, outwardOffset: 40, lingerMs: 60_000 })
-
-      const distanceFromOrigin = Math.hypot(visual.position.x, visual.position.y)
-      // Parked just outside its last centroid: the centroid radius (300) plus the offset.
-      expect(distanceFromOrigin).toBeCloseTo(340, 5)
-    })
+  it('clamps a long-idle actor to zero, never negative', () => {
+    expect(actorAlpha(0, 100_000, 3_000, 1_000)).toBe(0)
   })
 
-  describe('fade decays after the linger window elapses', () => {
-    // These exercise the raw fade with linger disabled (lingerMs: 0) and no idle
-    // pulse, so the fade is measured straight from lastActiveAt as before Part C. The
-    // lingering behavior itself is covered in its own describe above.
-    const noLinger = { lingerMs: 0, idlePulseDepth: 0 } as const
-
-    it('is full at the instant of activity', () => {
-      const activity = makeActivity({ lastActiveAt: 5000 })
-      const visual = actorVisualFor(activity, 5000, { ...noLinger, fadeMs: 3000 })
-      expect(visual.alpha).toBe(1)
-    })
-
-    it('decays linearly to zero over the fade window since the last activity', () => {
-      const lastActiveAt = 5000
-      const fadeMs = 3000
-      const activity = makeActivity({ lastActiveAt })
-
-      const atActivity = actorVisualFor(activity, lastActiveAt, { ...noLinger, fadeMs })
-      const midFade = actorVisualFor(activity, lastActiveAt + fadeMs / 2, { ...noLinger, fadeMs })
-      const afterFade = actorVisualFor(activity, lastActiveAt + fadeMs, { ...noLinger, fadeMs })
-
-      expect(atActivity.alpha).toBeCloseTo(1, 5)
-      expect(midFade.alpha).toBeCloseTo(0.5, 5)
-      expect(afterFade.alpha).toBe(0)
-    })
-
-    it('clamps a long-idle actor to zero, never negative', () => {
-      const activity = makeActivity({ lastActiveAt: 1000 })
-      const visual = actorVisualFor(activity, 1000 + 100_000, { ...noLinger, fadeMs: 3000 })
-      expect(visual.alpha).toBe(0)
-    })
-
-    it('treats an actor active again as fully present (alpha back to 1)', () => {
-      const stale = makeActivity({ lastActiveAt: 1000 })
-      const refreshed = makeActivity({ lastActiveAt: 9000 })
-
-      const staleVisual = actorVisualFor(stale, 9500, { ...noLinger, fadeMs: 3000 })
-      const refreshedVisual = actorVisualFor(refreshed, 9500, { ...noLinger, fadeMs: 3000 })
-
-      expect(refreshedVisual.alpha).toBeGreaterThan(staleVisual.alpha)
-      expect(refreshedVisual.alpha).toBeCloseTo(1 - 500 / 3000, 5)
-    })
+  it('honors a longer idle time (the agent-pause use case): no fade across a long pause', () => {
+    // A live agent edits then pauses for ten seconds; with a long idle time it stays
+    // fully present rather than fading after Gource's default three seconds.
+    const lastActiveAt = 5_000
+    expect(actorAlpha(lastActiveAt, lastActiveAt + 10_000, 60_000, 1_000)).toBe(1)
+    // The default three-second idle WOULD have it long gone by then.
+    expect(actorAlpha(lastActiveAt, lastActiveAt + 10_000, 3_000, 1_000)).toBe(0)
   })
 
-  describe('color comes from the actor identity', () => {
-    it('uses colorForActor so the same actor is always the same hue', () => {
-      const visual = actorVisualFor(makeActivity({ actor: 'agent-7' }), 1000)
-      expect(visual.color).toEqual(colorForActor('agent-7'))
-    })
+  it('treats a future-dated activity as fully present rather than over-bright', () => {
+    expect(actorAlpha(10_000, 5_000, 3_000, 1_000)).toBe(1)
   })
 
-  describe('determinism', () => {
-    it('is a pure function of its inputs', () => {
-      const activity = makeActivity({ actor: 'agent-1', touched: [{ x: 10, y: 20 }], lastActiveAt: 900 })
-      const first = actorVisualFor(activity, 1500)
-      const second = actorVisualFor(activity, 1500)
-      expect(first).toEqual(second)
-    })
+  it('is a pure function of its inputs (deterministic)', () => {
+    const first = actorAlpha(0, 3_500, 3_000, 1_000)
+    const second = actorAlpha(0, 3_500, 3_000, 1_000)
+    expect(first).toBe(second)
   })
 })
 
-describe('separateActorTargets', () => {
-  it('leaves targets already farther apart than the personal space untouched', () => {
-    const targets = [
-      { actor: 'agent-a', position: { x: 0, y: 0 }},
-      { actor: 'agent-b', position: { x: 500, y: 0 }},
-    ]
-    const separated = separateActorTargets(targets, 50)
-    expect(separated[0]).toEqual({ x: 0, y: 0 })
-    expect(separated[1]).toEqual({ x: 500, y: 0 })
+describe('ActorUser', () => {
+  describe('accelerating toward and braking at its action target', () => {
+    it('flies toward a file beyond the beam distance and ends up near it, not on it', () => {
+      // The user starts far from its one file; under the action pull it flies in and,
+      // after the physics settles, rests in the NEIGHBORHOOD of the file (a short beam)
+      // rather than far away or stacked exactly on it. Gource's weak friction means it
+      // overshoots and oscillates a little before settling, so the assertion is a bounded
+      // "near, not on" rather than "stops dead at the brake radius".
+      const file: Vec2 = { x: 1_000, y: 0 }
+      const user = new ActorUser('agent-1', { x: 0, y: 0 }, { beamDist: 100, actionDist: 50 })
+
+      settle(user, [ file ], 1_200)
+
+      const distanceToFile = Math.hypot(user.position.x - file.x, user.position.y - file.y)
+      // It arrived in the neighborhood of the file (within a couple beam distances), so
+      // the orb-to-file beam is short...
+      expect(distanceToFile).toBeLessThan(200)
+      // ...but did NOT collapse onto the file's exact position (it brakes near it).
+      expect(distanceToFile).toBeGreaterThan(0)
+      // And it genuinely crossed most of the 1000-unit gap (it flew to its file).
+      expect(user.position.x).toBeGreaterThan(800)
+    })
+
+    it('settles within the dead zone between the action and beam distances', () => {
+      // The user comes to rest in the band [actionDist, beamDist] from its file: beyond
+      // the brake radius but inside the pull radius, exactly Gource's resting band.
+      const file: Vec2 = { x: 800, y: 0 }
+      const beamDist = 100
+      const actionDist = 50
+      const user = new ActorUser('agent-1', { x: 0, y: 0 }, { beamDist, actionDist })
+
+      settle(user, [ file ], 800)
+
+      const distanceToFile = Math.hypot(user.position.x - file.x, user.position.y - file.y)
+      // Comfortably inside the pull radius and outside (or at) the brake radius, so the
+      // orb hugs its file with a short beam rather than sitting on it or far away.
+      expect(distanceToFile).toBeLessThanOrEqual(beamDist + 1)
+      expect(distanceToFile).toBeGreaterThan(actionDist - 30)
+    })
+
+    it('drives toward the AVERAGE of several action targets', () => {
+      // Two files symmetric about x=500: the user should settle near their midpoint.
+      const files: Vec2[] = [{ x: 500, y: 300 }, { x: 500, y: -300 }]
+      const user = new ActorUser('agent-1', { x: 0, y: 0 })
+
+      settle(user, files, 800)
+
+      // Pulled toward the average (500, 0): out along x, and centered on y.
+      expect(user.position.x).toBeGreaterThan(300)
+      expect(user.position.y).toBeCloseTo(0, 0)
+    })
   })
 
-  it('pushes two near actors apart to roughly the personal space, centered on their midpoint', () => {
-    const targets = [
-      { actor: 'agent-a', position: { x: 0, y: 0 }},
-      { actor: 'agent-b', position: { x: 20, y: 0 }},
-    ]
-    const personalSpace = 60
-    const separated = separateActorTargets(targets, personalSpace)
+  describe('friction brings it to rest when the action ends', () => {
+    it('coasts to a stop after its file is gone, moving less and less each frame', () => {
+      // Give the user a strong pull to build up speed, then drop the action: friction
+      // must bleed its momentum so each subsequent coasting frame moves it less.
+      const user = new ActorUser('agent-1', { x: 0, y: 0 }, { friction: 1, maxUserSpeed: 500 })
+      for (let frame = 0; frame < 5; frame++) {
+        user.applyForceToActions([{ x: 5_000, y: 0 }])
+        user.step(1 / 60)
+      }
 
-    const distance = Math.hypot(separated[1].x - separated[0].x, separated[1].y - separated[0].y)
-    expect(distance).toBeCloseTo(personalSpace, 5)
-    // The midpoint stays put (they opened symmetrically), so each moved out by half the
-    // shortfall: from 10 (the original midpoint) the gap of 60 splits to -20 and 40.
-    const midpointX = (separated[0].x + separated[1].x) / 2
-    expect(midpointX).toBeCloseTo(10, 5)
+      // Now no action: it coasts. Measure the per-frame step; friction must make each
+      // coasting frame move no more than the last (a monotonically decaying glide).
+      let previous = user.position.x
+      const firstStep = user.position.x
+      let previousStep = Infinity
+      for (let frame = 0; frame < 600; frame++) {
+        user.step(1 / 60)
+        const step = user.position.x - previous
+        previous = user.position.x
+        expect(step).toBeLessThanOrEqual(previousStep + 1e-9)
+        previousStep = step
+      }
+      // It built up real momentum first (it actually traveled while coasting)...
+      expect(user.position.x).toBeGreaterThan(firstStep)
+      // ...and after long coasting the per-frame step has decayed to essentially nothing.
+      expect(previousStep).toBeLessThan(0.01)
+    })
+
+    it('does not move at all with no action and no momentum (a fresh idle user)', () => {
+      const user = new ActorUser('agent-1', { x: 200, y: 50 })
+      const before = { ...user.position }
+      for (let frame = 0; frame < 60; frame++) {
+        user.applyForceToActions([])
+        user.step(1 / 60)
+      }
+      expect(user.position).toEqual(before)
+    })
   })
 
-  it('splits perfectly coincident actors deterministically (no random kick)', () => {
-    const coincident = () => [
-      { actor: 'agent-a', position: { x: 100, y: 100 }},
-      { actor: 'agent-b', position: { x: 100, y: 100 }},
-    ]
-    const personalSpace = 40
+  describe('user-to-user separation within personal space', () => {
+    it('pushes two coincident-ish users apart', () => {
+      // Two users start very close (inside the personal space). The mutual repulsion
+      // must drive them apart so their orbs do not stack.
+      const personalSpaceDist = 100
+      const first = new ActorUser('agent-a', { x: 0, y: 0 }, { personalSpaceDist })
+      const second = new ActorUser('agent-b', { x: 10, y: 0 }, { personalSpaceDist })
 
-    const first = separateActorTargets(coincident(), personalSpace)
-    const second = separateActorTargets(coincident(), personalSpace)
+      const startGap = Math.hypot(second.position.x - first.position.x, second.position.y - first.position.y)
+      for (let frame = 0; frame < 200; frame++) {
+        // Apply forces to both before stepping either (the scene's order).
+        first.applyForceUser(second)
+        second.applyForceUser(first)
+        first.step(1 / 60)
+        second.step(1 / 60)
+      }
+      const endGap = Math.hypot(second.position.x - first.position.x, second.position.y - first.position.y)
 
-    // They no longer overlap...
-    const distance = Math.hypot(first[1].x - first[0].x, first[1].y - first[0].y)
-    expect(distance).toBeCloseTo(personalSpace, 5)
-    // ...and the split is identical run to run (deterministic, seek-safe).
-    expect(first).toEqual(second)
+      // They separated, opening up toward the personal space.
+      expect(endGap).toBeGreaterThan(startGap)
+      expect(endGap).toBeGreaterThan(personalSpaceDist * 0.5)
+    })
+
+    it('separates perfectly coincident users deterministically (no random kick)', () => {
+      function run(): { first: Vec2, second: Vec2 } {
+        const personalSpaceDist = 80
+        const first = new ActorUser('agent-a', { x: 100, y: 100 }, { personalSpaceDist })
+        const second = new ActorUser('agent-b', { x: 100, y: 100 }, { personalSpaceDist })
+        for (let frame = 0; frame < 50; frame++) {
+          first.applyForceUser(second)
+          second.applyForceUser(first)
+          first.step(1 / 60)
+          second.step(1 / 60)
+        }
+        return { first: { ...first.position }, second: { ...second.position }}
+      }
+
+      const a = run()
+      const b = run()
+      // No longer stacked...
+      expect(Math.hypot(a.first.x - a.second.x, a.first.y - a.second.y)).toBeGreaterThan(0)
+      // ...and identical run to run (deterministic, seek-safe; Gource kicks randomly).
+      expect(a).toEqual(b)
+    })
+
+    it('does not separate when personal space is disabled (zero)', () => {
+      const first = new ActorUser('agent-a', { x: 0, y: 0 }, { personalSpaceDist: 0 })
+      const second = new ActorUser('agent-b', { x: 5, y: 0 }, { personalSpaceDist: 0 })
+      for (let frame = 0; frame < 60; frame++) {
+        first.applyForceUser(second)
+        second.applyForceUser(first)
+        first.step(1 / 60)
+        second.step(1 / 60)
+      }
+      // Untouched: the repulsion never fired.
+      expect(first.position).toEqual({ x: 0, y: 0 })
+      expect(second.position).toEqual({ x: 5, y: 0 })
+    })
+
+    it('ignores a user separating from itself', () => {
+      const user = new ActorUser('agent-a', { x: 0, y: 0 }, { personalSpaceDist: 100 })
+      user.applyForceUser(user)
+      user.step(1 / 60)
+      expect(user.position).toEqual({ x: 0, y: 0 })
+    })
   })
 
-  it('disables separation when the personal space is zero', () => {
-    const targets = [
-      { actor: 'agent-a', position: { x: 0, y: 0 }},
-      { actor: 'agent-b', position: { x: 1, y: 0 }},
-    ]
-    const separated = separateActorTargets(targets, 0)
-    expect(separated[0]).toEqual({ x: 0, y: 0 })
-    expect(separated[1]).toEqual({ x: 1, y: 0 })
+  describe('the max-speed clamp holds', () => {
+    it('never moves more than max speed * dt in a single frame, however strong the pull', () => {
+      // A huge pull would, unclamped, fling the user across the canvas in one frame. The
+      // clamp caps the acceleration to the max speed, so one frame moves at most
+      // maxSpeed * dt.
+      const maxUserSpeed = 500
+      const deltaSeconds = 1 / 60
+      const user = new ActorUser('agent-1', { x: 0, y: 0 }, { maxUserSpeed })
+
+      user.applyForceToActions([{ x: 1_000_000, y: 0 }])
+      const before = { ...user.position }
+      user.step(deltaSeconds)
+      const moved = Math.hypot(user.position.x - before.x, user.position.y - before.y)
+
+      expect(moved).toBeLessThanOrEqual(maxUserSpeed * deltaSeconds + 1e-6)
+    })
   })
 
-  it('returns copies, never mutating the input positions', () => {
-    const targets = [
-      { actor: 'agent-a', position: { x: 0, y: 0 }},
-      { actor: 'agent-b', position: { x: 5, y: 0 }},
-    ]
-    separateActorTargets(targets, 80)
-    // The originals are untouched (the function returns fresh vectors).
-    expect(targets[0].position).toEqual({ x: 0, y: 0 })
-    expect(targets[1].position).toEqual({ x: 5, y: 0 })
+  describe('integration is deterministic and robust', () => {
+    it('reproduces the exact same trajectory for the same inputs and fixed deltas', () => {
+      function run(): Vec2 {
+        const user = new ActorUser('agent-1', { x: 0, y: 0 })
+        settle(user, [{ x: 700, y: 200 }], 300)
+        return { ...user.position }
+      }
+      expect(run()).toEqual(run())
+    })
+
+    it('holds the position on a non-positive or non-finite frame delta (a paused frame)', () => {
+      const user = new ActorUser('agent-1', { x: 30, y: 40 })
+      user.applyForceToActions([{ x: 900, y: 0 }])
+      const before = { ...user.position }
+      user.step(0)
+      user.step(-1)
+      user.step(Number.NaN)
+      expect(user.position).toEqual(before)
+    })
+  })
+
+  describe('the visual', () => {
+    it('reports the live position, the idle fade, the size, and the identity color', () => {
+      const options: ActorUserOptions = { idleMs: 3_000, fadeMs: 1_000, size: 12 }
+      const user = new ActorUser('agent-7', { x: 100, y: 0 }, options)
+
+      const visualFresh = user.visualAt(1_000, 1_000)
+      expect(visualFresh.position).toEqual({ x: 100, y: 0 })
+      expect(visualFresh.alpha).toBe(1)
+      expect(visualFresh.size).toBe(12)
+      expect(visualFresh.color).toEqual(colorForActor('agent-7'))
+
+      // Halfway through the fade once idle: half present.
+      const visualFading = user.visualAt(1_000 + 3_000 + 500, 1_000)
+      expect(visualFading.alpha).toBeCloseTo(0.5, 5)
+    })
   })
 })
