@@ -206,7 +206,9 @@ export class PixiBackend implements RenderBackend {
       console.debug('runewood: PixiBackend.createBeamScene called before init, returning null')
       return null
     }
-    return new BeamScene(this.beamLayer, options)
+    // Hand the beam scene the live renderer so it can bake its one shared beam-gradient
+    // texture (Gource's beam.png) every beam sprite reuses.
+    return new BeamScene(this.beamLayer, this.application?.renderer, options)
   }
 
   /**

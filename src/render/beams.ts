@@ -5,6 +5,7 @@ import type { Vec2 } from '../core/layout'
 import type { Hsl } from '../core/theme'
 
 import { colorForActor } from '../core/theme'
+import { beamActionColor } from './beamColor'
 
 /**
  * The signature "vis" effect: a brief tapered beam of light flung from an actor to
@@ -336,25 +337,6 @@ const DEFAULT_BEAM_WIDTH = 8
 const DEFAULT_PULSE_RADIUS = 26
 const DEFAULT_ACTION_TINT = 0.5
 
-/**
- * The hue each action contributes to its beams, in degrees. These read as intent:
- * green for creation, amber for a modify, cyan for a non-mutating scan, red for a
- * delete, violet for a path-less pulse. The actor's own hue is blended in (see
- * {@link blendActionColor}) so two actors doing the same action still read as
- * distinct.
- */
-const hueByAction = {
-  create: 130,
-  modify: 45,
-  scan: 190,
-  delete: 5,
-  pulse: 280,
-} as const satisfies Record<RunewoodAction, number>
-
-/** Fixed saturation/lightness for action tints, matching the forest's vivid palette. */
-const ACTION_SATURATION = 0.7
-const ACTION_LIGHTNESS = 0.55
-
 /** Fills in every {@link BeamFieldOptions} default in one place. */
 function resolveOptions(options: BeamFieldOptions): ResolvedBeamOptions {
   return {
@@ -367,15 +349,17 @@ function resolveOptions(options: BeamFieldOptions): ResolvedBeamOptions {
 }
 
 /**
- * Blends an action's intent hue with the actor's identity color, so a beam reads
- * as both "what happened" (the action) and "who did it" (the actor). The blend is
- * a straight per-channel lerp toward the action color by `tint`: at `tint = 0` the
- * beam is pure actor color, at `1` pure action color, and the default `0.5` splits
- * the difference. Pure: same inputs always yield the same color.
+ * Blends an action's intent color with the actor's identity color, so a beam reads
+ * as both "what happened" (the Gource-style action color) and "who did it" (the
+ * actor). The action half comes from {@link beamActionColor} (green add / amber
+ * modify / red delete, per Gource, plus runewood's cyan scan and violet pulse). The
+ * blend is a straight per-channel lerp toward the action color by `tint`: at
+ * `tint = 0` the beam is pure actor color, at `1` pure action color, and the default
+ * `0.5` splits the difference. Pure: same inputs always yield the same color.
  */
 function blendActionColor(action: RunewoodAction, actor: string, tint: number): Hsl {
   const actorColor = colorForActor(actor)
-  const actionColor: Hsl = { h: hueByAction[action], s: ACTION_SATURATION, l: ACTION_LIGHTNESS }
+  const actionColor = beamActionColor(action)
 
   // Hue is angular, so lerp along the shorter way around the wheel rather than
   // numerically, which would make a 350->10 blend swing through the cold side.

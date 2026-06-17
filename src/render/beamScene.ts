@@ -1,6 +1,6 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Container, Texture } from 'pixi.js'
+import type { Container, Renderer, Texture } from 'pixi.js'
 import type { Vec2 } from '../core/layout'
 import type { RunewoodTheme } from '../core/theme'
 import type { BeamFieldOptions, ActiveBeam, BeamEndpointResolver } from './beams'
@@ -8,10 +8,12 @@ import type { ActorActivity, ActorUserOptions } from './actors'
 import type { AvatarResolver } from './avatarRegistry'
 
 // Core
-import { BlurFilter, Graphics, Sprite } from 'pixi.js'
+import { Graphics, Sprite } from 'pixi.js'
 
 import { colorForActor } from '../core/theme'
 import { hslToRgbInt } from './color'
+import { buildBeamTexture } from './glowTexture'
+import { beamPlacement } from './beamGeometry'
 import { BeamField } from './beams'
 import { ActorUser } from './actors'
 import { AvatarTextureCache } from './avatarTexture'
@@ -28,14 +30,17 @@ import { AvatarTextureCache } from './avatarTexture'
  *
  * Two kinds of thing live here, both additively blended for a glow that reads
  * above the forest:
- * - **beams**: the brief, soft flashlight cones flung from actors to touched files,
- *   drawn from the {@link BeamField}'s active set into one pooled `Graphics` cleared
- *   and refilled each frame, then blurred into a fuzzy glow. The cone's single point
- *   sits at the actor and it fans out onto the file, like a flashlight hitting it. Each
- *   beam's endpoints are resolved LIVE every frame (see below): its source is the firing
+ * - **beams**: the brief, glowing colored lasers flung from actors to touched files,
+ *   Gource's action beam (`src/action.cpp`). Each is one tinted, rotated, scaled
+ *   `Sprite` of the baked beam-gradient texture ({@link buildBeamTexture}), drawn from
+ *   the {@link BeamField}'s active set: the gradient stretches along the line so the
+ *   beam is brightest at its core and softens to nothing at the user and file ends,
+ *   the additive blend makes it bloom, and its lifetime fade dims it out. Each beam's
+ *   endpoints are resolved LIVE every frame (see below): its source is the firing
  *   actor's live user position and its target is the touched node's live physics
- *   position, so the beam flies from the contributor's orb to the actual file node and
- *   tracks it as the sim migrates it.
+ *   position, so the laser flies from the contributor's orb to the actual file node
+ *   and tracks it as the sim migrates it. A `pulse` (path-less) beam reaches a short
+ *   nudge off the orb, so it reads as a small actor-local burst rather than a laser.
  * - **actors**: one retained orb `Graphics` per actor, keyed by actor id, created
  *   when an actor first appears and culled once it has fully faded out. The orb is a
  *   Gource {@link ActorUser}: a physics body that accelerates toward the files it is
@@ -69,8 +74,21 @@ export class BeamScene {
   /** Tuning for the actor physics + fade (Gource's `RUser` constants), forwarded to each {@link ActorUser}. */
   private readonly actorOptions: ActorUserOptions
 
-  /** One batched graphic holding every live beam this frame, cleared and refilled. */
-  private readonly beamGraphics: Graphics
+  /**
+   * The one baked beam-gradient texture (Gource's `beam.png`), shared by every beam
+   * sprite: tinted to the beam color, stretched along the line, additively blended.
+   * `null` when no renderer was supplied (a headless backend), in which case beams are
+   * simply not drawn.
+   */
+  private readonly beamTexture: Texture | null
+  /**
+   * A pool of retained beam `Sprite`s, grown on demand and reused frame to frame. Each
+   * frame's live beams claim the first N sprites (positioned, rotated, scaled, tinted),
+   * and any leftover from a busier previous frame are hidden, so the layer never churns
+   * a sprite per beam yet stays allocation-flat once the pool has reached its high-water
+   * mark. Empty when there is no beam texture to draw.
+   */
+  private readonly beamSprites: Sprite[]
   /** Retained actor orb graphics, keyed by actor id. */
   private readonly actorGraphics: Map<string, Graphics>
   /**
@@ -117,23 +135,20 @@ export class BeamScene {
   /**
    * @param layer the world container for beams/actors, added above the forest
    *   layers so the glow reads on top of the wood.
+   * @param renderer the live renderer, used once to bake the shared beam-gradient
+   *   texture every beam sprite reuses. `undefined` on a headless backend, in which
+   *   case beams are not drawn (the field still simulates, actors still render).
    */
-  constructor(layer: Container, options: BeamSceneOptions = {}) {
+  constructor(layer: Container, renderer?: Renderer, options: BeamSceneOptions = {}) {
     this.layer = layer
     this.field = new BeamField(options.beams)
     this.actorOptions = options.actors ?? {}
 
-    this.beamGraphics = new Graphics()
-    // Additive blend so overlapping beams build toward white, the way real bloom
-    // stacks, rather than painting flatly over each other.
-    this.beamGraphics.blendMode = 'add'
-    // Soften the whole beam layer with one cheap blur pass so each cone reads as a fuzzy glow of
-    // light fanning onto the file rather than a crisp wedge with hard edges (the "make it blurred"
-    // ask). One filter covers every beam at once (they share this single batched graphic), so it is
-    // far cheaper than blurring per beam, and it rides UNDER the actor orbs, which are separate
-    // children of the layer and stay sharp. See {@link BEAM_BLUR_STRENGTH}.
-    this.beamGraphics.filters = [ new BlurFilter({ strength: BEAM_BLUR_STRENGTH }) ]
-    this.layer.addChild(this.beamGraphics)
+    // Bake the one shared beam-gradient texture up front (Gource's beam.png). Every
+    // live beam is then a cheap tinted sprite of it, additively blended, so there is
+    // no per-beam geometry to rebuild and no blur filter to run.
+    this.beamTexture = renderer ? buildBeamTexture(renderer) : null
+    this.beamSprites = []
 
     this.actorGraphics = new Map()
     this.actorUsers = new Map()
@@ -219,16 +234,22 @@ export class BeamScene {
   /**
    * Drops all in-flight beams (a backward seek; the issue says clear, don't
    * reverse). Actors are left to fade on their own from the activity the
-   * controller supplies, so only the beam field and its graphic are emptied.
+   * controller supplies, so only the beam field is emptied and every pooled beam
+   * sprite is hidden until the next forward play respawns them.
    */
   public clear(): void {
     this.field.clear()
-    this.beamGraphics.clear()
+    for (const sprite of this.beamSprites) {
+      sprite.visible = false
+    }
   }
 
   /** Removes every retained graphic. Call when tearing the scene down. */
   public dispose(): void {
-    this.beamGraphics.destroy()
+    for (const sprite of this.beamSprites) {
+      sprite.destroy()
+    }
+    this.beamSprites.length = 0
     // An avatared actor may have only avatar graphics (no orb), so tear down the union of
     // both retained sets, not just the orbs.
     const retained = new Set<string>([ ...this.actorGraphics.keys(), ...this.avatarSprites.keys() ])
@@ -238,58 +259,74 @@ export class BeamScene {
   }
 
   /**
-   * Refills the single batched beam graphic from the active set. Each beam is drawn
-   * as a *stack* of additive tapered triangles rather than one flat one, which (with
-   * the layer's blur filter on top) turns the old hard "sharp triangle" into a glowy
-   * cone of light: a bright, thin core triangle with a couple of progressively wider,
-   * dimmer triangles layered under it. Because the layers are additively blended, the
-   * overlap sums to a hot bright center that falls off softly to the sides, the way
-   * real light blooms, so the beam reads as a soft flashlight cone rather than a flat
-   * wedge with a hard edge.
+   * Draws the active beams as Gource's glowing colored lasers, one tinted `Sprite` of
+   * the baked beam-gradient texture per beam. Each beam is centered on the midpoint of
+   * the line from the actor (source) to the file (target), rotated to that line, scaled
+   * so the texture's gradient stretches along the full length and spans the beam's
+   * current width, tinted to the beam color, and additively blended so overlapping
+   * beams bloom toward white. The gradient itself supplies the soft falloff to the user
+   * and file ends (it is transparent at both edges, hot in the core), so the laser reads
+   * as a beam of light rather than a flat bar, with no per-beam geometry or blur pass.
    *
-   * The cone now points the OTHER way (the swap): its single APEX vertex sits at the
-   * actor (source) and the two width-spread vertices sit at the touched file (target),
-   * so the beam starts as a point at the contributor and FANS OUT onto the file, like a
-   * flashlight cone hitting it, instead of being wide at the actor and narrowing to the
-   * file. The width is therefore spread at the TARGET end. A degenerate zero-length beam
-   * (source == target) is skipped since it has no direction to give width.
+   * The sprites are drawn from a reused pool ({@link beamSprites}): this frame's beams
+   * claim the first N sprites and any extra left over from a busier previous frame are
+   * hidden, so the layer stays allocation-flat once the pool has reached its peak size.
+   * The lifetime fade rides in `beam.alpha` and the theme's bloom scales the whole
+   * field's brightness. A degenerate zero-length beam (source == target) and a frame
+   * with no baked texture (headless backend) draw nothing.
    */
   private drawBeams(beams: ActiveBeam[], theme: RunewoodTheme): void {
-    this.beamGraphics.clear()
+    if (!this.beamTexture) {
+      return
+    }
+
+    let drawn = 0
     for (const beam of beams) {
-      const directionX = beam.target.x - beam.source.x
-      const directionY = beam.target.y - beam.source.y
-      const length = Math.hypot(directionX, directionY)
-      if (length === 0) {
+      const placement = beamPlacement(beam.source, beam.target, beam.width)
+      if (!placement) {
+        // Zero-length beam: no direction to orient the laser, so skip it.
         continue
       }
 
-      // The unit perpendicular to the beam, to spread each layer's width symmetrically
-      // across the beam on both sides at the TARGET (file) end, the cone's wide base.
-      const perpendicularX = -directionY / length
-      const perpendicularY = directionX / length
-      const color = hslToRgbInt(beam.color)
-
-      // Stack the soft layers widest-and-dimmest first so the bright thin core lands
-      // on top. The additive blend sums the overlap into a hot core with a soft
-      // falloff to the edges, and the layer's blur filter softens the whole thing into
-      // a fuzzy glow. The theme's bloom scales the whole stack so a restrained theme
-      // glows gently; the beam's own lifetime fade rides in `beam.alpha`.
-      //
-      // The width is spread at the TARGET (file) end and the single apex sits at the
-      // SOURCE (actor), so the cone fans out onto the file (the swap).
-      for (const layer of BEAM_GLOW_LAYERS) {
-        const halfWidth = (beam.width * layer.widthScale) / 2
-        const leftX = beam.target.x + perpendicularX * halfWidth
-        const leftY = beam.target.y + perpendicularY * halfWidth
-        const rightX = beam.target.x - perpendicularX * halfWidth
-        const rightY = beam.target.y - perpendicularY * halfWidth
-
-        this.beamGraphics
-          .poly([ beam.source.x, beam.source.y, leftX, leftY, rightX, rightY ])
-          .fill({ color, alpha: beam.alpha * layer.alphaScale * theme.bloomIntensity })
-      }
+      const sprite = this.beamSpriteAt(drawn)
+      sprite.visible = true
+      sprite.tint = hslToRgbInt(beam.color)
+      sprite.alpha = beam.alpha * theme.bloomIntensity
+      sprite.position.set(placement.center.x, placement.center.y)
+      sprite.rotation = placement.rotation
+      // Anchor-centered, so width/length stretch the texture symmetrically about the
+      // midpoint along the line and across it. The texture's own pixel size is divided
+      // out so the sprite spans exactly the beam's length and width in world units.
+      sprite.width = placement.length
+      sprite.height = placement.width
+      drawn++
     }
+
+    // Hide any pooled sprites a busier previous frame used but this frame did not, so
+    // stale lasers from the last frame never linger.
+    for (let index = drawn; index < this.beamSprites.length; index++) {
+      this.beamSprites[index].visible = false
+    }
+  }
+
+  /**
+   * The pooled beam sprite at `index`, creating it (and growing the pool) on first use.
+   * Every beam sprite shares the one baked beam texture, is anchor-centered so it
+   * stretches symmetrically about the beam midpoint, and is additively blended for the
+   * glow. The pool only ever grows to the high-water mark of simultaneously live beams.
+   */
+  private beamSpriteAt(index: number): Sprite {
+    let sprite = this.beamSprites[index]
+    if (!sprite) {
+      sprite = new Sprite(this.beamTexture ?? undefined)
+      sprite.anchor.set(0.5)
+      // Additive blend so overlapping beams build toward white, the way real bloom
+      // stacks, rather than painting flatly over each other.
+      sprite.blendMode = 'add'
+      this.layer.addChild(sprite)
+      this.beamSprites[index] = sprite
+    }
+    return sprite
   }
 
   /**
@@ -550,30 +587,6 @@ function spawnPositionFor(touched: Vec2[]): Vec2 {
  * "who is doing what" orb readable as the forest grows around it.
  */
 const MIN_ACTOR_SCREEN_PX = 9
-
-/**
- * The additive layers each beam is drawn from, widest-and-dimmest first so the
- * bright thin core lands on top. Stacking these with an additive blend turns the
- * flat "sharp triangle" into a soft glow: the wide low-alpha layers spread a haze to
- * the sides while the narrow high-alpha core stays hot, and the sums fall off softly
- * from the center out. `widthScale` is a multiple of the beam's current width;
- * `alphaScale` is a multiple of its current alpha. Tuned so the core reads crisp and
- * the halo trails off gently; a judgment call worth tuning to taste.
- */
-const BEAM_GLOW_LAYERS = [
-  { widthScale: 2.6, alphaScale: 0.18 },
-  { widthScale: 1.7, alphaScale: 0.30 },
-  { widthScale: 1.0, alphaScale: 0.85 },
-] as const
-
-/**
- * The blur radius, in pixels, applied to the whole beam layer so each cone reads as a fuzzy glow of
- * light fanning onto the file rather than a crisp triangle (the "make it blurred" ask). One pass
- * over the single batched beam graphic softens every beam at once for the cost of one filter, and it
- * sits under the (separate, still-sharp) actor orbs. Tuned for a noticeably soft edge without
- * smearing the cone into a featureless blob; raise it for a fuzzier beam, lower it for a crisper one.
- */
-const BEAM_BLUR_STRENGTH = 6
 
 /**
  * The fraction of an actor's drawn radius the avatar's identity ring is thick. A

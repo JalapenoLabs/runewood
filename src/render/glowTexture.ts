@@ -46,6 +46,59 @@ export function buildGlowTexture(renderer: Renderer, radius: number = GLOW_TEXTU
 }
 
 /**
+ * Builds a reusable soft beam-gradient texture: Gource's `beam.png` rebuilt in code.
+ * It is a white horizontal strip that is transparent at both ends and rises to a hot
+ * opaque core in the middle, so when it is stretched along a beam and tinted, the
+ * beam reads as a glowing colored laser that is brightest at its center and softens
+ * to nothing at the user and file ends, rather than a flat-edged bar.
+ *
+ * Why one baked strip and not a per-beam gradient: the texture is uploaded to the GPU
+ * once and every live beam draws it as a cheap tinted, rotated, scaled `Sprite`
+ * (additively blended), so the whole field's glow costs one texture and N sprite
+ * draws. White texels mean a sprite's `tint` recolors it to the action/actor hue for
+ * free, exactly like the node glow texture above.
+ *
+ * The gradient runs along the strip's WIDTH ({@link BEAM_TEXTURE_LENGTH} texels) and
+ * is a single texel tall: a beam has no meaningful cross-axis detail of its own (its
+ * perpendicular softness comes from the additive blend + the layer blur), so a 1-px
+ * tall strip is all the GPU needs and keeps the upload tiny, matching Gource's
+ * 128x1 `beam.png`. The falloff is a smooth bell (a raised cosine) so the core blooms
+ * and the ends fade with no hard seam.
+ */
+export function buildBeamTexture(renderer: Renderer): Texture {
+  const graphics = new Graphics()
+
+  // Paint the strip one vertical column at a time, each column's alpha following a
+  // raised-cosine bell: 0 at both ends, 1 at the center. Stacking thin opaque columns
+  // approximates the smooth 1D gradient of Gource's beam.png without a 2D canvas
+  // context the WebGL/WebGPU backend may not expose.
+  for (let column = 0; column < BEAM_TEXTURE_LENGTH; column++) {
+    const position = column / (BEAM_TEXTURE_LENGTH - 1)
+    // Raised cosine: peaks at the midpoint, falls smoothly to 0 at both ends.
+    const alpha = 0.5 - 0.5 * Math.cos(position * Math.PI * 2)
+    graphics
+      .rect(column, 0, 1, BEAM_TEXTURE_THICKNESS)
+      .fill({ color: 0xffffff, alpha })
+  }
+
+  return renderer.generateTexture(graphics)
+}
+
+/**
+ * The length, in texels, of the baked beam-gradient strip (its long, gradient axis).
+ * Mirrors Gource's 128-wide `beam.png`: enough samples that stretching it along a
+ * beam stays a smooth bell, while the strip stays a one-time, near-free GPU upload.
+ */
+export const BEAM_TEXTURE_LENGTH = 128
+
+/**
+ * The thickness, in texels, of the baked beam strip (its short axis). Gource's beam is
+ * a single row; a few texels here just give `generateTexture` a non-degenerate height
+ * to rasterize, and the sprite scales this to the drawn beam width regardless.
+ */
+const BEAM_TEXTURE_THICKNESS = 4
+
+/**
  * The radius, in texture pixels, the glow texture is generated at. Large enough
  * that scaling it up per node stays smooth, small enough to keep the one-time
  * GPU upload cheap. Node sprites scale this to the node's glow size, so the
