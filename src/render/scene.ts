@@ -102,6 +102,14 @@ export class Scene {
   private readonly edgeOptions: EdgeVisualOptions
 
   /**
+   * Above this many drawn nodes the per-node soft-glow sprite is auto-disabled (issue: at scale the
+   * additive glow is the most expensive per-node effect and the main bloom-bleed clutter, so a big
+   * forest stays crisp small dots and fast). The crisp cores + edges are always kept. A host can
+   * raise it for a glowier large forest or lower it to degrade sooner; see {@link SceneOptions}.
+   */
+  private readonly maxGlowNodes: number
+
+  /**
    * @param edgeLayer world container for branches (added under the node layer so
    *   branches sit behind the glowing discs).
    * @param nodeLayer world container for node discs + glow sprites.
@@ -122,6 +130,7 @@ export class Scene {
     this.lastEdgeDraw = new Map()
     this.nodeOptions = options.node ?? {}
     this.edgeOptions = options.edge ?? {}
+    this.maxGlowNodes = options.maxGlowNodes ?? DEFAULT_MAX_GLOW_NODES
   }
 
   /**
@@ -160,6 +169,11 @@ export class Scene {
 
     this.cullDeparted(springs)
 
+    // Effect degrade at scale: above the glow-node cap, drop the per-node soft-glow sprite (the
+    // priciest per-node effect and the worst bloom-bleed clutter), so a large forest reads as crisp
+    // dots + edges and stays fast. Decided once per frame off the live drawn-node count.
+    const glowEnabled = springs.size <= this.maxGlowNodes
+
     // The breathing intensity is shared by every ring this frame: it depends only on
     // the wall-clock animation time, not the node, so compute it once. Skipped (and
     // left at 0) when nothing is highlighted, so the common no-highlight path pays
@@ -184,7 +198,7 @@ export class Scene {
         this.removeNode(path)
         continue
       }
-      const visual = this.drawNode(node, physics.position, now, theme)
+      const visual = this.drawNode(node, physics.position, now, theme, glowEnabled)
       // Edges connect a node to its *display-parent* (nearest visible ancestor), so
       // a collapsed pass-through chain is spanned by one edge, and are styled by the
       // node's *visible* depth so a deep leaf drawn near the center is not a hairline.
@@ -236,7 +250,13 @@ export class Scene {
    * tinted to the node's hue and additively blended, so the big-glow look survives
    * even with the heavy bloom post-process off.
    */
-  private drawNode(node: TreeNode, position: Vec2, now: number, theme: RunewoodTheme): NodeVisual {
+  private drawNode(
+    node: TreeNode,
+    position: Vec2,
+    now: number,
+    theme: RunewoodTheme,
+    glowEnabled: boolean,
+  ): NodeVisual {
     const visual = nodeVisualFor(node, now, theme, this.nodeOptions)
 
     let graphics = this.nodeGraphics.get(node.path)
@@ -260,6 +280,7 @@ export class Scene {
       || previous.alpha !== visual.alpha
       || previous.brightness !== visual.brightness
       || previous.glow !== visual.glow
+      || previous.glowEnabled !== glowEnabled
       || previous.color.h !== visual.color.h
       || previous.color.s !== visual.color.s
       || previous.color.l !== visual.color.l
@@ -286,7 +307,10 @@ export class Scene {
         .circle(0, 0, visual.radius)
         .fill({ color: coreColor, alpha: visual.alpha })
 
-      this.updateGlow(node.path, visual.radius, visual.color, visual.alpha * visual.glow)
+      // Degrade at scale: when the glow is disabled (too many nodes) force the glow strength to zero
+      // so `updateGlow` tears any existing sprite down, leaving just the crisp core.
+      const glowStrength = glowEnabled ? visual.alpha * visual.glow : 0
+      this.updateGlow(node.path, visual.radius, visual.color, glowStrength)
     }
 
     // Both the core and its glow sprite are positioned absolutely in world space, so
@@ -304,6 +328,7 @@ export class Scene {
       alpha: visual.alpha,
       brightness: visual.brightness,
       glow: visual.glow,
+      glowEnabled,
       color: { h: visual.color.h, s: visual.color.s, l: visual.color.l },
     })
 
@@ -718,6 +743,8 @@ type DrawnNode = {
   alpha: number
   brightness: number
   glow: number
+  /** Whether the per-node glow sprite was enabled when last drawn, so a scale toggle forces a redraw. */
+  glowEnabled: boolean
   color: { h: number, s: number, l: number }
 }
 
@@ -755,6 +782,13 @@ function indexNodesByPath(tree: TreeNode): Map<string, TreeNode> {
 export type SceneOptions = {
   node?: NodeVisualOptions
   edge?: EdgeVisualOptions
+  /**
+   * Above this many drawn nodes the per-node soft-glow sprite is auto-disabled, so a large forest
+   * stays crisp dots + edges and fast (the additive glow is the most expensive per-node effect and
+   * the main bloom-bleed clutter at scale). The crisp cores + edges always draw. Defaults to
+   * {@link DEFAULT_MAX_GLOW_NODES}. Raise it for a glowier big forest; lower it to degrade sooner.
+   */
+  maxGlowNodes?: number
 }
 
 /**
@@ -787,6 +821,16 @@ const MIN_EDGE_SCREEN_PX = 1.5
  * still blooms clearly. A judgment call worth tuning to taste.
  */
 const GLOW_SCALE = 1.8
+
+/**
+ * The default cap on drawn nodes before the per-node soft-glow sprite is auto-disabled (the
+ * {@link SceneOptions.maxGlowNodes} default). Below this a forest keeps its glowing-wood look; above
+ * it (a large multi-repo load of thousands of nodes) the glow is dropped so the forest stays crisp
+ * dots + edges and fast, since the additive glow is the priciest per-node effect and the worst
+ * bloom-bleed clutter at scale. Sized so a typical small/medium tree glows fully and only a genuinely
+ * large forest degrades. A judgment call worth tuning to the target hardware.
+ */
+const DEFAULT_MAX_GLOW_NODES = 1200
 
 /**
  * The minimum on-screen size, in screen pixels, the highlight reticle's working radius

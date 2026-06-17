@@ -69,6 +69,17 @@ export class ForceLayout {
   private readonly bodies: Map<string, NodePhysics>
 
   /**
+   * Per-directory sleep state, keyed by real node path (files are never bodies, so they are never
+   * here). A directory whose velocity AND net force stay below {@link SLEEP_*} thresholds for
+   * {@link SLEEP_DWELL_MS} of accumulated quiet time goes {@link SleepState.asleep}, after which the
+   * integrator skips it entirely until something wakes it (a force above the wake threshold, a
+   * camera impulse, or a structural change near it). This is the convergence + scale-perf win: a
+   * settled forest does almost no integration work, and its nodes stop micro-moving so the scene's
+   * skip-redraw actually triggers. Absent for the pinned root (never integrated anyway).
+   */
+  private readonly sleepByPath: Map<string, SleepState>
+
+  /**
    * Per-node layout metadata captured on {@link sync} from the collapse, so {@link step} can apply
    * the forces without re-walking the tree each frame. Keyed by real node path; the forest root and
    * an un-synced node are absent.
@@ -84,10 +95,23 @@ export class ForceLayout {
 
   private readonly options: Required<ForceLayoutOptions>
 
+  /**
+   * The global cooling temperature (d3-force-style `alpha`), in `[0, 1]`. Every directory's force
+   * step is scaled by it, and it decays toward 0 each step ({@link ALPHA_DECAY_PER_SECOND}). This is
+   * the convergence schedule on top of the per-body sleeping: it shrinks the residual jitter of a
+   * deep, competing force network frame by frame until each body's realized step drops below the
+   * sleep threshold and the whole forest goes static, instead of limit-cycling forever. It is
+   * REHEATED to 1 by any disturbance (a structural change on {@link sync} or a camera
+   * {@link applyImpulse}) so the layout re-anneals when it actually needs to move.
+   */
+  private alpha: number
+
   constructor(options: ForceLayoutOptions = {}) {
     this.bodies = new Map()
+    this.sleepByPath = new Map()
     this.metaByPath = new Map()
     this.pinnedPath = null
+    this.alpha = 1
     this.options = {
       center: options.center ?? { x: 0, y: 0 },
       gravity: options.gravity ?? DEFAULT_GRAVITY,
@@ -139,10 +163,12 @@ export class ForceLayout {
 
     // Pre-compute each directory's content radius, its direct visible file count (for the
     // parent-radius rest gap), and each file's packed ring slot, so the spring rest distances and
-    // the file destinations are ready before any body is spawned.
+    // the file destinations are ready before any body is spawned. The radial tidy-tree placement
+    // gives every NEW directory a sensible, already-organized initial spot (see below).
     const contentRadii = computeContentRadii(visibleNodes, this.options)
     const fileSlots = computeFileSlots(visibleNodes, this.options)
     const directFileCounts = countDirectFiles(visibleNodes)
+    const initialPlacement = computeInitialPlacement(visibleNodes, this.options)
 
     for (const visible of visibleNodes) {
       if (visible.isForestRoot) {
@@ -160,18 +186,71 @@ export class ForceLayout {
       this.metaByPath.set(path, meta)
 
       if (!this.bodies.has(path)) {
+        // A NEW node: place a directory at its deterministic radial tidy-tree spot so a bulk seed
+        // of thousands lands already spread out (the force sim then only gently refines + de-laps,
+        // instead of relaxing from one giant pile and exploding). A file still spawns on its
+        // directory and eases out to its ring slot. The radial spot is the big first-load fix.
         this.bodies.set(path, {
-          position: this.spawnPositionFor(path, meta),
+          position: this.spawnPositionFor(path, meta, initialPlacement),
           velocity: { x: 0, y: 0 },
         })
       }
+      else {
+        // An existing directory gains/keeps a body. A structural change (a sibling appeared, a
+        // child was added under it) disturbs its force balance, so wake it to re-settle; a file is
+        // not an integrated body and needs no waking.
+        if (!meta.isFile) {
+          this.wake(path)
+        }
+      }
+      // Every tracked directory must have a sleep record; create one (awake) for a fresh body.
+      if (!meta.isFile && !this.sleepByPath.has(path)) {
+        this.sleepByPath.set(path, { asleep: false, restMs: 0, lastStepDistance: 0 })
+      }
     }
 
-    // Drop bodies whose node is no longer visible, so the sim and the drawn forest stay in lockstep.
+    // Drop bodies (and their sleep state) whose node is no longer visible, so the sim and the drawn
+    // forest stay in lockstep, and wake any directory that lost a neighbor so the gap re-settles.
     for (const path of [ ...this.bodies.keys() ]) {
       if (!livePaths.has(path)) {
         this.bodies.delete(path)
+        this.sleepByPath.delete(path)
       }
+    }
+
+    // A structural change (the only time the controller calls `sync`) disturbs the force balance, so
+    // reheat the cooling schedule to full: the layout re-anneals from whatever it was, then cools
+    // back to rest. Without this, a node added after the forest cooled would never get the energy to
+    // find its place.
+    this.alpha = 1
+  }
+
+  /**
+   * Wakes a sleeping directory so the integrator resumes moving it: clears its asleep flag and its
+   * accumulated quiet time. Called when something disturbs the layout near it (a structural change
+   * on {@link sync}, a strong force, or a camera {@link applyImpulse}). A no-op for a path with no
+   * sleep record (a file, the pinned root, or an untracked node).
+   */
+  private wake(path: string): void {
+    const sleep = this.sleepByPath.get(path)
+    if (sleep) {
+      sleep.asleep = false
+      sleep.restMs = 0
+    }
+  }
+
+  /**
+   * Wakes a directory ONLY if it is currently asleep, leaving an already-awake body's settle dwell
+   * untouched. Used for the overlap-wake during repulsion: a node drifting into a settled cluster
+   * revives the sleepers it touches, but a settled pair that rests microscopically overlapping must
+   * NOT keep resetting each other's dwell (or neither would ever sleep). An awake body decides to
+   * sleep purely from its own force + velocity in {@link integrateDirectories}.
+   */
+  private wakeIfAsleep(path: string): void {
+    const sleep = this.sleepByPath.get(path)
+    if (sleep?.asleep) {
+      sleep.asleep = false
+      sleep.restMs = 0
     }
   }
 
@@ -199,8 +278,10 @@ export class ForceLayout {
    */
   public reset(): void {
     this.bodies.clear()
+    this.sleepByPath.clear()
     this.metaByPath.clear()
     this.pinnedPath = null
+    this.alpha = 1
   }
 
   /**
@@ -225,10 +306,16 @@ export class ForceLayout {
 
     // Accumulate this frame's directory forces before integrating, so every force reads the same
     // start-of-frame positions (an explicit, order-independent step). Files are not force bodies;
-    // they ease toward their slot in a separate pass after the directories have moved.
+    // they ease toward their slot in a separate pass after the directories have moved. Only AWAKE
+    // directories get an acceleration slot: a sleeping one is skipped for the (expensive) force
+    // passes entirely. A sleeping directory still sits in the repulsion quadtree as a SOURCE, and
+    // an awake body overlapping it wakes it (so a neighbor moving into a settled node revives it).
     const accelerations = new Map<string, Vec2>()
     for (const [ path, meta ] of this.metaByPath) {
       if (meta.isFile || path === this.pinnedPath) {
+        continue
+      }
+      if (this.sleepByPath.get(path)?.asleep) {
         continue
       }
       accelerations.set(path, { x: 0, y: 0 })
@@ -238,8 +325,17 @@ export class ForceLayout {
     this.applyParentSpring(accelerations)
     this.applyParentEdgeNudge(accelerations)
     this.applySiblingSpread(accelerations)
-    this.integrateDirectories(accelerations, deltaSeconds)
+    this.integrateDirectories(accelerations, clampedMs, deltaSeconds)
     this.easeFiles(deltaSeconds)
+
+    // Cool the global temperature toward rest, framerate-independently. As alpha shrinks, each
+    // body's force step shrinks with it, so a deep, competing force network anneals to stillness
+    // (its residual jitter falls under the sleep threshold) instead of limit-cycling forever. Files
+    // are not cooled (they ease deterministically and always reach their slot).
+    this.alpha *= Math.pow(ALPHA_DECAY_PER_SECOND, deltaSeconds)
+    if (this.alpha < ALPHA_FLOOR) {
+      this.alpha = 0
+    }
   }
 
   /**
@@ -274,7 +370,13 @@ export class ForceLayout {
       }
       body.velocity.x += kick.x
       body.velocity.y += kick.y
+      // A kicked body has velocity to spend, so wake it (and let the wobble settle it back to sleep).
+      this.wake(path)
     }
+
+    // Reheat the cooling schedule so the kicked forest has the force-energy to re-settle into a tidy
+    // arrangement after the wobble, rather than the kick just sliding cooled-flat bodies around.
+    this.alpha = 1
   }
 
   /**
@@ -299,9 +401,18 @@ export class ForceLayout {
     for (const [ path, acceleration ] of accelerations) {
       const body = this.bodies.get(path)!
       const radius = this.radiusOf(path)
-      const push = tree.repulsionOn(path, body.position, radius, (candidatePath) => {
-        return this.repelsAgainst(path, candidatePath)
-      })
+      // Only a body that actually MOVED last step can wake a sleeping neighbor it overlaps: that is
+      // a genuine intruder drifting in. A settled cluster rests with standing overlap (gravity packs
+      // the discs slightly inside one another), so waking on static overlap would never let it
+      // sleep; requiring real motion means only a true disturbance revives a sleeper.
+      const isMover = (this.sleepByPath.get(path)?.lastStepDistance ?? 0) > WAKE_MOVE_EPSILON
+      const push = tree.repulsionOn(
+        path,
+        body.position,
+        radius,
+        (candidatePath) => this.repelsAgainst(path, candidatePath),
+        isMover ? (overlappedPath) => this.wakeIfAsleep(overlappedPath) : undefined,
+      )
       acceleration.x += push.x
       acceleration.y += push.y
     }
@@ -557,22 +668,26 @@ export class ForceLayout {
    * motion is pure Gource. The force is integrated directly into position (not into velocity), so a
    * strong spring can never build up runaway momentum: that is the anti-flail fix.
    */
-  private integrateDirectories(accelerations: Map<string, Vec2>, deltaSeconds: number): void {
+  private integrateDirectories(accelerations: Map<string, Vec2>, deltaMs: number, deltaSeconds: number): void {
     // Per-second damping converted to this step: the wobble velocity retains `(1 - damping)^dt`, so
     // the decay is framerate-independent rather than tied to a fixed step count.
     const retained = Math.pow(1 - this.options.damping, deltaSeconds)
 
     for (const [ path, acceleration ] of accelerations) {
       const body = this.bodies.get(path)!
+      const startX = body.position.x
+      const startY = body.position.y
 
-      // Gource's momentumless force response: step straight toward the force balance. The step is
-      // CLAMPED to a fraction of the node's own radius per frame ({@link maxStepFractionOfRadius}),
-      // so a strong, stiff force (deep in a big forest the gravity + edge terms can be large) can
-      // never carry the node past its equilibrium and set up a perpetual overshoot oscillation.
-      // Capping the step keeps each frame a sub-equilibrium relaxation, so the forest converges to
-      // rest instead of limit-cycling, while a settled node (tiny force) is unaffected.
-      const stepX = acceleration.x * deltaSeconds
-      const stepY = acceleration.y * deltaSeconds
+      // Gource's momentumless force response: step straight toward the force balance, scaled by the
+      // global cooling temperature `alpha` so a deep, competing force network anneals to rest rather
+      // than limit-cycling forever (the convergence schedule). The step is also CLAMPED to a
+      // fraction of the node's own radius per frame ({@link maxStepFractionOfRadius}), so a strong,
+      // stiff force (deep in a big forest the gravity + edge terms can be large) can never carry the
+      // node past its equilibrium and set up a perpetual overshoot. Capping plus cooling keeps every
+      // frame a sub-equilibrium relaxation, so the forest converges to rest, while a settled node
+      // (tiny force) is unaffected.
+      const stepX = acceleration.x * deltaSeconds * this.alpha
+      const stepY = acceleration.y * deltaSeconds * this.alpha
       const stepLength = Math.hypot(stepX, stepY)
       const maxStep = Math.max(this.radiusOf(path), MIN_DIR_STEP) * MAX_STEP_FRACTION_OF_RADIUS
       if (stepLength > maxStep) {
@@ -590,6 +705,39 @@ export class ForceLayout {
       body.position.y += body.velocity.y * deltaSeconds
       body.velocity.x *= retained
       body.velocity.y *= retained
+
+      // Record how far the body actually moved this step, so the overlap-wake can tell a real
+      // intruder (a moving body) from a settled neighbor resting with standing overlap.
+      const sleepState = this.sleepByPath.get(path)
+      if (sleepState) {
+        sleepState.lastStepDistance = Math.hypot(body.position.x - startX, body.position.y - startY)
+      }
+
+      // Sleep bookkeeping (convergence + the scale perf win): a directory whose actual per-step
+      // MOVEMENT and residual wobble velocity both sit below the sleep thresholds is quiet.
+      // Accumulate that quiet time; once it clears the dwell, the body sleeps and the integrator
+      // skips it next frame (so it stops micro-moving and the scene's skip-redraw triggers). Any
+      // disturbance above the thresholds resets the dwell, keeping the body awake while it still has
+      // settling to do. Keying on the realized step (not the raw force) means a body resting in a
+      // standing-overlap equilibrium, where opposing forces nearly cancel into a tiny net step, is
+      // correctly recognized as quiet and allowed to sleep.
+      if (!sleepState) {
+        continue
+      }
+      const speed = Math.hypot(body.velocity.x, body.velocity.y)
+      if (sleepState.lastStepDistance < SLEEP_STEP_THRESHOLD && speed < SLEEP_SPEED_THRESHOLD) {
+        sleepState.restMs += deltaMs
+        if (sleepState.restMs >= SLEEP_DWELL_MS) {
+          sleepState.asleep = true
+          // Zero the residual wobble so a sleeping body is truly static (no leftover sub-threshold
+          // drift), which is what lets the scene treat it as unmoved and skip its redraw.
+          body.velocity.x = 0
+          body.velocity.y = 0
+        }
+      }
+      else {
+        sleepState.restMs = 0
+      }
     }
   }
 
@@ -651,40 +799,37 @@ export class ForceLayout {
   }
 
   /**
-   * Where a brand-new node is born (Gource `setInitialPosition`): a directory spawns at its parent's
-   * current position nudged a unit step along the grandparent -> parent direction (plus a
-   * deterministic per-path hash jitter so siblings fan rather than stack); a file spawns directly on
-   * its directory and eases out to its ring slot. Falls back to a hash-chosen ray from the center
-   * when the parent has no body yet (a repo root off the undrawn center).
+   * Where a brand-new node is born. A **directory** lands at its deterministic radial tidy-tree spot
+   * ({@link computeInitialPlacement}), so a bulk seed of thousands arrives already spread across the
+   * forest rather than piled at its parent (the explosion the force sim used to relax from). A
+   * **file** spawns directly on its directory and eases out to its ring slot. The radial placement
+   * is centered on the sim's center, so it is in the same world space the sim then refines in.
+   *
+   * The placement map is computed once per {@link sync} over the whole visible set; if a directory
+   * is somehow absent from it (it should not be), we fall back to the old Gource off-the-branch
+   * nudge so a node never spawns at an undefined position.
    */
-  private spawnPositionFor(path: string, meta: NodeMeta): Vec2 {
-    const parentBody = this.bodies.get(meta.displayParentPath)
-    const anchor = parentBody ? parentBody.position : this.options.center
-
+  private spawnPositionFor(path: string, meta: NodeMeta, placement: Map<string, Vec2>): Vec2 {
     if (meta.isFile) {
       // Files start on their directory and ease out to the ring; no jitter needed.
+      const directoryBody = this.bodies.get(meta.displayParentPath)
+      const anchor = directoryBody ? directoryBody.position : this.options.center
       return { x: anchor.x, y: anchor.y }
     }
 
-    // The grandparent -> parent edge direction, the way Gource nudges a fresh node off the branch.
+    const radial = placement.get(path)
+    if (radial) {
+      return { x: radial.x, y: radial.y }
+    }
+
+    // Fallback (a directory missing from the placement, which the pure helper should never omit):
+    // the old Gource off-the-branch spawn, so a node always gets a defined, sane initial position.
+    const parentBody = this.bodies.get(meta.displayParentPath)
+    const anchor = parentBody ? parentBody.position : this.options.center
     const edge = parentBody ? this.outwardEdgeOf(meta.displayParentPath, anchor) : null
     const jitter = hashUnitVector(path)
-
-    let directionX: number
-    let directionY: number
-    if (edge) {
-      // Gource: normalise(edge * 2 + hash), a unit step mostly along the branch with a little
-      // per-path scatter so siblings born together separate.
-      directionX = edge.x * 2 + jitter.x
-      directionY = edge.y * 2 + jitter.y
-    }
-    else {
-      // No branch direction (a repo root, or a parent sitting on its own parent): scatter on a
-      // hash-chosen ray, exactly Gource's `pos += vec2Hash(abspath)` fallback.
-      directionX = jitter.x
-      directionY = jitter.y
-    }
-
+    const directionX = edge ? edge.x * 2 + jitter.x : jitter.x
+    const directionY = edge ? edge.y * 2 + jitter.y : jitter.y
     const length = Math.hypot(directionX, directionY) || EPSILON
     const reach = this.radiusOf(meta.displayParentPath) + meta.contentRadius
     return {
@@ -692,6 +837,24 @@ export class ForceLayout {
       y: anchor.y + (directionY / length) * reach,
     }
   }
+}
+
+/**
+ * The internal sleep state of one directory body, keyed by path in {@link ForceLayout.sleepByPath}.
+ * A body accumulates {@link restMs} of below-threshold quiet time and, once it clears
+ * {@link SLEEP_DWELL_MS}, flips {@link asleep} so the integrator skips it until something wakes it.
+ */
+type SleepState = {
+  /** Whether the integrator currently skips this body (it has settled). */
+  asleep: boolean
+  /** Accumulated quiet (below-threshold) time since the body was last disturbed, in milliseconds. */
+  restMs: number
+  /**
+   * How far this body moved on its last integrated step, in layout units. Drives the overlap-wake:
+   * only a body that genuinely moved (a real intruder, not a settled body resting with standing
+   * overlap) wakes the sleeping neighbors it overlaps. Zero for a sleeping or never-stepped body.
+   */
+  lastStepDistance: number
 }
 
 /**
@@ -732,6 +895,23 @@ export type SiblingGroup = {
 
 /** A small floor on a distance so a normalize divide never hits zero for two coincident bodies. */
 const EPSILON = 1e-6
+
+/**
+ * The minimum disc penetration (layout units) at which an awake body's overlap WAKES a sleeping
+ * neighbor. Two settled bodies rest tangent and micro-overlap by floating-point noise alone; waking
+ * on that would keep a converged cluster from ever fully sleeping. A node genuinely drifting into a
+ * settled cluster penetrates well past this, so it still revives the nodes it actually disturbs.
+ */
+const WAKE_PENETRATION = 0.5
+
+/**
+ * The minimum per-step movement (layout units) that makes an awake body a "mover" able to wake the
+ * sleeping neighbors it overlaps. Above the sleep step threshold so a body settling toward rest does
+ * not count as an intruder, but low enough that a body genuinely travelling (a fresh node drifting
+ * into a cluster, a kicked body) does. This is the dynamic half of the wake test: a settled cluster
+ * with standing overlap has no movers, so it stays asleep; a real arrival has a clear mover.
+ */
+const WAKE_MOVE_EPSILON = 0.1
 
 /**
  * Default parent gravity (Gource `gGourceForceGravity`): how hard a directory is pulled to rest just
@@ -787,6 +967,53 @@ const MAX_STEP_FRACTION_OF_RADIUS = 4
 
 /** A floor on the per-frame step cap so a tiny-radius directory can still move a sane minimum. */
 const MIN_DIR_STEP = 8
+
+/**
+ * The per-SECOND multiplier the global cooling temperature `alpha` decays by (framerate-independent:
+ * `alpha *= ALPHA_DECAY_PER_SECOND ^ deltaSeconds` each step). At `0.08` the temperature roughly
+ * halves every ~0.27s, so a freshly-(re)heated forest anneals from full energy to effectively cold
+ * in a few seconds, after which the residual force steps are tiny and every body sleeps. This is the
+ * convergence schedule that breaks the deep-tree limit cycle the raw force model otherwise sits in.
+ * Lower cools faster (snappier settle, less organic glide); higher cools slower (more lingering
+ * motion). Reheated to 1 by any structural change ({@link ForceLayout.sync}) or camera impulse.
+ */
+const ALPHA_DECAY_PER_SECOND = 0.08
+
+/**
+ * The temperature below which `alpha` snaps to exactly 0, so a cooled forest does no residual force
+ * stepping at all (the force step becomes literally zero) and every body reliably sleeps rather than
+ * creeping by ever-smaller-but-nonzero amounts forever. Small enough that the layout is visually at
+ * rest well before it trips.
+ */
+const ALPHA_FLOOR = 0.002
+
+/**
+ * The realized per-step movement (layout units) below which a directory counts as quiet for
+ * sleeping. Keying on the actual step (rather than the raw force) is what lets a body resting in a
+ * standing-overlap equilibrium sleep: there the spring and repulsion nearly cancel into a tiny net
+ * step even though each individual force is sizeable. Set well under the scene's redraw epsilon
+ * ({@link import('../render/scene').DRAW_EPSILON}, ~0.1px) so a node sleeps right around the point
+ * its motion would already be invisible, while a real disturbance (a step many times larger) keeps
+ * it awake. A tuning knob: lower for stricter stillness before sleeping, higher to quiesce sooner.
+ */
+const SLEEP_STEP_THRESHOLD = 0.05
+
+/**
+ * The wobble-velocity magnitude (layout units per second) below which a directory counts as quiet
+ * for sleeping. Only the camera-impulse channel carries velocity (the force response is
+ * momentumless), so this is essentially "the camera kick has bled off"; paired with
+ * {@link SLEEP_FORCE_THRESHOLD} so a body sleeps only when both its force and its residual motion
+ * are small.
+ */
+const SLEEP_SPEED_THRESHOLD = 4
+
+/**
+ * How long (in accumulated below-threshold milliseconds) a directory must stay quiet before it
+ * sleeps. A short dwell so a settled forest goes static within a fraction of a second, but long
+ * enough that a node merely passing through its equilibrium on the way to overshoot does not sleep
+ * prematurely. ~250ms is a handful of frames at 60fps.
+ */
+const SLEEP_DWELL_MS = 250
 
 /**
  * Default Barnes-Hut opening angle (theta). A quadtree cell is treated as a single center-of-mass
@@ -924,6 +1151,139 @@ export function computeContentRadii(
   }
   return radii
 }
+
+/**
+ * Computes a deterministic radial tidy-tree position for every visible **directory**, used to give a
+ * freshly-spawned node a sensible, already-organized initial spot instead of piling it on its parent
+ * (issue: a bulk seed of thousands all spawning at/near their parents starts the force sim from a
+ * massively-overlapping degenerate state, producing an explosion of repulsion and minutes of churn).
+ * Seeding the radial layout up front means the force sim only has to gently refine and de-overlap,
+ * so a 3000-node first load lands organized in a second or two.
+ *
+ * The placement is the same radial fan {@link import('./layout').computeTargets} produces, computed
+ * directly off the {@link VisibleNode} display-parent grouping the sim already holds (rather than the
+ * raw tree): repo roots ring the center, and each directory hands its visible directory-children an
+ * even slice of its own angular wedge one ring further out. Files are intentionally absent (they are
+ * deterministic ring satellites of their directory, placed by {@link computeFileSlots}, and spawn on
+ * the directory then ease out). The forest root, when present, sits at the center.
+ *
+ * Pure given `(visibleNodes, options)`: identical input yields identical positions, with no time or
+ * randomness, so a bulk add is reproducible and unit-testable. Directories are visited in sorted
+ * path order so the fan is independent of input ordering.
+ */
+export function computeInitialPlacement(
+  visibleNodes: VisibleNode[],
+  options: Required<ForceLayoutOptions>,
+): Map<string, Vec2> {
+  // Group the visible DIRECTORIES by their display-parent, so the radial recursion walks only the
+  // directory skeleton (files are satellites, not part of the fan). Children are kept sorted by path
+  // for an order-independent layout.
+  const directoryChildrenByParent = new Map<string, VisibleNode[]>()
+  for (const visible of visibleNodes) {
+    if (visible.isForestRoot || visible.node.isFile) {
+      continue
+    }
+    const siblings = directoryChildrenByParent.get(visible.displayParentPath)
+    if (siblings) {
+      siblings.push(visible)
+    }
+    else {
+      directoryChildrenByParent.set(visible.displayParentPath, [ visible ])
+    }
+  }
+  for (const siblings of directoryChildrenByParent.values()) {
+    siblings.sort((left, right) => {
+      return left.node.path < right.node.path ? -1 : left.node.path > right.node.path ? 1 : 0
+    })
+  }
+
+  const positions = new Map<string, Vec2>()
+  // The repo roots (display-parent `''`) fan around the full circle; each directory then hands its
+  // own children a slice of its wedge, one ring further out, exactly like the radial tidy-tree.
+  placeRadialChildren('', { angle: 0, span: Math.PI }, 0, {
+    center: options.center,
+    ringSpacing: options.directoryPadding * RADIAL_RING_SPACING_PADDINGS,
+    directoryChildrenByParent,
+    positions,
+  })
+  return positions
+}
+
+/**
+ * Lays out the visible directory children of `parentPath` across the parent's angular `wedge`, one
+ * ring further out than the parent's depth, then recurses into each child with its own narrowed
+ * wedge. Mirrors the radial tidy-tree in {@link import('./layout').computeTargets}, but over the
+ * directory-only {@link VisibleNode} grouping the sim holds. A deterministic per-path jitter breaks
+ * up the mechanical ring perfection so the force sim starts from a slightly organic spread.
+ */
+function placeRadialChildren(
+  parentPath: string,
+  wedge: { angle: number, span: number },
+  depth: number,
+  context: RadialPlacementContext,
+): void {
+  const children = context.directoryChildrenByParent.get(parentPath)
+  if (!children || children.length === 0) {
+    return
+  }
+
+  const childDepth = depth + 1
+  const radius = context.ringSpacing * childDepth
+
+  // Each child gets an equal share of the parent's wedge; a lone child inherits the parent's exact
+  // angle so a deep chain grows straight outward instead of drifting.
+  const filledSpan = wedge.span * 2 * RADIAL_WEDGE_FILL
+  const perChildSpan = filledSpan / children.length
+  const wedgeStart = wedge.angle - filledSpan / 2
+
+  for (const [ index, child ] of children.entries()) {
+    const childAngle = children.length === 1
+      ? wedge.angle
+      : wedgeStart + perChildSpan * (index + 0.5)
+
+    // A small deterministic radial jitter from the path hash so siblings born together do not land
+    // on a mathematically perfect arc the sim then has to perturb; the angle is left clean so a node
+    // stays well within its parent's wedge.
+    const jitterUnit = (hashPath(child.node.path) & 0xffff) / 0xffff - 0.5
+    const jitteredRadius = radius + jitterUnit * context.ringSpacing * RADIAL_JITTER_FRACTION
+
+    context.positions.set(child.node.path, {
+      x: context.center.x + Math.cos(childAngle) * jitteredRadius,
+      y: context.center.y + Math.sin(childAngle) * jitteredRadius,
+    })
+
+    placeRadialChildren(child.node.path, { angle: childAngle, span: perChildSpan / 2 }, childDepth, context)
+  }
+}
+
+/** Everything {@link placeRadialChildren} needs that does not change between nodes. */
+type RadialPlacementContext = {
+  center: Vec2
+  ringSpacing: number
+  directoryChildrenByParent: Map<string, VisibleNode[]>
+  positions: Map<string, Vec2>
+}
+
+/**
+ * The radial ring spacing for {@link computeInitialPlacement}, expressed as a multiple of the
+ * directory padding so the initial fan's ring gap scales with the same unit the content radii use.
+ * Wide enough that sibling sub-trees start clearly separated, so the force sim opens from an
+ * already-spread state rather than a pile.
+ */
+const RADIAL_RING_SPACING_PADDINGS = 80
+
+/**
+ * Fraction (0..1) of a node's angular wedge its children are allowed to span, leaving a gap between
+ * sibling sub-trees so they read as distinct branches. Mirrors the radial tidy-tree's default.
+ */
+const RADIAL_WEDGE_FILL = 0.85
+
+/**
+ * Peak radial jitter on the initial placement, as a fraction of the ring spacing, derived from each
+ * path's hash (never randomness, so the placement stays deterministic). Just enough to break the
+ * mechanical ring perfection so the force sim does not start every sibling on one exact arc.
+ */
+const RADIAL_JITTER_FRACTION = 0.15
 
 /**
  * A directory's `parent_radius` (Gource `calcRadius`): the radius a child rests just outside,
@@ -1141,6 +1501,7 @@ export type QuadTree = {
     position: Vec2,
     radius: number,
     repels: (candidatePath: string) => boolean,
+    onOverlap?: (overlappedPath: string) => void,
   ) => Vec2
 }
 
@@ -1196,9 +1557,10 @@ export function buildQuadTree(points: QuadPoint[], theta: number): QuadTree {
     position: Vec2,
     radius: number,
     repels: (candidatePath: string) => boolean,
+    onOverlap?: (overlappedPath: string) => void,
   ): Vec2 => {
     const push = { x: 0, y: 0 }
-    accumulateRepulsion(root, path, position, radius, theta, repels, push)
+    accumulateRepulsion(root, path, position, radius, theta, repels, push, onOverlap)
     return push
   }
 
@@ -1283,6 +1645,7 @@ function accumulateRepulsion(
   theta: number,
   repels: (candidatePath: string) => boolean,
   push: Vec2,
+  onOverlap?: (overlappedPath: string) => void,
 ): void {
   if (cell.totalRadius <= 0) {
     return
@@ -1294,7 +1657,20 @@ function accumulateRepulsion(
     if (other.path === path || !repels(other.path)) {
       return
     }
+    const beforeX = push.x
+    const beforeY = push.y
     addOverlapPush(position, radius, other.position, other.radius, push)
+    // The push delta equals the disc penetration depth; report the overlap so the caller can wake a
+    // sleeping neighbor the querying body has drifted INTO, but only when the penetration is
+    // MEANINGFUL ({@link WAKE_PENETRATION}). Two bodies resting tangent micro-overlap by floating
+    // point alone; waking on that would keep a settled cluster from ever fully sleeping. A real
+    // intruder penetrates well past the epsilon.
+    if (onOverlap) {
+      const penetration = Math.hypot(push.x - beforeX, push.y - beforeY)
+      if (penetration > WAKE_PENETRATION) {
+        onOverlap(other.path)
+      }
+    }
     return
   }
 
@@ -1308,14 +1684,16 @@ function accumulateRepulsion(
 
   // Far-field test: if the cell subtends a small enough angle, lump it. A lumped cell can only ever
   // contribute a push if the query disc reaches its combined radius, mirroring the overlap-only
-  // pairwise rule, so a far cluster (the common case) contributes nothing and is never opened.
+  // pairwise rule, so a far cluster (the common case) contributes nothing and is never opened. A
+  // lumped cell has no single path, so it never fires the overlap-wake callback (a far cluster is
+  // not a direct neighbor); only leaf overlaps wake a sleeper, which is exactly the intent.
   if (distance > EPSILON && cell.size / distance < theta) {
     addOverlapPush(position, radius, { x: cell.comX, y: cell.comY }, cell.totalRadius, push)
     return
   }
 
   for (const child of cell.children) {
-    accumulateRepulsion(child, path, position, radius, theta, repels, push)
+    accumulateRepulsion(child, path, position, radius, theta, repels, push, onOverlap)
   }
 }
 

@@ -11,6 +11,7 @@ import {
   ForceLayout,
   computeContentRadii,
   computeFileSlots,
+  computeInitialPlacement,
   countDirectFiles,
   parentFileRadius,
   buildQuadTree,
@@ -465,6 +466,231 @@ describe('ForceLayout: applyImpulse (camera wobble)', () => {
     layout.applyImpulse({ x: 0, y: 0 })
     layout.applyImpulse({ x: Number.NaN, y: 1 })
     expect(totalKineticEnergy(layout)).toBe(0)
+  })
+})
+
+describe('computeInitialPlacement (deterministic radial first-load placement)', () => {
+  it('spreads a bulk-added set across the radial layout: bounded, non-coincident, NOT all at one point', () => {
+    // A repo with 100 sibling directories all added at once (the bulk-seed case). The placement must
+    // fan them around the radial layout, not stack them on one point the way a pile-at-parent spawn
+    // would.
+    const visible: VisibleNode[] = [ dir('repo', '', 1) ]
+    for (let index = 0; index < 100; index++) {
+      visible.push(dir(`repo/d${index}`, 'repo', 2))
+    }
+
+    const placement = computeInitialPlacement(visible, defaultedOptions())
+
+    // Every directory got a finite position.
+    expect(placement.size).toBe(101)
+    for (const position of placement.values()) {
+      expect(Number.isFinite(position.x)).toBe(true)
+      expect(Number.isFinite(position.y)).toBe(true)
+    }
+
+    // The 100 children are spread out, not piled: the count of distinct rounded positions is high
+    // (a pile would collapse to one or two points), and they span a real bounding box.
+    const childPositions = visible
+      .filter((visible) => visible.node.path.startsWith('repo/'))
+      .map((visible) => placement.get(visible.node.path)!)
+    const distinct = new Set(childPositions.map((position) => `${Math.round(position.x)},${Math.round(position.y)}`))
+    expect(distinct.size).toBeGreaterThan(90)
+
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    for (const position of childPositions) {
+      minX = Math.min(minX, position.x)
+      maxX = Math.max(maxX, position.x)
+      minY = Math.min(minY, position.y)
+      maxY = Math.max(maxY, position.y)
+    }
+    // The fan has real extent on both axes (a ring around the center), but stays bounded.
+    expect(maxX - minX).toBeGreaterThan(50)
+    expect(maxY - minY).toBeGreaterThan(50)
+    expect(maxX - minX).toBeLessThan(100_000)
+
+    // No two children share an exact position (the explosion-causing degenerate state).
+    const exact = new Set(childPositions.map((position) => `${position.x},${position.y}`))
+    expect(exact.size).toBe(childPositions.length)
+  })
+
+  it('places deeper directories further from the center than shallower ones', () => {
+    const visible: VisibleNode[] = [
+      dir('repo', '', 1),
+      dir('repo/src', 'repo', 2),
+      dir('repo/src/core', 'repo/src', 3),
+    ]
+    const options = defaultedOptions({ center: { x: 0, y: 0 }})
+    const placement = computeInitialPlacement(visible, options)
+
+    const repoRadius = Math.hypot(placement.get('repo')!.x, placement.get('repo')!.y)
+    const srcRadius = Math.hypot(placement.get('repo/src')!.x, placement.get('repo/src')!.y)
+    const coreRadius = Math.hypot(placement.get('repo/src/core')!.x, placement.get('repo/src/core')!.y)
+
+    expect(srcRadius).toBeGreaterThan(repoRadius)
+    expect(coreRadius).toBeGreaterThan(srcRadius)
+  })
+
+  it('omits files (they are deterministic ring satellites, placed by computeFileSlots)', () => {
+    const visible: VisibleNode[] = [
+      dir('repo', '', 1),
+      file('repo/main.ts', 'repo', 2),
+    ]
+    const placement = computeInitialPlacement(visible, defaultedOptions())
+    expect(placement.has('repo')).toBe(true)
+    expect(placement.has('repo/main.ts')).toBe(false)
+  })
+
+  it('is deterministic and independent of input ordering', () => {
+    const build = (reversed: boolean): VisibleNode[] => {
+      const children = Array.from({ length: 10 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
+      const ordered = reversed ? [ ...children ].reverse() : children
+      return [ dir('repo', '', 1), ...ordered ]
+    }
+    const first = computeInitialPlacement(build(false), defaultedOptions())
+    const second = computeInitialPlacement(build(true), defaultedOptions())
+    for (const path of first.keys()) {
+      expect(second.get(path)!).toEqual(first.get(path)!)
+    }
+  })
+
+  it('a bulk sync lands its bodies already spread (not piled at the parent)', () => {
+    // Wire the placement through the sim's `sync`: a fresh ForceLayout given a 100-dir bulk set must
+    // spawn its bodies spread out, BEFORE any `step` runs, proving the initial placement (not the
+    // force relaxation) is what spreads them.
+    const visible: VisibleNode[] = [ dir('repo', '', 1) ]
+    for (let index = 0; index < 100; index++) {
+      visible.push(dir(`repo/d${index}`, 'repo', 2))
+    }
+    const layout = new ForceLayout()
+    layout.sync(visible)
+
+    const positions = [ ...layout.state.values() ].map((body) => {
+      return `${Math.round(body.position.x)},${Math.round(body.position.y)}`
+    })
+    const distinct = new Set(positions)
+    // Almost every body sits at its own spot the instant it is synced; a pile-at-parent spawn would
+    // collapse them to a couple of points around the parent.
+    expect(distinct.size).toBeGreaterThan(90)
+  })
+})
+
+describe('ForceLayout: sleeping (convergence + the scale perf win)', () => {
+  /** Steps until every directory body sleeps, or returns false if it never settles within the budget. */
+  function stepUntilAllAsleep(layout: ForceLayout, deltaMs: number, maxSteps: number): boolean {
+    for (let index = 0; index < maxSteps; index++) {
+      layout.step(deltaMs)
+      if (allDirectoriesAsleep(layout)) {
+        return true
+      }
+    }
+    return allDirectoriesAsleep(layout)
+  }
+
+  /** Whether every directory body has gone fully static (moves essentially nothing over many frames). */
+  function allDirectoriesAsleep(layout: ForceLayout): boolean {
+    const before = new Map<string, { x: number, y: number }>()
+    for (const [ path, body ] of layout.state) {
+      before.set(path, { x: body.position.x, y: body.position.y })
+    }
+    for (let index = 0; index < 20; index++) {
+      layout.step(FIXED_DELTA_MS)
+    }
+    for (const [ path, body ] of layout.state) {
+      const start = before.get(path)!
+      if (Math.hypot(body.position.x - start.x, body.position.y - start.y) > 1e-6) {
+        return false
+      }
+    }
+    return true
+  }
+
+  it('a settled body goes fully static (skipped by integration) and stays put', () => {
+    const root = dir('repo', '', 1)
+    const children = Array.from({ length: 8 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
+    const layout = new ForceLayout()
+    layout.sync([ root, ...children ])
+
+    // Let it settle, then confirm a long further run moves NOTHING (truly static, not a perpetual
+    // jiggle): the convergence guarantee the sleeping gives.
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+    const settled = displacementOver(layout, FIXED_DELTA_MS, 120)
+    expect(settled.total).toBeCloseTo(0, 6)
+    expect(settled.max).toBeCloseTo(0, 6)
+  })
+
+  it('a camera impulse wakes the settled bodies, which then move again and re-settle', () => {
+    const root = dir('repo', '', 1)
+    const children = Array.from({ length: 8 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
+    const layout = new ForceLayout()
+    layout.sync([ root, ...children ])
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+
+    // Asleep: no motion.
+    expect(displacementOver(layout, FIXED_DELTA_MS, 40).total).toBeCloseTo(0, 6)
+
+    // A kick wakes them; they move again, then re-settle to static.
+    layout.applyImpulse({ x: 60, y: 0 })
+    const afterKick = displacementOver(layout, FIXED_DELTA_MS, 40)
+    expect(afterKick.total).toBeGreaterThan(0)
+
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+    expect(displacementOver(layout, FIXED_DELTA_MS, 40).total).toBeCloseTo(0, 6)
+  })
+
+  it('adding a new sibling near a settled cluster wakes it to re-settle', () => {
+    const root = dir('repo', '', 1)
+    const children = Array.from({ length: 6 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
+    const layout = new ForceLayout()
+    layout.sync([ root, ...children ])
+    stepTimes(layout, FIXED_DELTA_MS, 600)
+    expect(displacementOver(layout, FIXED_DELTA_MS, 40).total).toBeCloseTo(0, 6)
+
+    // Add two more siblings (a structural change): the existing cluster must wake and re-settle, so
+    // the new arrivals are accommodated rather than overlapped by a frozen layout.
+    const grown = [ root, ...children, dir('repo/dNew1', 'repo', 2), dir('repo/dNew2', 'repo', 2) ]
+    layout.sync(grown)
+    const afterAdd = displacementOver(layout, FIXED_DELTA_MS, 40)
+    expect(afterAdd.total).toBeGreaterThan(0)
+  })
+
+  it('a large tree reaches a fully settled, static, bounded state (it sleeps, not jiggles forever)', () => {
+    // The scale case: a wide, deep forest of hundreds of directories must come fully to REST (every
+    // body static), not churn forever. This is the convergence + framerate fix.
+    const visible: VisibleNode[] = [ rootVisible() ]
+    for (let repoIndex = 0; repoIndex < 6; repoIndex++) {
+      const repoPath = `repo${repoIndex}`
+      visible.push(dir(repoPath, '', 1))
+      for (let branchIndex = 0; branchIndex < 6; branchIndex++) {
+        const branchPath = `${repoPath}/b${branchIndex}`
+        visible.push(dir(branchPath, repoPath, 2))
+        for (let leafIndex = 0; leafIndex < 7; leafIndex++) {
+          const leafPath = `${branchPath}/l${leafIndex}`
+          visible.push(dir(leafPath, branchPath, 3))
+          visible.push(file(`${leafPath}/a.ts`, leafPath, 4))
+          visible.push(file(`${leafPath}/b.ts`, leafPath, 4))
+        }
+      }
+    }
+
+    const layout = new ForceLayout()
+    layout.sync(visible)
+
+    // It settles to a fully static state within a bounded number of steps (it does not churn for
+    // minutes / forever). The directory bodies all sleep; a further long run moves nothing.
+    const settled = stepUntilAllAsleep(layout, FIXED_DELTA_MS, 4000)
+    expect(settled).toBe(true)
+
+    // And every body is at a finite, bounded position (no flail to infinity).
+    let maxCoordinate = 0
+    for (const body of layout.state.values()) {
+      expect(Number.isFinite(body.position.x)).toBe(true)
+      expect(Number.isFinite(body.position.y)).toBe(true)
+      maxCoordinate = Math.max(maxCoordinate, Math.abs(body.position.x), Math.abs(body.position.y))
+    }
+    expect(maxCoordinate).toBeLessThan(50_000)
   })
 })
 
