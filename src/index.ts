@@ -32,7 +32,17 @@ export { applyEvent, createTree, seedTree } from './core/tree'
 export { collapseTree } from './core/collapse'
 export { Timeline } from './core/timeline'
 export { computeTargets, stepSprings, nodeHeat } from './core/layout'
-export { ForceLayout, countSiblings, collisionRadiusFor, shouldCollide } from './core/physics'
+export {
+  ForceLayout,
+  computeContentRadii,
+  computeFileSlots,
+  countDirectFiles,
+  parentFileRadius,
+  buildQuadTree,
+  clampSpeed,
+  zoomImpulse,
+} from './core/physics'
+export type { QuadTree, QuadPoint, SiblingGroup } from './core/physics'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
 export { Emitter } from './core/emitter'
 export { HighlightRegistry, highlightPulse } from './core/highlight'

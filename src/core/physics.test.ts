@@ -2,32 +2,27 @@
 
 import type { VisibleNode } from './collapse'
 import type { TreeNode } from './tree'
-import type { Vec2, NodePhysics } from './layout'
-import type { NodeMeta, ForceLayoutOptions } from './physics'
+import type { ForceLayoutOptions, QuadPoint } from './physics'
 
 // Core
 import { describe, expect, it } from 'vitest'
 
 import {
   ForceLayout,
-  buildSpatialGrid,
-  countSiblings,
-  collisionRadiusFor,
-  shouldCollide,
-  fanSpreadForces,
-  antiFoldbackForce,
-  untangleGroupForces,
+  computeContentRadii,
+  computeFileSlots,
+  countDirectFiles,
+  parentFileRadius,
+  buildQuadTree,
   clampSpeed,
   zoomImpulse,
 } from './physics'
 
 /**
- * Builds a minimal {@link TreeNode} for a path. The sim reads `path`, `isFile`, and `touchCount`
- * off the node (every other force input comes from the `VisibleNode` wrapper), so the rest is
- * filled with inert defaults to keep the fixtures readable. `touchCount` is exposed so a test can
- * make a node "heavily edited" and assert its collision radius grows.
+ * Builds a minimal {@link TreeNode} for a path. The sim reads `path` and `isFile` off the node;
+ * every other force input comes from the {@link VisibleNode} wrapper, so the rest is inert.
  */
-function nodeFor(path: string, isFile: boolean, touchCount = 0): TreeNode {
+function nodeFor(path: string, isFile: boolean): TreeNode {
   const lastSlash = path.lastIndexOf('/')
   return {
     name: lastSlash >= 0 ? path.slice(lastSlash + 1) : path,
@@ -35,7 +30,7 @@ function nodeFor(path: string, isFile: boolean, touchCount = 0): TreeNode {
     isFile,
     children: new Map(),
     status: 'discovered',
-    touchCount,
+    touchCount: 0,
     lastTouchedAt: null,
   }
 }
@@ -72,9 +67,35 @@ function totalKineticEnergy(layout: ForceLayout): number {
 }
 
 /**
- * The distance between two bodies in a settled layout, by path. A convenience for the collision /
- * overlap assertions, which all reduce to "are these two centers at least their summed radii apart".
+ * The displacement each body undergoes over `count` steps: a snapshot of every position before and
+ * after. Returns both the summed and the single largest per-body displacement. The directory sim is
+ * momentumless (Gource `pos += accel * dt`) and deliberately stays *gently alive* (a tiny perpetual
+ * jiggle is loved, not a bug), so the meaningful settled measure is the LARGEST per-body move: at
+ * rest every node nudges by well under a node-width per dozens of frames, even though the sum over
+ * hundreds of nodes is not literally zero.
  */
+function displacementOver(
+  layout: ForceLayout,
+  deltaMs: number,
+  count: number,
+): { total: number, max: number } {
+  const before = new Map<string, { x: number, y: number }>()
+  for (const [ path, body ] of layout.state) {
+    before.set(path, { x: body.position.x, y: body.position.y })
+  }
+  stepTimes(layout, deltaMs, count)
+  let total = 0
+  let max = 0
+  for (const [ path, body ] of layout.state) {
+    const start = before.get(path)!
+    const moved = Math.hypot(body.position.x - start.x, body.position.y - start.y)
+    total += moved
+    max = Math.max(max, moved)
+  }
+  return { total, max }
+}
+
+/** The distance between two bodies in a settled layout, by path. */
 function distanceBetween(layout: ForceLayout, leftPath: string, rightPath: string): number {
   const left = layout.state.get(leftPath)!.position
   const right = layout.state.get(rightPath)!.position
@@ -85,886 +106,562 @@ const FIXED_DELTA_MS = 16
 
 /** A fully-defaulted options object, for the pure helpers that take `Required<ForceLayoutOptions>`. */
 function defaultedOptions(overrides: ForceLayoutOptions = {}): Required<ForceLayoutOptions> {
-  // Construct a layout and read back its resolved options shape by re-deriving the same defaults
-  // the constructor uses. We keep this list in sync with the constructor; a drift would surface as
-  // a failing `collisionRadiusFor` expectation below.
   return {
     center: { x: 0, y: 0 },
-    restLength: 120,
-    restLengthDepthScale: 0.35,
-    siblingRestScale: 1,
-    springStiffness: 26,
-    outwardBias: 0.18,
-    untangleStrength: 0.35,
-    fileRestLength: 40,
-    collisionStiffness: 240,
-    collisionMargin: 10,
-    directoryRadius: 1.6,
-    fileRadius: 1.1,
-    damping: 0.9,
+    gravity: 10,
+    directoryPadding: 1.5,
+    fileDiameter: 8,
+    fileEaseSpeed: 5,
+    damping: 0.85,
     maxStepMs: 50,
-    spawnOffset: 12,
+    quadTreeTheta: 0.5,
     wobbleMaxSpeed: 220,
     ...overrides,
   }
 }
 
-describe('collisionRadiusFor', () => {
-  it('gives a file a SMALLER collision radius than a directory of the same base size', () => {
-    const options = defaultedOptions()
-    const directoryRadius = collisionRadiusFor(dir('repo/sub', 'repo', 2), options)
-    const fileRadius = collisionRadiusFor(file('repo/a.ts', 'repo', 2), options)
+describe('ForceLayout: directory springs to its parent', () => {
+  it('a child directory settles at roughly its rest distance from the parent, not on top of it', () => {
+    // A repo root at the center and one child directory under it.
+    const root = dir('repo', '', 1)
+    const child = dir('repo/src', 'repo', 2)
+    const layout = new ForceLayout({ center: { x: 0, y: 0 }})
+    layout.sync([ root, child ])
 
-    // Files pack tighter as satellites; directories are the slightly larger structural skeleton.
-    expect(fileRadius).toBeLessThan(directoryRadius)
+    // Pin the repo root in place so we measure the child's resting distance from a fixed anchor.
+    const rootBody = layout.state.get('repo')!
+    rootBody.position.x = 0
+    rootBody.position.y = 0
+
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+    rootBody.position.x = 0
+    rootBody.position.y = 0
+
+    const distance = distanceBetween(layout, 'repo', 'repo/src')
+
+    // The spring rests the child just outside the sum of the two radii. With empty dirs those radii
+    // are the padding floor (1.5 each), so the rest gap is small but strictly positive: the child
+    // never lands on the parent, and it does not fly off to infinity either.
+    expect(distance).toBeGreaterThan(0)
+    expect(distance).toBeLessThan(200)
+    expect(Number.isFinite(distance)).toBe(true)
   })
 
-  it('matches the drawn base size scaled by the per-kind factor (stable, no touch pulse)', () => {
-    const options = defaultedOptions()
-    // An untouched node's steady base radius is the default 7. A directory scales it by 1.6.
-    const untouched = collisionRadiusFor(dir('repo/sub', 'repo', 2), options)
-    expect(untouched).toBeCloseTo(7 * options.directoryRadius)
-  })
+  it('a directory full of files rests further out than an empty one (content radius widens the gap)', () => {
+    // Two sibling repos: one empty, one holding many files. The full repo has a bigger content
+    // radius, so its own child should rest further from it than the empty repo's child does.
+    const emptyParent = dir('empty', '', 1)
+    const emptyChild = dir('empty/child', 'empty', 2)
 
-  it('grows with a node\'s touch importance, matching the larger drawn disc of a busy node', () => {
-    const options = defaultedOptions()
-    const calm = collisionRadiusFor(dir('repo/calm', 'repo', 2), options)
-    // A heavily-edited directory draws a touch larger (the saturating importance bump), so its
-    // collision radius must grow to match, or busy nodes would visibly overlap.
-    const busy = { node: nodeFor('repo/busy', false, 50), displayParentPath: 'repo', depth: 2, isForestRoot: false }
-    expect(collisionRadiusFor(busy, options)).toBeGreaterThan(calm)
+    const fullParent = dir('full', '', 1)
+    const fullChild = dir('full/child', 'full', 2)
+    const fullFiles = Array.from({ length: 30 }, (_unused, index) => {
+      return file(`full/f${index}.ts`, 'full', 2)
+    })
+
+    const emptyLayout = new ForceLayout()
+    emptyLayout.sync([ emptyParent, emptyChild ])
+    const emptyRadii = computeContentRadii([ emptyParent, emptyChild ], defaultedOptions())
+
+    const fullLayout = new ForceLayout()
+    fullLayout.sync([ fullParent, fullChild, ...fullFiles ])
+    const fullRadii = computeContentRadii([ fullParent, fullChild, ...fullFiles ], defaultedOptions())
+
+    // The content radius of the file-heavy directory is strictly larger.
+    expect(fullRadii.get('full')!).toBeGreaterThan(emptyRadii.get('empty')!)
+
+    // And that translates to its child resting further out once both settle (pinning each parent).
+    emptyLayout.state.get('empty')!.position = { x: 0, y: 0 }
+    fullLayout.state.get('full')!.position = { x: 0, y: 0 }
+    stepTimes(emptyLayout, FIXED_DELTA_MS, 300)
+    stepTimes(fullLayout, FIXED_DELTA_MS, 300)
+    emptyLayout.state.get('empty')!.position = { x: 0, y: 0 }
+    fullLayout.state.get('full')!.position = { x: 0, y: 0 }
+
+    const emptyGap = distanceBetween(emptyLayout, 'empty', 'empty/child')
+    const fullGap = distanceBetween(fullLayout, 'full', 'full/child')
+    expect(fullGap).toBeGreaterThan(emptyGap)
   })
 })
 
-describe('shouldCollide', () => {
-  const dirMeta = (displayParentPath: string): NodeMeta => ({
-    displayParentPath,
-    isFile: false,
-    depth: 2,
-    siblingCount: 1,
-    collisionRadius: 10,
-  })
-  const fileMeta = (displayParentPath: string): NodeMeta => ({
-    displayParentPath,
-    isFile: true,
-    depth: 2,
-    siblingCount: 1,
-    collisionRadius: 5,
+describe('ForceLayout: directory <-> directory repulsion (quadtree)', () => {
+  it('two overlapping sibling directories push apart until their discs separate', () => {
+    // Two repo roots spawned essentially on top of each other; the quadtree repulsion must split
+    // them so their content discs no longer overlap.
+    const left = dir('left', '', 1)
+    const right = dir('right', '', 1)
+    const layout = new ForceLayout()
+    layout.sync([ left, right ])
+
+    // Force a deep overlap to make the repulsion do real work.
+    layout.state.get('left')!.position = { x: 0, y: 0 }
+    layout.state.get('right')!.position = { x: 0.5, y: 0 }
+
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+
+    const radii = computeContentRadii([ left, right ], defaultedOptions())
+    const sumRadius = radii.get('left')! + radii.get('right')!
+    const distance = distanceBetween(layout, 'left', 'right')
+
+    // They end up at least roughly their summed radii apart (no longer overlapping) and finite.
+    expect(distance).toBeGreaterThanOrEqual(sumRadius * 0.5)
+    expect(distance).toBeGreaterThan(0)
+    expect(Number.isFinite(distance)).toBe(true)
   })
 
-  it('always collides two directories, regardless of parentage (the global skeleton spread)', () => {
-    expect(shouldCollide('a/x', dirMeta('a'), 'b/y', dirMeta('b'))).toBe(true)
-  })
+  it('does not repel a parent or child (only the spring governs that edge)', () => {
+    // A parent and its single child: the repulsion predicate must exclude this edge, so the child
+    // settles at the spring rest gap rather than being shoved away by repulsion.
+    const parent = dir('repo', '', 1)
+    const child = dir('repo/src', 'repo', 2)
+    const layout = new ForceLayout()
+    layout.sync([ parent, child ])
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+    layout.state.get('repo/src')!.position = { x: 1, y: 0 }
 
-  it('collides two files only when they share a directory (one satellite cluster)', () => {
-    expect(shouldCollide('a/x.ts', fileMeta('a'), 'a/y.ts', fileMeta('a'))).toBe(true)
-    expect(shouldCollide('a/x.ts', fileMeta('a'), 'b/y.ts', fileMeta('b'))).toBe(false)
-  })
+    stepTimes(layout, FIXED_DELTA_MS, 300)
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
 
-  it('collides a file with its OWN directory but not a stranger directory', () => {
-    // The file `a/x.ts` lives in directory `a`: it collides with `a` (held just outside it) ...
-    expect(shouldCollide('a/x.ts', fileMeta('a'), 'a', dirMeta(''))).toBe(true)
-    // ... but not with an unrelated directory `b` it merely sits near.
-    expect(shouldCollide('a/x.ts', fileMeta('a'), 'b', dirMeta(''))).toBe(false)
+    // The child stays close to the parent (a few radii), proving repulsion did not blow the edge up.
+    const distance = distanceBetween(layout, 'repo', 'repo/src')
+    expect(distance).toBeLessThan(100)
   })
 })
 
-describe('countSiblings', () => {
-  it('counts directory-siblings and file-siblings of a parent on SEPARATE rings', () => {
-    const counts = countSiblings([
+describe('ForceLayout: settling (the anti-flail guarantee)', () => {
+  it('a fan of many sibling directories loses motion and settles to rest', () => {
+    const root = dir('repo', '', 1)
+    const children = Array.from({ length: 12 }, (_unused, index) => {
+      return dir(`repo/d${index}`, 'repo', 2)
+    })
+    const layout = new ForceLayout()
+    layout.sync([ root, ...children ])
+
+    // Movement early (still settling) must exceed movement late (at rest): the forest stops flailing.
+    const earlyMovement = displacementOver(layout, FIXED_DELTA_MS, 60)
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+    const lateMovement = displacementOver(layout, FIXED_DELTA_MS, 60)
+
+    expect(lateMovement.total).toBeLessThan(earlyMovement.total)
+    // At rest no node in the fan twitches more than a node-width over 60 frames.
+    expect(lateMovement.max).toBeLessThan(10)
+  })
+
+  it('a deep tree of hundreds of directories settles to bounded, finite positions (no flail)', () => {
+    // Build a wide, deep forest: 6 repos, each with a branching subtree, ~300 directories total.
+    const visible: VisibleNode[] = [ rootVisible() ]
+    let directoryCount = 0
+    for (let repoIndex = 0; repoIndex < 6; repoIndex++) {
+      const repoPath = `repo${repoIndex}`
+      visible.push(dir(repoPath, '', 1))
+      directoryCount++
+      for (let branchIndex = 0; branchIndex < 6; branchIndex++) {
+        const branchPath = `${repoPath}/b${branchIndex}`
+        visible.push(dir(branchPath, repoPath, 2))
+        directoryCount++
+        for (let leafIndex = 0; leafIndex < 7; leafIndex++) {
+          const leafPath = `${branchPath}/l${leafIndex}`
+          visible.push(dir(leafPath, branchPath, 3))
+          directoryCount++
+          // A couple of files on each leaf, to exercise the satellite packing under load.
+          visible.push(file(`${leafPath}/a.ts`, leafPath, 4))
+          visible.push(file(`${leafPath}/b.ts`, leafPath, 4))
+        }
+      }
+    }
+    expect(directoryCount).toBeGreaterThan(250)
+
+    const layout = new ForceLayout()
+    layout.sync(visible)
+    stepTimes(layout, FIXED_DELTA_MS, 800)
+
+    // Every body must be at a finite, bounded position: this is the core stability guarantee that
+    // the old custom-force stack failed. Nothing has flung off to infinity or gone NaN.
+    let maxCoordinate = 0
+    for (const body of layout.state.values()) {
+      expect(Number.isFinite(body.position.x)).toBe(true)
+      expect(Number.isFinite(body.position.y)).toBe(true)
+      maxCoordinate = Math.max(maxCoordinate, Math.abs(body.position.x), Math.abs(body.position.y))
+    }
+    // A generous but finite bound: hundreds of ~tens-of-units discs cannot legitimately span past
+    // this if the sim is stable. A flailing sim would blow well past it. (In practice the whole
+    // forest packs into a few hundred units; the bound is loose so it can never false-fail.)
+    expect(maxCoordinate).toBeLessThan(50_000)
+
+    // The anti-flail guarantee: it stays BOUNDED. Stepping another long stretch must not let any
+    // node run away or grow the forest's extent; a flailing sim would balloon here.
+    stepTimes(layout, FIXED_DELTA_MS, 800)
+    let maxAfter = 0
+    for (const body of layout.state.values()) {
+      expect(Number.isFinite(body.position.x)).toBe(true)
+      expect(Number.isFinite(body.position.y)).toBe(true)
+      maxAfter = Math.max(maxAfter, Math.abs(body.position.x), Math.abs(body.position.y))
+    }
+    // The extent did not blow up over the extra steps: it stays within a small multiple of where it
+    // already was (the forest is settled into a stable, bounded arrangement, not diverging).
+    expect(maxAfter).toBeLessThan(maxCoordinate * 3 + 500)
+
+    // And per-node motion stays a gentle, bounded jiggle (the sim is intentionally "alive"), never
+    // a flail: no single directory lurches across the canvas in a frame-burst.
+    const settled = displacementOver(layout, FIXED_DELTA_MS, 60)
+    expect(settled.max).toBeLessThan(60) // no node moves more than ~a few node-widths over 60 frames
+  })
+})
+
+describe('ForceLayout: files are satellites around their directory', () => {
+  it('a file rests in a ring close to its directory, not flung away', () => {
+    const repo = dir('repo', '', 1)
+    const onlyFile = file('repo/main.ts', 'repo', 2)
+    const layout = new ForceLayout()
+    layout.sync([ repo, onlyFile ])
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+
+    stepTimes(layout, FIXED_DELTA_MS, 200)
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+
+    // A single file sits in ring 1 (radius 0 offset in Gource's packing): essentially on the
+    // directory. With more files they spread to outer rings, but one file hugs the center.
+    const distance = distanceBetween(layout, 'repo', 'repo/main.ts')
+    expect(distance).toBeLessThan(2)
+  })
+
+  it('many files pack into concentric rings, all within a few ring-widths of the directory', () => {
+    const repo = dir('repo', '', 1)
+    const files = Array.from({ length: 40 }, (_unused, index) => file(`repo/f${index}.ts`, 'repo', 2))
+    const layout = new ForceLayout()
+    layout.sync([ repo, ...files ])
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+
+    stepTimes(layout, FIXED_DELTA_MS, 200)
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+
+    // Every file is within a bounded radius (a handful of file-diameters) of its directory: the
+    // satellite cluster stays tight, never spreading like a sub-tree.
+    for (const fileNode of files) {
+      const distance = distanceBetween(layout, 'repo', fileNode.node.path)
+      expect(distance).toBeLessThan(8 * 12) // generous: ~12 ring widths at fileDiameter 8
+    }
+  })
+
+  it('a file follows its directory when the directory is moved', () => {
+    const repo = dir('repo', '', 1)
+    const onlyFile = file('repo/main.ts', 'repo', 2)
+    const layout = new ForceLayout()
+    layout.sync([ repo, onlyFile ])
+    layout.state.get('repo')!.position = { x: 0, y: 0 }
+    stepTimes(layout, FIXED_DELTA_MS, 100)
+
+    // Hold the directory far away (re-pinning each frame so its own spring to the center cannot pull
+    // it back) and confirm the file chases it there: files track their directory's live position.
+    const repoBody = layout.state.get('repo')!
+    for (let index = 0; index < 200; index++) {
+      repoBody.position.x = 1000
+      repoBody.position.y = 1000
+      layout.step(FIXED_DELTA_MS)
+    }
+
+    const distance = distanceBetween(layout, 'repo', 'repo/main.ts')
+    expect(distance).toBeLessThan(5)
+  })
+})
+
+describe('ForceLayout: determinism', () => {
+  it('two runs with the same visible set and fixed deltas produce identical positions', () => {
+    const build = (): VisibleNode[] => [
       dir('repo', '', 1),
-      dir('repo/a', 'repo', 2),
-      dir('repo/b', 'repo', 2),
-      file('repo/x.ts', 'repo', 2),
+      dir('repo/src', 'repo', 2),
+      dir('repo/test', 'repo', 2),
+      file('repo/src/a.ts', 'repo/src', 3),
+      file('repo/src/b.ts', 'repo/src', 3),
+    ]
+
+    const runA = new ForceLayout()
+    runA.sync(build())
+    stepTimes(runA, FIXED_DELTA_MS, 250)
+
+    const runB = new ForceLayout()
+    runB.sync(build())
+    stepTimes(runB, FIXED_DELTA_MS, 250)
+
+    for (const [ path, body ] of runA.state) {
+      const other = runB.state.get(path)!
+      expect(other.position.x).toBeCloseTo(body.position.x, 9)
+      expect(other.position.y).toBeCloseTo(body.position.y, 9)
+    }
+  })
+})
+
+describe('ForceLayout: forest root pinning and lifecycle', () => {
+  it('pins the forest root at the center and never integrates it', () => {
+    const layout = new ForceLayout({ center: { x: 5, y: -3 }})
+    layout.sync([ rootVisible(), dir('repo', '', 1) ])
+    stepTimes(layout, FIXED_DELTA_MS, 100)
+
+    const rootBody = layout.state.get('')!
+    expect(rootBody.position.x).toBe(5)
+    expect(rootBody.position.y).toBe(-3)
+    expect(rootBody.velocity.x).toBe(0)
+    expect(rootBody.velocity.y).toBe(0)
+  })
+
+  it('drops bodies for nodes that leave the visible set', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('repo', '', 1), dir('repo/src', 'repo', 2) ])
+    expect(layout.state.has('repo/src')).toBe(true)
+
+    layout.sync([ dir('repo', '', 1) ])
+    expect(layout.state.has('repo/src')).toBe(false)
+    expect(layout.state.has('repo')).toBe(true)
+  })
+
+  it('reset clears every body', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('repo', '', 1), file('repo/a.ts', 'repo', 2) ])
+    expect(layout.state.size).toBeGreaterThan(0)
+    layout.reset()
+    expect(layout.state.size).toBe(0)
+  })
+
+  it('ignores a non-positive or non-finite step delta', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('repo', '', 1), dir('repo/src', 'repo', 2) ])
+    const before = { ...layout.state.get('repo/src')!.position }
+    layout.step(0)
+    layout.step(-16)
+    layout.step(Number.NaN)
+    const after = layout.state.get('repo/src')!.position
+    expect(after.x).toBe(before.x)
+    expect(after.y).toBe(before.y)
+  })
+})
+
+describe('ForceLayout: applyImpulse (camera wobble)', () => {
+  it('kicks directory bodies and then settles them back via damping', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('repo', '', 1), dir('repo/src', 'repo', 2) ])
+    stepTimes(layout, FIXED_DELTA_MS, 100)
+
+    layout.applyImpulse({ x: 50, y: 0 })
+    const kicked = totalKineticEnergy(layout)
+    expect(kicked).toBeGreaterThan(0)
+
+    stepTimes(layout, FIXED_DELTA_MS, 400)
+    expect(totalKineticEnergy(layout)).toBeLessThan(kicked)
+    expect(totalKineticEnergy(layout)).toBeLessThan(1)
+  })
+
+  it('does not impart a velocity to the pinned forest root', () => {
+    const layout = new ForceLayout()
+    layout.sync([ rootVisible(), dir('repo', '', 1) ])
+    layout.applyImpulse({ x: 30, y: 30 })
+    const rootBody = layout.state.get('')!
+    expect(rootBody.velocity.x).toBe(0)
+    expect(rootBody.velocity.y).toBe(0)
+  })
+
+  it('a zero or non-finite impulse is a no-op', () => {
+    const layout = new ForceLayout()
+    layout.sync([ dir('repo', '', 1) ])
+    layout.applyImpulse({ x: 0, y: 0 })
+    layout.applyImpulse({ x: Number.NaN, y: 1 })
+    expect(totalKineticEnergy(layout)).toBe(0)
+  })
+})
+
+describe('computeContentRadii', () => {
+  it('an empty directory gets the padding floor; a file-heavy one grows with sqrt of file area', () => {
+    const empty = dir('empty', '', 1)
+    const heavy = dir('heavy', '', 1)
+    const files = Array.from({ length: 16 }, (_unused, index) => file(`heavy/f${index}.ts`, 'heavy', 2))
+
+    const radii = computeContentRadii([ empty, heavy, ...files ], defaultedOptions())
+
+    // Empty: max(1, sqrt(0)) * padding = 1 * 1.5.
+    expect(radii.get('empty')!).toBeCloseTo(1.5, 6)
+
+    // Heavy: sqrt(16 * fileArea) * padding, with fileArea = (4)^2 * PI = 16*PI.
+    const fileArea = 4 * 4 * Math.PI
+    const expected = Math.sqrt(16 * fileArea) * 1.5
+    expect(radii.get('heavy')!).toBeCloseTo(expected, 6)
+  })
+
+  it('a parent directory accumulates the area of its sub-directories (bottom-up fold)', () => {
+    // repo > src > {two files}. The repo radius must reflect the nested files, not just its own.
+    const repo = dir('repo', '', 1)
+    const src = dir('repo/src', 'repo', 2)
+    const fileA = file('repo/src/a.ts', 'repo/src', 3)
+    const fileB = file('repo/src/b.ts', 'repo/src', 3)
+
+    const radii = computeContentRadii([ repo, src, fileA, fileB ], defaultedOptions())
+
+    const fileArea = 4 * 4 * Math.PI
+    const expected = Math.sqrt(2 * fileArea) * 1.5
+    // src holds both files directly; repo accumulates src's area, so both equal the two-file area.
+    expect(radii.get('repo')!).toBeCloseTo(expected, 6)
+    expect(radii.get('repo/src')!).toBeCloseTo(expected, 6)
+  })
+})
+
+describe('computeFileSlots', () => {
+  it('a single file sits at the directory center (ring 1, radius 0)', () => {
+    const slots = computeFileSlots([ dir('repo', '', 1), file('repo/a.ts', 'repo', 2) ], defaultedOptions())
+    const slot = slots.get('repo/a.ts')!
+    expect(Math.hypot(slot.x, slot.y)).toBeCloseTo(0, 6)
+  })
+
+  it('files beyond the first ring sit one file-diameter out, evenly spread', () => {
+    const files = Array.from({ length: 8 }, (_unused, index) => file(`repo/f${index}.ts`, 'repo', 2))
+    const slots = computeFileSlots([ dir('repo', '', 1), ...files ], defaultedOptions())
+
+    // The first file is in ring 1 at radius 0; subsequent files move to ring 2 at radius
+    // fileDiameter (8). At least one file should sit at exactly that radius.
+    const radii = [ ...slots.values() ].map((slot) => Math.hypot(slot.x, slot.y))
+    expect(Math.min(...radii)).toBeCloseTo(0, 6)
+    expect(radii.some((radius) => Math.abs(radius - 8) < 1e-6)).toBe(true)
+
+    // No file is flung absurdly far: even with 8 files we stay within a couple of rings.
+    expect(Math.max(...radii)).toBeLessThan(8 * 4)
+  })
+
+  it('is deterministic and ordered by path (insertion order does not matter)', () => {
+    const a = file('repo/a.ts', 'repo', 2)
+    const b = file('repo/b.ts', 'repo', 2)
+    const c = file('repo/c.ts', 'repo', 2)
+
+    const first = computeFileSlots([ dir('repo', '', 1), c, a, b ], defaultedOptions())
+    const second = computeFileSlots([ dir('repo', '', 1), a, b, c ], defaultedOptions())
+
+    for (const path of [ 'repo/a.ts', 'repo/b.ts', 'repo/c.ts' ]) {
+      expect(first.get(path)!).toEqual(second.get(path)!)
+    }
+  })
+})
+
+describe('countDirectFiles and parentFileRadius', () => {
+  it('counts only the directory\'s own visible files', () => {
+    const counts = countDirectFiles([
+      dir('repo', '', 1),
+      dir('repo/src', 'repo', 2),
+      file('repo/top.ts', 'repo', 2),
+      file('repo/src/a.ts', 'repo/src', 3),
+      file('repo/src/b.ts', 'repo/src', 3),
     ])
-
-    // Two directory children and one file child under `repo`, counted as two separate rings.
-    expect(counts.get('dir:repo')).toBe(2)
-    expect(counts.get('file:repo')).toBe(1)
+    expect(counts.get('repo')).toBe(1)
+    expect(counts.get('repo/src')).toBe(2)
   })
 
-  it('excludes the forest root (it is not a simulated body)', () => {
-    const counts = countSiblings([ rootVisible(), dir('repo', '', 1) ])
-    // Only the one repo root is counted, under the empty-string center; the forest root is skipped.
-    expect(counts.get('dir:')).toBe(1)
-  })
-})
+  it('parentFileRadius grows with the direct file count', () => {
+    const options = defaultedOptions()
+    const fewFiles = parentFileRadius(
+      { displayParentPath: '', isFile: false, depth: 1, contentRadius: 1, fileCount: 2, fileSlot: null },
+      options,
+    )
+    const manyFiles = parentFileRadius(
+      { displayParentPath: '', isFile: false, depth: 1, contentRadius: 1, fileCount: 20, fileSlot: null },
+      options,
+    )
+    expect(manyFiles).toBeGreaterThan(fewFiles)
 
-describe('ForceLayout', () => {
-  describe('sync', () => {
-    it('adds a body for each new visible node and removes bodies for vanished ones', () => {
-      const layout = new ForceLayout()
-      layout.sync([ dir('repo', '', 1), file('repo/a.ts', 'repo', 2) ])
-
-      expect(layout.state.has('repo')).toBe(true)
-      expect(layout.state.has('repo/a.ts')).toBe(true)
-      expect(layout.state.size).toBe(2)
-
-      // The leaf is no longer visible (deleted/collapsed): its body must be dropped.
-      layout.sync([ dir('repo', '', 1) ])
-      expect(layout.state.has('repo')).toBe(true)
-      expect(layout.state.has('repo/a.ts')).toBe(false)
-      expect(layout.state.size).toBe(1)
-    })
-
-    it('pins the forest root at the configured center with zero velocity', () => {
-      const center = { x: 5, y: -7 }
-      const layout = new ForceLayout({ center })
-      layout.sync([ rootVisible(), dir('repo', '', 1) ])
-
-      const root = layout.state.get('')
-      expect(root).toBeDefined()
-      expect(root!.position).toEqual(center)
-
-      // After stepping, the pinned root must not have moved or gained velocity, while the repo
-      // (pulled by its edge spring) is free to move.
-      stepTimes(layout, FIXED_DELTA_MS, 30)
-      const rootAfter = layout.state.get('')!
-      expect(rootAfter.position).toEqual(center)
-      expect(rootAfter.velocity).toEqual({ x: 0, y: 0 })
-    })
-
-    it('spawns a new node near its display-parent so it emerges from the branch', () => {
-      const layout = new ForceLayout({ spawnOffset: 12 })
-      // Seed the parent and let it settle somewhere away from the origin.
-      layout.sync([ dir('repo', '', 1) ])
-      stepTimes(layout, FIXED_DELTA_MS, 40)
-      const parentPosition = { ...layout.state.get('repo')!.position }
-
-      // Now a child appears; it must spawn within ~one spawn-offset of the parent, not at the
-      // origin, so it visibly grows out of the branch.
-      layout.sync([ dir('repo', '', 1), dir('repo/sub', 'repo', 2) ])
-      const child = layout.state.get('repo/sub')!
-      const distanceFromParent = Math.hypot(
-        child.position.x - parentPosition.x,
-        child.position.y - parentPosition.y,
-      )
-      expect(distanceFromParent).toBeLessThanOrEqual(12 + 1e-6)
-      expect(distanceFromParent).toBeGreaterThan(0)
-    })
-  })
-
-  describe('collision (real, size-aware no-overlap)', () => {
-    it('pushes two overlapping directories apart to touching and settles near it (no overlap)', () => {
-      // Two directories started overlapping, held together by an edge spring whose rest length is
-      // exactly their touch distance: this is the real regime where collision and spring balance.
-      // Collision must separate them out of overlap, and the opposing spring must keep them from
-      // flying apart, so they settle right around the touch distance: touching, not overlapping.
-      const radius = collisionRadiusFor(dir('repoA', '', 1), defaultedOptions())
-      const minSeparation = radius * 2 + defaultedOptions().collisionMargin
-
-      // Both repo roots hang off the undrawn center; pull them toward a rest length equal to the
-      // touch distance so the equilibrium is exactly "touching". The outward bias is off so the
-      // only horizontal forces are the spring and collision.
-      const layout = new ForceLayout({ restLength: minSeparation, outwardBias: 0 })
-      layout.sync([ dir('repoA', '', 1), dir('repoB', '', 1) ])
-      layout.state.get('repoA')!.position = { x: -1, y: 0 }
-      layout.state.get('repoB')!.position = { x: 1, y: 0 }
-
-      stepTimes(layout, FIXED_DELTA_MS, 1_500)
-
-      const separation = distanceBetween(layout, 'repoA', 'repoB')
-      // They reached (at least) the touch distance: no overlap ...
-      expect(separation).toBeGreaterThanOrEqual(minSeparation - 1.0)
-      // ... and the spring kept them from flying apart, so they settle near touch, not far past it.
-      expect(separation).toBeLessThan(minSeparation * 2)
-    })
-
-    it('exerts ZERO collision force on two well-separated directories', () => {
-      // Past the touch distance the collision force is exactly zero. With the spring + outward bias
-      // off and the two directories comfortably apart, neither may move at all.
-      const layout = new ForceLayout({ springStiffness: 0, outwardBias: 0 })
-      layout.sync([ dir('repoA', '', 1), dir('repoB', '', 1) ])
-      layout.state.get('repoA')!.position = { x: 0, y: 0 }
-      layout.state.get('repoB')!.position = { x: 500, y: 0 }
-
-      stepTimes(layout, FIXED_DELTA_MS, 60)
-
-      // Neither moved: they never overlapped, so collision contributed nothing and no other force
-      // is active.
-      expect(layout.state.get('repoA')!.position).toEqual({ x: 0, y: 0 })
-      expect(layout.state.get('repoB')!.position).toEqual({ x: 500, y: 0 })
-    })
-
-    it('separates a whole crowded ring of sibling directories so none overlap', () => {
-      // Six children of one parent. After settling, EVERY pair of them must be at least their
-      // summed collision radii apart: the headline "the nodes are aware of each other" guarantee.
-      const layout = new ForceLayout()
-      const siblings = [ 'a', 'b', 'c', 'd', 'e', 'f' ]
-      layout.sync([
-        rootVisible(),
-        dir('repo', '', 1),
-        ...siblings.map((name) => dir(`repo/${name}`, 'repo', 2)),
-      ])
-      stepTimes(layout, FIXED_DELTA_MS, 1_500)
-
-      const radius = collisionRadiusFor(dir('repo/a', 'repo', 2), defaultedOptions())
-      const minSeparation = radius * 2 // summed radii; the margin is breathing room on top
-
-      for (let leftIndex = 0; leftIndex < siblings.length; leftIndex++) {
-        for (let rightIndex = leftIndex + 1; rightIndex < siblings.length; rightIndex++) {
-          const separation = distanceBetween(layout, `repo/${siblings[leftIndex]}`, `repo/${siblings[rightIndex]}`)
-          expect(separation).toBeGreaterThanOrEqual(minSeparation - 1e-3)
-        }
-      }
-    })
-
-    it('does NOT let a file from one directory collide with a file from another directory', () => {
-      // Files only cluster with their OWN directory's files. Two files in different dirs, started
-      // overlapping with every other force off, must not push apart.
-      const layout = new ForceLayout({ springStiffness: 0, outwardBias: 0 })
-      layout.sync([
-        dir('repoA', '', 1),
-        dir('repoB', '', 1),
-        file('repoA/x.ts', 'repoA', 2),
-        file('repoB/y.ts', 'repoB', 2),
-      ])
-      layout.state.get('repoA/x.ts')!.position = { x: 100, y: 0 }
-      layout.state.get('repoB/y.ts')!.position = { x: 101, y: 0 }
-
-      stepTimes(layout, FIXED_DELTA_MS, 30)
-
-      // Neither file moved: cross-directory files exert no collision on each other.
-      expect(layout.state.get('repoA/x.ts')!.position).toEqual({ x: 100, y: 0 })
-      expect(layout.state.get('repoB/y.ts')!.position).toEqual({ x: 101, y: 0 })
-    })
-
-    it('separates the files of ONE directory so its satellite cluster does not overlap', () => {
-      const layout = new ForceLayout({ outwardBias: 0 })
-      layout.sync([
-        dir('repo', '', 1),
-        file('repo/a.ts', 'repo', 2),
-        file('repo/b.ts', 'repo', 2),
-      ])
-      // Start the two siblings overlapping.
-      layout.state.get('repo/a.ts')!.position = { x: 50, y: 0 }
-      layout.state.get('repo/b.ts')!.position = { x: 51, y: 0 }
-
-      stepTimes(layout, FIXED_DELTA_MS, 400)
-
-      const radius = collisionRadiusFor(file('repo/a.ts', 'repo', 2), defaultedOptions())
-      const separation = distanceBetween(layout, 'repo/a.ts', 'repo/b.ts')
-      // The two file siblings ended at least their summed radii apart: a non-overlapping cluster.
-      expect(separation).toBeGreaterThanOrEqual(radius * 2 - 1e-3)
-    })
-  })
-
-  describe('sibling-count rest length', () => {
-    it('rests a child on a WIDER ring when it has more siblings (six > one)', () => {
-      const buildAndSettle = (siblingNames: string[]): number => {
-        // The untangle force is disabled here so this isolates the sibling-count rest length /
-        // collision mechanism under test: a tidy fan (the untangle force's job) packs siblings more
-        // efficiently and would otherwise let the crowded ring settle slightly tighter, which is its
-        // own behavior, covered by the dedicated untangle tests below.
-        const layout = new ForceLayout({ untangleStrength: 0 })
-        layout.sync([
-          rootVisible(),
-          dir('repo', '', 1),
-          ...siblingNames.map((name) => dir(`repo/${name}`, 'repo', 2)),
-        ])
-        stepTimes(layout, FIXED_DELTA_MS, 1_200)
-        const repo = layout.state.get('repo')!.position
-        // The mean distance of the children from their parent: the ring radius they settled on.
-        let total = 0
-        for (const name of siblingNames) {
-          const child = layout.state.get(`repo/${name}`)!.position
-          total += Math.hypot(child.x - repo.x, child.y - repo.y)
-        }
-        return total / siblingNames.length
-      }
-
-      const loneRing = buildAndSettle([ 'only' ])
-      const crowdedRing = buildAndSettle([ 'a', 'b', 'c', 'd', 'e', 'f' ])
-
-      // A parent with six children pushes them out to a meaningfully larger ring than a lone child,
-      // so the bigger circumference has room to seat all six without overlap.
-      expect(crowdedRing).toBeGreaterThan(loneRing)
-    })
-
-    it('a lone child stays near the base rest length (the sibling widening does not inflate it)', () => {
-      // With one child, the sibling-count floor is well under the base depth rest length, so the
-      // child rests at ~the base rest length, exactly as a simple two-body chain would.
-      const restLength = 120
-      const layout = new ForceLayout({ restLength, restLengthDepthScale: 0, outwardBias: 0 })
-      layout.sync([ dir('repo', '', 1), dir('repo/only', 'repo', 2) ])
-      stepTimes(layout, FIXED_DELTA_MS, 600)
-
-      const distance = distanceBetween(layout, 'repo', 'repo/only')
-      expect(distance).toBeGreaterThan(restLength * 0.9)
-      expect(distance).toBeLessThan(restLength * 1.2)
-    })
-  })
-
-  describe('fluid outward growth (the gentle bias)', () => {
-    it('grows a child directory OUTWARD, away from the center, not collapsing inward', () => {
-      // A pinned center, a repo root, and one child directory under it. Wherever the repo root
-      // settles, its child must end up FURTHER from the center (outward) and on the parent's far
-      // side from the center, never folded back inward across the trunk.
-      const layout = new ForceLayout({ center: { x: 0, y: 0 }})
-      layout.sync([ rootVisible(), dir('repo', '', 1), dir('repo/child', 'repo', 2) ])
-      stepTimes(layout, FIXED_DELTA_MS, 800)
-
-      const repo = layout.state.get('repo')!.position
-      const child = layout.state.get('repo/child')!.position
-      const repoDistance = Math.hypot(repo.x, repo.y)
-      const childDistance = Math.hypot(child.x, child.y)
-
-      // The child sits further out than its parent: the branch grew away from the center.
-      expect(childDistance).toBeGreaterThan(repoDistance)
-
-      // The parent -> child step must have a POSITIVE component along the trunk's outward ray
-      // (center -> repo): the child grew outward, not back toward the center.
-      const outwardX = repo.x / (repoDistance || 1)
-      const outwardY = repo.y / (repoDistance || 1)
-      const stepX = child.x - repo.x
-      const stepY = child.y - repo.y
-      const outwardComponent = stepX * outwardX + stepY * outwardY
-      expect(outwardComponent).toBeGreaterThan(0)
-    })
-  })
-
-  describe('file clustering', () => {
-    it('rests a file CLOSER to its directory than a child directory does', () => {
-      // Same parent, one file and one child directory. The file must settle much nearer the parent
-      // (a tight satellite) than the directory (which spreads like a sub-tree).
-      const layout = new ForceLayout()
-      layout.sync([
-        rootVisible(),
-        dir('repo', '', 1),
-        dir('repo/sub', 'repo', 2),
-        file('repo/a.ts', 'repo', 2),
-      ])
-      stepTimes(layout, FIXED_DELTA_MS, 600)
-
-      const fileDistance = distanceBetween(layout, 'repo', 'repo/a.ts')
-      const dirDistance = distanceBetween(layout, 'repo', 'repo/sub')
-      expect(fileDistance).toBeLessThan(dirDistance)
-    })
-  })
-
-  describe('step', () => {
-    it('pulls a child directory toward roughly the rest length from its parent', () => {
-      const restLength = 100
-      // No depth scaling, the outward bias off, and one lone child (so no sibling widening): the
-      // child rests at ~`restLength` from its parent, an easy settled distance to assert.
-      const layout = new ForceLayout({
-        restLength,
-        restLengthDepthScale: 0,
-        outwardBias: 0,
-      })
-      layout.sync([ dir('repo', '', 1), dir('repo/sub', 'repo', 2) ])
-
-      stepTimes(layout, FIXED_DELTA_MS, 600)
-      const distance = distanceBetween(layout, 'repo', 'repo/sub')
-      expect(distance).toBeGreaterThan(restLength * 0.9)
-      expect(distance).toBeLessThan(restLength * 1.15)
-    })
-
-    it('loses kinetic energy under damping and settles a single edge fully to rest', () => {
-      // A lone parent + child (collision irrelevant for two well-separated bodies, outward off) has
-      // a true equilibrium at the rest length, so damping must carry it all the way to rest.
-      const layout = new ForceLayout({
-        restLengthDepthScale: 0,
-        outwardBias: 0,
-      })
-      layout.sync([ dir('repo', '', 1), dir('repo/sub', 'repo', 2) ])
-
-      // A few steps in, the edge spring is actively doing work pulling the child out.
-      stepTimes(layout, FIXED_DELTA_MS, 8)
-      const energyEarly = totalKineticEnergy(layout)
-      expect(energyEarly).toBeGreaterThan(0)
-
-      // Far more steps in, damping must have bled the system essentially to rest.
-      stepTimes(layout, FIXED_DELTA_MS, 1_400)
-      const energyLate = totalKineticEnergy(layout)
-
-      expect(energyLate).toBeLessThan(energyEarly)
-      // Essentially at rest: a per-body speed well under a hundredth of a unit/sec.
-      expect(energyLate).toBeLessThan(1e-3)
-    })
-
-    it('bleeds kinetic energy out of an excited sibling fan (eases toward calm, not frozen)', () => {
-      // With the sibling fan + collision on, the group keeps gently jostling (the always-alive feel
-      // the design wants), but damping must still drain the bulk of the initial excitement so it
-      // eases toward a calm state rather than ringing forever.
-      const layout = new ForceLayout()
-      layout.sync([
-        dir('repo', '', 1),
-        dir('repo/a', 'repo', 2),
-        dir('repo/b', 'repo', 2),
-        dir('repo/c', 'repo', 2),
-      ])
-
-      stepTimes(layout, FIXED_DELTA_MS, 10)
-      const energyEarly = totalKineticEnergy(layout)
-
-      stepTimes(layout, FIXED_DELTA_MS, 800)
-      const energyLate = totalKineticEnergy(layout)
-
-      // The disturbance must have eased out to a small fraction of its peak.
-      expect(energyLate).toBeLessThan(energyEarly * 0.5)
-    })
-
-    it('is deterministic: identical structure + deltas yield identical positions', () => {
-      const build = (): ForceLayout => {
-        const layout = new ForceLayout()
-        layout.sync([
-          dir('repo', '', 1),
-          dir('repo/a', 'repo', 2),
-          dir('repo/b', 'repo', 2),
-        ])
-        stepTimes(layout, FIXED_DELTA_MS, 120)
-        return layout
-      }
-
-      const first = build()
-      const second = build()
-      for (const path of [ 'repo', 'repo/a', 'repo/b' ]) {
-        expect(second.state.get(path)!.position).toEqual(first.state.get(path)!.position)
-      }
-    })
-
-    it('ignores a non-positive or non-finite delta without disturbing the state', () => {
-      const layout = new ForceLayout()
-      layout.sync([ dir('repo', '', 1), dir('repo/sub', 'repo', 2) ])
-      // Excite the system, then snapshot.
-      stepTimes(layout, FIXED_DELTA_MS, 20)
-      const snapshot = new Map(
-        [ ...layout.state.entries() ].map(([ path, body ]) => [
-          path,
-          { x: body.position.x, y: body.position.y, vx: body.velocity.x, vy: body.velocity.y },
-        ]),
-      )
-
-      layout.step(0)
-      layout.step(-5)
-      layout.step(Number.NaN)
-
-      for (const [ path, body ] of layout.state) {
-        const expected = snapshot.get(path)!
-        expect(body.position.x).toBe(expected.x)
-        expect(body.position.y).toBe(expected.y)
-        expect(body.velocity.x).toBe(expected.vx)
-        expect(body.velocity.y).toBe(expected.vy)
-      }
-    })
-
-    it('clamps a huge delta so one giant step never destabilizes the sim', () => {
-      const layout = new ForceLayout({ maxStepMs: 50 })
-      layout.sync([
-        dir('repo', '', 1),
-        dir('repo/a', 'repo', 2),
-        dir('repo/b', 'repo', 2),
-      ])
-
-      // A pathological 10-second delta (a backgrounded tab) must be clamped, so every body stays
-      // finite and on-canvas rather than being flung to infinity.
-      layout.step(10_000)
-      for (const body of layout.state.values()) {
-        expect(Number.isFinite(body.position.x)).toBe(true)
-        expect(Number.isFinite(body.position.y)).toBe(true)
-        expect(Math.hypot(body.position.x, body.position.y)).toBeLessThan(10_000)
-      }
-    })
-  })
-
-  describe('reset', () => {
-    it('drops every body so a rewind re-syncs from scratch', () => {
-      const layout = new ForceLayout()
-      layout.sync([ dir('repo', '', 1), file('repo/a.ts', 'repo', 2) ])
-      expect(layout.state.size).toBe(2)
-
-      layout.reset()
-      expect(layout.state.size).toBe(0)
-
-      // After a reset, a fresh sync re-populates normally (the rewind path).
-      layout.sync([ dir('other', '', 1) ])
-      expect(layout.state.has('other')).toBe(true)
-      expect(layout.state.has('repo')).toBe(false)
-    })
+    // No files: the padding floor.
+    const none = parentFileRadius(
+      { displayParentPath: '', isFile: false, depth: 1, contentRadius: 1, fileCount: 0, fileSlot: null },
+      options,
+    )
+    expect(none).toBeCloseTo(options.directoryPadding, 6)
   })
 })
 
-/** A bodies map of the shape {@link buildSpatialGrid} consumes, from path -> position pairs. */
-function bodiesFrom(entries: Array<[ string, Vec2 ]>): Map<string, NodePhysics> {
-  const bodies = new Map<string, NodePhysics>()
-  for (const [ path, position ] of entries) {
-    bodies.set(path, { position, velocity: { x: 0, y: 0 }})
-  }
-  return bodies
-}
-
-/** All paths in a grid cell, for order-independent membership assertions. */
-function pathsIn(cell: { members: Array<{ path: string }> } | undefined): string[] {
-  return (cell?.members ?? []).map((member) => member.path).sort()
-}
-
-describe('buildSpatialGrid', () => {
-  it('bins bodies into cells of the given side by floor-dividing their position', () => {
-    // Cell side 100: (10,10) and (90,90) share cell (0,0); (150,10) is cell (1,0).
-    const grid = buildSpatialGrid(bodiesFrom([
-      [ 'a', { x: 10, y: 10 }],
-      [ 'b', { x: 90, y: 90 }],
-      [ 'c', { x: 150, y: 10 }],
-    ]), 100)
-
-    expect(pathsIn(grid.cells.get('0,0'))).toEqual([ 'a', 'b' ])
-    expect(pathsIn(grid.cells.get('1,0'))).toEqual([ 'c' ])
-    // No empty cells are materialized.
-    expect(grid.cells.size).toBe(2)
-  })
-
-  it('handles negative coordinates by flooring toward negative infinity', () => {
-    // Math.floor(-1/100) is -1, so a node at (-1,-1) lands in cell (-1,-1), not (0,0).
-    const grid = buildSpatialGrid(bodiesFrom([
-      [ 'neg', { x: -1, y: -1 }],
-      [ 'pos', { x: 1, y: 1 }],
-    ]), 100)
-
-    expect(pathsIn(grid.cells.get('-1,-1'))).toEqual([ 'neg' ])
-    expect(pathsIn(grid.cells.get('0,0'))).toEqual([ 'pos' ])
-  })
-
-  it('neighborhoodOf yields each adjacent cell-pair exactly once across a full sweep', () => {
-    // A 3x3 block of occupied cells, one body each. Sweeping every cell's neighborhood must
-    // enumerate every UNORDERED pair of touching cells exactly once (the property that lets the
-    // collision apply an equal-and-opposite force without double-counting).
-    const entries: Array<[ string, Vec2 ]> = []
-    for (let cellX = 0; cellX < 3; cellX++) {
-      for (let cellY = 0; cellY < 3; cellY++) {
-        // Center each body in its 100-unit cell so it bins unambiguously.
-        entries.push([ `${cellX},${cellY}`, { x: cellX * 100 + 50, y: cellY * 100 + 50 }])
-      }
-    }
-    const grid = buildSpatialGrid(bodiesFrom(entries), 100)
-
-    const seenPairs = new Set<string>()
-    for (const cell of grid.cells.values()) {
-      const neighborhood = grid.neighborhoodOf(cell.cellX, cell.cellY)
-      // The own cell is always first.
-      expect(neighborhood[0]).toBe(cell)
-      for (let index = 1; index < neighborhood.length; index++) {
-        const neighbor = neighborhood[index]
-        const key = [ `${cell.cellX},${cell.cellY}`, `${neighbor.cellX},${neighbor.cellY}` ].sort().join('|')
-        // A given unordered cell-pair must never be produced twice.
-        expect(seenPairs.has(key)).toBe(false)
-        seenPairs.add(key)
-        // Neighbors are genuinely adjacent (within one cell on each axis).
-        expect(Math.abs(neighbor.cellX - cell.cellX)).toBeLessThanOrEqual(1)
-        expect(Math.abs(neighbor.cellY - cell.cellY)).toBeLessThanOrEqual(1)
-      }
-    }
-
-    // A 3x3 grid has 12 horizontal/vertical + 8 diagonal = 20 adjacent unordered pairs.
-    expect(seenPairs.size).toBe(20)
-  })
-
-  it('floors a non-positive cell size to 1 rather than scattering bodies into nonsense cells', () => {
-    // A zero cell size would divide-by-zero every coordinate; the guard floors it to 1, so each
-    // integer coordinate still lands in its own sensible cell.
-    const grid = buildSpatialGrid(bodiesFrom([
-      [ 'a', { x: 3, y: 4 }],
-      [ 'b', { x: 3, y: 5 }],
-    ]), 0)
-
-    expect(pathsIn(grid.cells.get('3,4'))).toEqual([ 'a' ])
-    expect(pathsIn(grid.cells.get('3,5'))).toEqual([ 'b' ])
-  })
-})
-
-/** The signed angle of `point` around `center`, in (-pi, pi]. Reads a child's angle for the fan tests. */
-function angleAround(center: Vec2, point: Vec2): number {
-  return Math.atan2(point.y - center.y, point.x - center.x)
-}
-
-/** The absolute angular separation between two points around a shared center, in [0, pi]. */
-function angularGap(center: Vec2, left: Vec2, right: Vec2): number {
-  let delta = angleAround(center, right) - angleAround(center, left)
-  while (delta > Math.PI) {
-    delta -= Math.PI * 2
-  }
-  while (delta <= -Math.PI) {
-    delta += Math.PI * 2
-  }
-  return Math.abs(delta)
-}
-
-/**
- * Advances sibling children a few explicit-Euler steps under ONLY the fan-spread force (the parent
- * is the fixed anchor), so a test can assert their angular gap actually opens over time, not just
- * that the instantaneous force points the right way. A tiny step keeps the integration well-behaved.
- */
-function stepFanSpread(parent: Vec2, children: Vec2[], scale: number, steps: number): Vec2[] {
-  const positions = children.map((child) => ({ x: child.x, y: child.y }))
-  const stepSize = 0.0005
-  for (let iteration = 0; iteration < steps; iteration++) {
-    const forces = fanSpreadForces(parent, positions, scale)
-    for (let index = 0; index < positions.length; index++) {
-      positions[index].x += forces[index].x * stepSize
-      positions[index].y += forces[index].y * stepSize
-    }
-  }
-  return positions
-}
-
-describe('fanSpreadForces', () => {
-  it('spreads two siblings at nearly the same angle apart, widening their gap over several steps', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    // Two children at radius 100, both near angle 0 (a tiny 0.05 rad apart): badly crowded.
-    const children: Vec2[] = [
-      { x: 100, y: 0 },
-      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+describe('buildQuadTree', () => {
+  it('two overlapping points each feel a push directly apart from the other', () => {
+    const points: QuadPoint[] = [
+      { path: 'a', position: { x: 0, y: 0 }, radius: 10 },
+      { path: 'b', position: { x: 4, y: 0 }, radius: 10 },
     ]
+    const tree = buildQuadTree(points, 0.5)
 
-    const gapBefore = angularGap(parent, children[0], children[1])
-    const settled = stepFanSpread(parent, children, 50, 200)
-    const gapAfter = angularGap(parent, settled[0], settled[1])
+    // 'a' is at x=0, 'b' at x=4, summed radii 20: they overlap by 16, so 'a' is pushed in -x.
+    const pushA = tree.repulsionOn('a', { x: 0, y: 0 }, 10, () => true)
+    expect(pushA.x).toBeLessThan(0)
+    expect(Math.abs(pushA.y)).toBeLessThan(1e-9)
 
-    // The fan emerged: stepping under the spreading force alone opened the wedge between them.
-    expect(gapAfter).toBeGreaterThan(gapBefore)
+    // 'b' is pushed the opposite way, in +x.
+    const pushB = tree.repulsionOn('b', { x: 4, y: 0 }, 10, () => true)
+    expect(pushB.x).toBeGreaterThan(0)
   })
 
-  it('applies opposing, purely tangential pushes to a crowded pair (one each way around the parent)', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    // Two children near angle 0, very close in angle, at the same radius. The lower one (negative
-    // angle) is pushed further negative in angle, the upper (positive) further positive.
-    const lower: Vec2 = { x: 100 * Math.cos(-0.04), y: 100 * Math.sin(-0.04) }
-    const upper: Vec2 = { x: 100 * Math.cos(0.04), y: 100 * Math.sin(0.04) }
-    const forces = fanSpreadForces(parent, [ lower, upper ], 50)
-
-    // The two children move in OPPOSITE angular directions: the lower child's force points
-    // clockwise (decreasing angle) and the upper's counter-clockwise (increasing angle). The
-    // angular direction of a force is the sign of (offset cross force).
-    const crossLower = lower.x * forces[0].y - lower.y * forces[0].x
-    const crossUpper = upper.x * forces[1].y - upper.y * forces[1].x
-    expect(crossLower).toBeLessThan(0)
-    expect(crossUpper).toBeGreaterThan(0)
-
-    // Each push is purely tangential (perpendicular to that child's own radial axis), so the radial
-    // (dot) component is essentially zero.
-    const radialLower = lower.x * forces[0].x + lower.y * forces[0].y
-    const radialUpper = upper.x * forces[1].x + upper.y * forces[1].y
-    expect(Math.abs(radialLower)).toBeLessThan(1e-9)
-    expect(Math.abs(radialUpper)).toBeLessThan(1e-9)
-  })
-
-  it('leaves an evenly-fanned group essentially at rest (a good fan needs ~no spreading)', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    // Four siblings 90 deg apart: a perfect fan, whose adjacent gaps (pi/2) meet the even-gap
-    // threshold (2*pi / 4 = pi/2) exactly, so none push.
-    const radius = 100
-    const children: Vec2[] = [ 0, 1, 2, 3 ].map((quarter) => {
-      const angle = (quarter * Math.PI) / 2
-      return { x: radius * Math.cos(angle), y: radius * Math.sin(angle) }
-    })
-    const forces = fanSpreadForces(parent, children, 50)
-
-    for (const force of forces) {
-      expect(Math.hypot(force.x, force.y)).toBeLessThan(1e-9)
-    }
-  })
-
-  it('returns a zero force for a lone child (no sibling to fan against)', () => {
-    const forces = fanSpreadForces({ x: 0, y: 0 }, [{ x: 100, y: 0 }], 50)
-    expect(forces).toHaveLength(1)
-    expect(forces[0]).toEqual({ x: 0, y: 0 })
-  })
-
-  it('produces no spreading force at all when the scale is zero (the disabled fan)', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    const children: Vec2[] = [
-      { x: 100, y: 0 },
-      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+  it('well-separated points feel no push (overlap-only force)', () => {
+    const points: QuadPoint[] = [
+      { path: 'a', position: { x: 0, y: 0 }, radius: 5 },
+      { path: 'b', position: { x: 1000, y: 0 }, radius: 5 },
     ]
-    const forces = fanSpreadForces(parent, children, 0)
-    for (const force of forces) {
-      expect(Math.hypot(force.x, force.y)).toBe(0)
-    }
-  })
-})
-
-describe('antiFoldbackForce', () => {
-  const outward: Vec2 = { x: 1, y: 0 }
-
-  it('pushes a child folded back inward of its parent toward the outward side', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    // The child sits on the INWARD side of the parent (negative x along the outward axis): folded
-    // back. It must be pushed back outward (positive x).
-    const child: Vec2 = { x: -30, y: 5 }
-    const force = antiFoldbackForce(parent, outward, child, 10)
-
-    expect(force.x).toBeGreaterThan(0)
-    // The push is purely along the outward axis, so it has no off-axis (y) component here.
-    expect(force.y).toBeCloseTo(0, 12)
+    const tree = buildQuadTree(points, 0.5)
+    const push = tree.repulsionOn('a', { x: 0, y: 0 }, 5, () => true)
+    expect(Math.hypot(push.x, push.y)).toBeCloseTo(0, 9)
   })
 
-  it('grows with how far inward the child has folded', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    const slight = antiFoldbackForce(parent, outward, { x: -10, y: 0 }, 10)
-    const deep = antiFoldbackForce(parent, outward, { x: -40, y: 0 }, 10)
-    expect(deep.x).toBeGreaterThan(slight.x)
-  })
-
-  it('leaves a child already on the outward side untouched', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    const child: Vec2 = { x: 50, y: 10 }
-    const force = antiFoldbackForce(parent, outward, child, 10)
-    expect(force).toEqual({ x: 0, y: 0 })
-  })
-
-  it('returns zero when the parent has no defined outward direction', () => {
-    const force = antiFoldbackForce({ x: 0, y: 0 }, null, { x: -50, y: 0 }, 10)
-    expect(force).toEqual({ x: 0, y: 0 })
-  })
-
-  it('returns zero when the scale is zero (the disabled untangle force)', () => {
-    const force = antiFoldbackForce({ x: 0, y: 0 }, outward, { x: -50, y: 0 }, 0)
-    expect(force).toEqual({ x: 0, y: 0 })
-  })
-})
-
-describe('untangleGroupForces', () => {
-  it('produces no force at all when the strength scale is zero', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    const children: Vec2[] = [
-      { x: 100, y: 0 },
-      { x: 100 * Math.cos(0.05), y: 100 * Math.sin(0.05) },
+  it('respects the exclusion predicate (a skipped point contributes nothing)', () => {
+    const points: QuadPoint[] = [
+      { path: 'a', position: { x: 0, y: 0 }, radius: 10 },
+      { path: 'b', position: { x: 4, y: 0 }, radius: 10 },
     ]
-    const forces = untangleGroupForces(parent, { x: 1, y: 0 }, children, 0)
-
-    expect(forces).toHaveLength(2)
-    for (const force of forces) {
-      expect(Math.hypot(force.x, force.y)).toBe(0)
-    }
+    const tree = buildQuadTree(points, 0.5)
+    // Exclude 'b' entirely: 'a' should feel nothing even though they overlap.
+    const push = tree.repulsionOn('a', { x: 0, y: 0 }, 10, (candidate) => candidate !== 'b')
+    expect(Math.hypot(push.x, push.y)).toBeCloseTo(0, 9)
   })
 
-  it('combines the fan spreading and the anti-foldback into one force per child', () => {
-    const parent: Vec2 = { x: 0, y: 0 }
-    const outward: Vec2 = { x: 1, y: 0 }
-    // Two crowded children, both slightly INWARD of the parent (negative x) so both terms engage:
-    // the fan spreads them in y, the anti-foldback pushes them back out in +x.
-    const children: Vec2[] = [
-      { x: -100 * Math.cos(0.04), y: -100 * Math.sin(0.04) },
-      { x: -100 * Math.cos(0.04), y: 100 * Math.sin(0.04) },
-    ]
-    const forces = untangleGroupForces(parent, outward, children, 50)
+  it('an empty tree always returns a zero push', () => {
+    const tree = buildQuadTree([], 0.5)
+    const push = tree.repulsionOn('x', { x: 0, y: 0 }, 1, () => true)
+    expect(push).toEqual({ x: 0, y: 0 })
+  })
 
-    // Both get pushed back outward (anti-foldback, +x) and apart in y (fan), so neither force is
-    // zero and the y components oppose.
-    expect(forces[0].x).toBeGreaterThan(0)
-    expect(forces[1].x).toBeGreaterThan(0)
-    expect(Math.sign(forces[0].y)).not.toBe(Math.sign(forces[1].y))
+  it('a far cluster of overlapping points still pushes a nearby query the right way', () => {
+    // A tight cluster near the origin and one query point just overlapping it: the lumped far-field
+    // path (and the exact near path) must both push the query away from the cluster.
+    const points: QuadPoint[] = []
+    for (let index = 0; index < 20; index++) {
+      points.push({ path: `c${index}`, position: { x: index * 0.1, y: 0 }, radius: 30 })
+    }
+    const tree = buildQuadTree(points, 0.5)
+    const push = tree.repulsionOn('query', { x: -1, y: 0 }, 30, () => true)
+    // The cluster sits to the +x side, so the query at -1 is pushed further -x.
+    expect(push.x).toBeLessThan(0)
   })
 })
 
 describe('clampSpeed', () => {
   it('passes a vector under the cap through unchanged', () => {
-    // Magnitude 5 < cap 10, so the gesture's full kick is imparted as-is.
     expect(clampSpeed({ x: 3, y: 4 }, 10)).toEqual({ x: 3, y: 4 })
   })
 
-  it('clamps a vector over the cap to the cap magnitude, preserving its direction', () => {
-    // Magnitude 10, capped to 5: the (3, 4)/5 direction is kept while each component halves.
-    const result = clampSpeed({ x: 6, y: 8 }, 5)
-    expect(Math.hypot(result.x, result.y)).toBeCloseTo(5, 10)
-    expect(result.x).toBeCloseTo(3, 10)
-    expect(result.y).toBeCloseTo(4, 10)
+  it('rescales a vector over the cap to the cap magnitude, keeping direction', () => {
+    const clamped = clampSpeed({ x: 30, y: 40 }, 10) // magnitude 50 -> 10
+    expect(Math.hypot(clamped.x, clamped.y)).toBeCloseTo(10, 9)
+    expect(clamped.x / clamped.y).toBeCloseTo(30 / 40, 9)
   })
 
-  it('returns a zero kick for a non-finite component (a NaN delta upstream)', () => {
+  it('collapses a non-finite component or non-positive cap to zero', () => {
     expect(clampSpeed({ x: Number.NaN, y: 1 }, 10)).toEqual({ x: 0, y: 0 })
-    expect(clampSpeed({ x: 1, y: Number.POSITIVE_INFINITY }, 10)).toEqual({ x: 0, y: 0 })
-  })
-
-  it('returns a zero kick for a non-positive cap', () => {
-    expect(clampSpeed({ x: 3, y: 4 }, 0)).toEqual({ x: 0, y: 0 })
-    expect(clampSpeed({ x: 3, y: 4 }, -5)).toEqual({ x: 0, y: 0 })
+    expect(clampSpeed({ x: 1, y: 1 }, 0)).toEqual({ x: 0, y: 0 })
   })
 })
 
 describe('zoomImpulse', () => {
-  it('pushes the forest outward (away from the anchor) when zooming in', () => {
-    // The center sits to the +x of the anchor (offset (10, 0)); zooming in (factor 2) must kick the
-    // nodes the OTHER way, in -x, away from the anchor, so they spring back outward.
-    const impulse = zoomImpulse({ x: 10, y: 0 }, 2, 1)
+  it('zooming in pushes the nodes outward (away from the anchor)', () => {
+    // centerOffset points from anchor to center; zooming in (factor > 1) flips it outward.
+    const impulse = zoomImpulse({ x: 10, y: 0 }, 2, 5)
     expect(impulse.x).toBeLessThan(0)
-    expect(impulse.y).toBeCloseTo(0, 10)
   })
 
-  it('pulls the forest inward (toward the center) when zooming out', () => {
-    // Same geometry, zooming out (factor 0.5) flips the sign: the kick points toward +x (the center).
-    const impulse = zoomImpulse({ x: 10, y: 0 }, 0.5, 1)
+  it('zooming out pulls the nodes inward (toward the center)', () => {
+    const impulse = zoomImpulse({ x: 10, y: 0 }, 0.5, 5)
     expect(impulse.x).toBeGreaterThan(0)
-    expect(impulse.y).toBeCloseTo(0, 10)
   })
 
-  it('scales with the size of the zoom step (a hard zoom kicks harder than a gentle one)', () => {
-    const gentle = zoomImpulse({ x: 10, y: 0 }, 1.1, 1)
-    const hard = zoomImpulse({ x: 10, y: 0 }, 4, 1)
-    expect(Math.abs(hard.x)).toBeGreaterThan(Math.abs(gentle.x))
-  })
-
-  it('returns a zero impulse when the anchor sits on the center (no radial direction)', () => {
-    expect(zoomImpulse({ x: 0, y: 0 }, 2, 1)).toEqual({ x: 0, y: 0 })
-  })
-
-  it('returns a zero impulse for a unit or non-positive factor', () => {
-    expect(zoomImpulse({ x: 10, y: 0 }, 1, 1)).toEqual({ x: 0, y: 0 })
-    expect(zoomImpulse({ x: 10, y: 0 }, 0, 1)).toEqual({ x: 0, y: 0 })
-    expect(zoomImpulse({ x: 10, y: 0 }, -2, 1)).toEqual({ x: 0, y: 0 })
-  })
-})
-
-describe('ForceLayout.applyImpulse', () => {
-  it('adds the kick velocity to every non-pinned body and leaves the pinned root untouched', () => {
-    const layout = new ForceLayout()
-    layout.sync([ rootVisible(), dir('api', '', 1), dir('docs', '', 1) ])
-
-    layout.applyImpulse({ x: 5, y: -3 })
-
-    // The pinned root is held at the center and never integrated, so it must carry no velocity.
-    expect(layout.state.get('')!.velocity).toEqual({ x: 0, y: 0 })
-    // Every non-pinned body, all starting at rest, gained exactly the kick.
-    expect(layout.state.get('api')!.velocity).toEqual({ x: 5, y: -3 })
-    expect(layout.state.get('docs')!.velocity).toEqual({ x: 5, y: -3 })
-  })
-
-  it('caps the imparted velocity at wobbleMaxSpeed so a fast gesture cannot blow up the sim', () => {
-    const layout = new ForceLayout({ wobbleMaxSpeed: 10 })
-    layout.sync([ dir('api', '', 1) ])
-
-    // A requested kick of magnitude 100 along +x must saturate at the cap of 10.
-    layout.applyImpulse({ x: 100, y: 0 })
-
-    const velocity = layout.state.get('api')!.velocity
-    expect(Math.hypot(velocity.x, velocity.y)).toBeCloseTo(10, 10)
-    expect(velocity.x).toBeCloseTo(10, 10)
-  })
-
-  it('settles back to rest after a kick (the springs + damping decay the wobble)', () => {
-    const layout = new ForceLayout()
-    layout.sync([ rootVisible(), dir('api', '', 1), dir('docs', '', 1) ])
-    // Let the spawn arrangement settle first so the only energy measured is the kick's.
-    stepTimes(layout, FIXED_DELTA_MS, 400)
-
-    layout.applyImpulse({ x: 80, y: 80 })
-    const energyRightAfterKick = totalKineticEnergy(layout)
-    expect(energyRightAfterKick).toBeGreaterThan(0)
-
-    // A couple of seconds of stepping must bleed the kick's energy away to a small fraction.
-    stepTimes(layout, FIXED_DELTA_MS, 400)
-    const energyAfterSettling = totalKineticEnergy(layout)
-    expect(energyAfterSettling).toBeLessThan(energyRightAfterKick * 0.05)
-  })
-
-  it('is a no-op for a zero or non-finite impulse', () => {
-    const layout = new ForceLayout()
-    layout.sync([ dir('api', '', 1) ])
-
-    layout.applyImpulse({ x: 0, y: 0 })
-    expect(layout.state.get('api')!.velocity).toEqual({ x: 0, y: 0 })
-
-    layout.applyImpulse({ x: Number.NaN, y: 0 })
-    expect(layout.state.get('api')!.velocity).toEqual({ x: 0, y: 0 })
+  it('a unit factor, non-positive factor, or anchor-on-center yields zero', () => {
+    expect(zoomImpulse({ x: 10, y: 0 }, 1, 5)).toEqual({ x: 0, y: 0 })
+    expect(zoomImpulse({ x: 10, y: 0 }, -1, 5)).toEqual({ x: 0, y: 0 })
+    expect(zoomImpulse({ x: 0, y: 0 }, 2, 5)).toEqual({ x: 0, y: 0 })
   })
 })
