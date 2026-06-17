@@ -1,6 +1,6 @@
 {
   "name": "runewood",
-  "version": "0.0.1-alpha",
+  "version": "0.0.2",
   "description": "Gource-inspired, framework-agnostic WebGL visualization of live agent and repository activity",
   "keywords": [
     "visualization",
