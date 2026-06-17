@@ -42,8 +42,6 @@ export {
   countDirectFiles,
   parentFileRadius,
   buildQuadTree,
-  clampSpeed,
-  zoomImpulse,
 } from './core/physics'
 export type { QuadTree, QuadPoint, SiblingGroup } from './core/physics'
 export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'

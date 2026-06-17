@@ -15,8 +15,6 @@ import {
   countDirectFiles,
   parentFileRadius,
   buildQuadTree,
-  clampSpeed,
-  zoomImpulse,
 } from './physics'
 
 /**
@@ -56,15 +54,6 @@ function stepTimes(layout: ForceLayout, deltaMs: number, count: number): void {
   for (let index = 0; index < count; index++) {
     layout.step(deltaMs)
   }
-}
-
-/** Total kinetic energy proxy: the sum of squared speeds over every body. Falls as the system damps. */
-function totalKineticEnergy(layout: ForceLayout): number {
-  let energy = 0
-  for (const body of layout.state.values()) {
-    energy += body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y
-  }
-  return energy
 }
 
 /**
@@ -113,10 +102,8 @@ function defaultedOptions(overrides: ForceLayoutOptions = {}): Required<ForceLay
     directoryPadding: 1.5,
     fileDiameter: 8,
     fileEaseSpeed: 5,
-    damping: 0.85,
     maxStepMs: 50,
     quadTreeTheta: 0.5,
-    wobbleMaxSpeed: 220,
     ...overrides,
   }
 }
@@ -436,36 +423,34 @@ describe('ForceLayout: forest root pinning and lifecycle', () => {
   })
 })
 
-describe('ForceLayout: applyImpulse (camera wobble)', () => {
-  it('kicks directory bodies and then settles them back via damping', () => {
+describe('ForceLayout: the forest is inert to camera input', () => {
+  it('a settled layout does not move when no force or structural change disturbs it', () => {
+    // The wobble channel is gone: there is no operation a camera pan / zoom could call that imparts
+    // motion to a body. Once settled, the only thing that moves a body is a force (a structural
+    // change) or a step under a live temperature; a quiet step moves nothing. This is the positive
+    // proof that camera input cannot perturb the forest.
+    const root = dir('repo', '', 1)
+    const children = Array.from({ length: 6 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
     const layout = new ForceLayout()
-    layout.sync([ dir('repo', '', 1), dir('repo/src', 'repo', 2) ])
-    stepTimes(layout, FIXED_DELTA_MS, 100)
+    layout.sync([ root, ...children ])
+    stepTimes(layout, FIXED_DELTA_MS, 600)
 
-    layout.applyImpulse({ x: 50, y: 0 })
-    const kicked = totalKineticEnergy(layout)
-    expect(kicked).toBeGreaterThan(0)
-
-    stepTimes(layout, FIXED_DELTA_MS, 400)
-    expect(totalKineticEnergy(layout)).toBeLessThan(kicked)
-    expect(totalKineticEnergy(layout)).toBeLessThan(1)
+    const settled = displacementOver(layout, FIXED_DELTA_MS, 120)
+    expect(settled.total).toBeCloseTo(0, 6)
+    expect(settled.max).toBeCloseTo(0, 6)
   })
 
-  it('does not impart a velocity to the pinned forest root', () => {
+  it('every body carries a zeroed velocity field that the sim never drives', () => {
+    // The public `state` shape is unchanged (each body still exposes `velocity`), but nothing writes
+    // a non-zero velocity now that the wobble is removed, so it stays zero through a long run.
     const layout = new ForceLayout()
-    layout.sync([ rootVisible(), dir('repo', '', 1) ])
-    layout.applyImpulse({ x: 30, y: 30 })
-    const rootBody = layout.state.get('')!
-    expect(rootBody.velocity.x).toBe(0)
-    expect(rootBody.velocity.y).toBe(0)
-  })
+    layout.sync([ rootVisible(), dir('repo', '', 1), dir('repo/src', 'repo', 2) ])
+    stepTimes(layout, FIXED_DELTA_MS, 200)
 
-  it('a zero or non-finite impulse is a no-op', () => {
-    const layout = new ForceLayout()
-    layout.sync([ dir('repo', '', 1) ])
-    layout.applyImpulse({ x: 0, y: 0 })
-    layout.applyImpulse({ x: Number.NaN, y: 1 })
-    expect(totalKineticEnergy(layout)).toBe(0)
+    for (const body of layout.state.values()) {
+      expect(body.velocity.x).toBe(0)
+      expect(body.velocity.y).toBe(0)
+    }
   })
 })
 
@@ -619,25 +604,6 @@ describe('ForceLayout: sleeping (convergence + the scale perf win)', () => {
     const settled = displacementOver(layout, FIXED_DELTA_MS, 120)
     expect(settled.total).toBeCloseTo(0, 6)
     expect(settled.max).toBeCloseTo(0, 6)
-  })
-
-  it('a camera impulse wakes the settled bodies, which then move again and re-settle', () => {
-    const root = dir('repo', '', 1)
-    const children = Array.from({ length: 8 }, (_unused, index) => dir(`repo/d${index}`, 'repo', 2))
-    const layout = new ForceLayout()
-    layout.sync([ root, ...children ])
-    stepTimes(layout, FIXED_DELTA_MS, 600)
-
-    // Asleep: no motion.
-    expect(displacementOver(layout, FIXED_DELTA_MS, 40).total).toBeCloseTo(0, 6)
-
-    // A kick wakes them; they move again, then re-settle to static.
-    layout.applyImpulse({ x: 60, y: 0 })
-    const afterKick = displacementOver(layout, FIXED_DELTA_MS, 40)
-    expect(afterKick.total).toBeGreaterThan(0)
-
-    stepTimes(layout, FIXED_DELTA_MS, 600)
-    expect(displacementOver(layout, FIXED_DELTA_MS, 40).total).toBeCloseTo(0, 6)
   })
 
   it('adding a new sibling near a settled cluster wakes it to re-settle', () => {
@@ -856,23 +822,6 @@ describe('buildQuadTree', () => {
   })
 })
 
-describe('clampSpeed', () => {
-  it('passes a vector under the cap through unchanged', () => {
-    expect(clampSpeed({ x: 3, y: 4 }, 10)).toEqual({ x: 3, y: 4 })
-  })
-
-  it('rescales a vector over the cap to the cap magnitude, keeping direction', () => {
-    const clamped = clampSpeed({ x: 30, y: 40 }, 10) // magnitude 50 -> 10
-    expect(Math.hypot(clamped.x, clamped.y)).toBeCloseTo(10, 9)
-    expect(clamped.x / clamped.y).toBeCloseTo(30 / 40, 9)
-  })
-
-  it('collapses a non-finite component or non-positive cap to zero', () => {
-    expect(clampSpeed({ x: Number.NaN, y: 1 }, 10)).toEqual({ x: 0, y: 0 })
-    expect(clampSpeed({ x: 1, y: 1 }, 0)).toEqual({ x: 0, y: 0 })
-  })
-})
-
 describe('ForceLayout: localized reheat (no whole-tree re-energize on every event)', () => {
   /** Snapshots every body's current position so a later state can be diffed against it. */
   function snapshotPositions(layout: ForceLayout): Map<string, { x: number, y: number }> {
@@ -1020,24 +969,5 @@ describe('ForceLayout: localized reheat (no whole-tree re-energize on every even
     }
     const meanAngle = sumCross / sumLeverSquared
     expect(Math.abs(meanAngle)).toBeLessThan(0.02)
-  })
-})
-
-describe('zoomImpulse', () => {
-  it('zooming in pushes the nodes outward (away from the anchor)', () => {
-    // centerOffset points from anchor to center; zooming in (factor > 1) flips it outward.
-    const impulse = zoomImpulse({ x: 10, y: 0 }, 2, 5)
-    expect(impulse.x).toBeLessThan(0)
-  })
-
-  it('zooming out pulls the nodes inward (toward the center)', () => {
-    const impulse = zoomImpulse({ x: 10, y: 0 }, 0.5, 5)
-    expect(impulse.x).toBeGreaterThan(0)
-  })
-
-  it('a unit factor, non-positive factor, or anchor-on-center yields zero', () => {
-    expect(zoomImpulse({ x: 10, y: 0 }, 1, 5)).toEqual({ x: 0, y: 0 })
-    expect(zoomImpulse({ x: 10, y: 0 }, -1, 5)).toEqual({ x: 0, y: 0 })
-    expect(zoomImpulse({ x: 0, y: 0 }, 2, 5)).toEqual({ x: 0, y: 0 })
   })
 })

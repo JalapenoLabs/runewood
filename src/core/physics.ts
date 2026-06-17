@@ -54,11 +54,10 @@ import type { VisibleNode } from './collapse'
  * ### Constants
  *
  * The defaults are Gource's own values (see {@link ForceLayoutOptions}): gravity `10`, directory
- * padding `1.5`, file diameter `8`, file ease speed `5`. The one addition is a light per-second
- * velocity {@link ForceLayoutOptions.damping} on directories. Gource runs with `elasticity = 0`
- * (pure `pos += accel * dt`, no stored velocity), but runewood's {@link applyImpulse} camera wobble
- * needs a velocity channel to spend, so directories carry a velocity that the damping bleeds off,
- * letting a wobble settle while leaving the steady-state layout Gource-identical.
+ * padding `1.5`, file diameter `8`, file ease speed `5`. The integration is momentumless like
+ * Gource (`elasticity = 0`, pure `pos += accel * dt`, no stored velocity), so the steady-state
+ * layout is Gource-identical. The forest is inert to camera input: panning and zooming move the
+ * camera alone and impart no motion to any body.
  *
  * This is **forward-only visual state**, not a pure function of the tree: a backward seek re-folds
  * the (pure) tree and re-syncs the sim, which re-settles rather than reproducing pixel-exact prior
@@ -71,11 +70,11 @@ export class ForceLayout {
   /**
    * Per-directory sleep AND cooling state, keyed by real node path (files are never bodies, so they
    * are never here). Each body carries its OWN cooling {@link SleepState.temperature} (the former
-   * global `alpha`, now localized) plus its sleep bookkeeping: a directory whose velocity AND
-   * movement stay below {@link SLEEP_*} thresholds for {@link SLEEP_DWELL_MS} of accumulated quiet
-   * time, and whose temperature has cooled to rest, goes {@link SleepState.asleep}, after which the
-   * integrator skips it entirely until something wakes it (a force above the wake threshold, a
-   * camera impulse, or a structural change near it). This is the convergence + scale-perf win: a
+   * global `alpha`, now localized) plus its sleep bookkeeping: a directory whose per-step movement
+   * stays below {@link SLEEP_STEP_THRESHOLD} for {@link SLEEP_DWELL_MS} of accumulated quiet time,
+   * and whose temperature has cooled to rest, goes {@link SleepState.asleep}, after which the
+   * integrator skips it entirely until something wakes it (a force above the wake threshold or a
+   * structural change near it). This is the convergence + scale-perf win: a
    * settled forest does almost no integration work, and its nodes stop micro-moving so the scene's
    * skip-redraw actually triggers. Absent for the pinned root (never integrated anyway).
    *
@@ -112,10 +111,8 @@ export class ForceLayout {
       directoryPadding: options.directoryPadding ?? DEFAULT_DIRECTORY_PADDING,
       fileDiameter: options.fileDiameter ?? DEFAULT_FILE_DIAMETER,
       fileEaseSpeed: options.fileEaseSpeed ?? DEFAULT_FILE_EASE_SPEED,
-      damping: options.damping ?? DEFAULT_DAMPING,
       maxStepMs: options.maxStepMs ?? DEFAULT_MAX_STEP_MS,
       quadTreeTheta: options.quadTreeTheta ?? DEFAULT_QUAD_TREE_THETA,
-      wobbleMaxSpeed: options.wobbleMaxSpeed ?? DEFAULT_WOBBLE_MAX_SPEED,
     }
   }
 
@@ -327,7 +324,7 @@ export class ForceLayout {
    * untouched. Used for the overlap-wake during repulsion: a node drifting into a settled cluster
    * revives the sleepers it touches, but a settled pair that rests microscopically overlapping must
    * NOT keep resetting each other's dwell (or neither would ever sleep). An awake body decides to
-   * sleep purely from its own force + velocity in {@link integrateDirectories}.
+   * sleep purely from its own realized per-step movement in {@link integrateDirectories}.
    */
   private wakeIfAsleep(path: string): void {
     const sleep = this.sleepByPath.get(path)
@@ -368,8 +365,9 @@ export class ForceLayout {
 
   /**
    * Advances the simulation by `deltaMs` of real wall time. Directories are force-directed (spring
-   * to parent, parent-edge nudge, sibling spread, quadtree repulsion) and integrated with velocity
-   * damping; files ease deterministically toward their packed ring slot around their directory.
+   * to parent, parent-edge nudge, sibling spread, quadtree repulsion) and integrated momentumlessly
+   * (`pos += accel * dt`); files ease deterministically toward their packed ring slot around their
+   * directory.
    *
    * The delta is clamped to {@link ForceLayoutOptions.maxStepMs} for stability: a long stall (a
    * backgrounded tab, a GC pause) must not deliver one giant step that flings nodes across the
@@ -414,45 +412,6 @@ export class ForceLayout {
     // The per-body cooling now happens inside integrateDirectories: each awake directory decays its
     // OWN temperature framerate-independently, so a disturbance re-anneals only its own neighborhood
     // and a settled forest stays cold (no global temperature to pulse the whole tree on every event).
-  }
-
-  /**
-   * Kicks the whole forest with a one-shot velocity impulse so it visibly wobbles and then springs
-   * back to rest, the way a hanging mobile jiggles when you nudge the frame it dangles from. The
-   * controller calls this from the camera's pan and zoom handlers.
-   *
-   * `worldVelocity` is added to every non-pinned DIRECTORY body's velocity in WORLD units per
-   * second; the spring + damping then settle the kick into a wobble. Files carry no velocity (they
-   * are momentumless satellites), so they simply follow their directory as it wobbles, which keeps
-   * a file glued to its cluster instead of drifting off on a kick. The pinned forest root is left
-   * untouched so the forest hangs and wobbles around its fixed center.
-   *
-   * The kick is capped at {@link ForceLayoutOptions.wobbleMaxSpeed} ({@link clampSpeed}) so a fast
-   * camera flick cannot inject a runaway velocity. A zero / non-finite impulse is a no-op.
-   */
-  public applyImpulse(worldVelocity: Vec2): void {
-    const kick = clampSpeed(worldVelocity, this.options.wobbleMaxSpeed)
-    if (kick.x === 0 && kick.y === 0) {
-      return
-    }
-
-    for (const [ path, body ] of this.bodies) {
-      if (path === this.pinnedPath) {
-        continue
-      }
-      const meta = this.metaByPath.get(path)
-      if (meta?.isFile) {
-        // Files have no momentum channel in Gource; they follow their directory rather than taking
-        // a kick of their own, so a wobble never scatters a directory's satellite cluster.
-        continue
-      }
-      body.velocity.x += kick.x
-      body.velocity.y += kick.y
-      // A kicked body has velocity to spend, so reheat it: wake it AND restore its force-energy so
-      // the kicked forest re-settles into a tidy arrangement after the wobble, rather than the kick
-      // just sliding cooled-flat bodies around. The wobble then settles each body back to sleep.
-      this.reheat(path)
-    }
   }
 
   /**
@@ -730,25 +689,18 @@ export class ForceLayout {
   }
 
   /**
-   * Integrates the directory bodies, faithful to Gource plus a decaying wobble channel.
+   * Integrates the directory bodies, faithful to Gource's momentumless model.
    *
    * Gource's `RDirNode::move` is `pos += accel * dt`, with the acceleration recomputed from scratch
    * every frame and never stored. That is deliberately momentumless: it behaves like one step of
    * gradient descent toward the force balance, so it cannot accumulate the energy that a stiff
    * spring under semi-implicit Euler would, and it stays stable at hundreds of directories without
-   * any damping at all. We keep that exactly for the force response (`pos += accel * dt`).
-   *
-   * The body's `velocity` is reserved purely for runewood's camera-wobble {@link applyImpulse}: a
-   * kick lives there and decays by the per-second {@link ForceLayoutOptions.damping}, sliding the
-   * body each frame, so a wobble glides and settles. With no kick the velocity is zero and the
-   * motion is pure Gource. The force is integrated directly into position (not into velocity), so a
-   * strong spring can never build up runaway momentum: that is the anti-flail fix.
+   * any damping at all. The force is integrated directly into position (`pos += accel * dt`), never
+   * into a stored velocity, so a strong spring can never build up runaway momentum: that is the
+   * anti-flail fix. The forest is inert to camera input; pan / zoom move the camera alone and impart
+   * no motion to any body.
    */
   private integrateDirectories(accelerations: Map<string, Vec2>, deltaMs: number, deltaSeconds: number): void {
-    // Per-second damping converted to this step: the wobble velocity retains `(1 - damping)^dt`, so
-    // the decay is framerate-independent rather than tied to a fixed step count.
-    const retained = Math.pow(1 - this.options.damping, deltaSeconds)
-
     for (const [ path, acceleration ] of accelerations) {
       const body = this.bodies.get(path)!
       const sleepState = this.sleepByPath.get(path)
@@ -778,12 +730,6 @@ export class ForceLayout {
         body.position.y += stepY
       }
 
-      // The decaying wobble channel: spend and bleed off any camera-kick velocity.
-      body.position.x += body.velocity.x * deltaSeconds
-      body.position.y += body.velocity.y * deltaSeconds
-      body.velocity.x *= retained
-      body.velocity.y *= retained
-
       if (!sleepState) {
         continue
       }
@@ -808,23 +754,18 @@ export class ForceLayout {
 
       // Sleep bookkeeping (convergence + the scale perf win): a directory is ready to sleep when it
       // has cooled (its temperature has bottomed out, so it would do no further force work) AND its
-      // actual per-step movement and residual wobble velocity both sit below the sleep thresholds.
-      // Accumulate that quiet time; once it clears the dwell, the body sleeps and the integrator
-      // skips it next frame (so it stops micro-moving and the scene's skip-redraw triggers). Any
-      // disturbance above the thresholds, or a fresh reheat, resets the dwell. Keying on the realized
-      // step (not the raw force) means a body resting in a standing-overlap equilibrium, where
-      // opposing forces nearly cancel into a tiny net step, is correctly recognized as quiet.
-      const speed = Math.hypot(body.velocity.x, body.velocity.y)
+      // actual per-step movement sits below the sleep threshold. Accumulate that quiet time; once it
+      // clears the dwell, the body sleeps and the integrator skips it next frame (so it stops
+      // micro-moving and the scene's skip-redraw triggers). Any disturbance above the threshold, or a
+      // fresh reheat, resets the dwell. Keying on the realized step (not the raw force) means a body
+      // resting in a standing-overlap equilibrium, where opposing forces nearly cancel into a tiny
+      // net step, is correctly recognized as quiet.
       const cooled = sleepState.temperature === 0
-      const quiet = sleepState.lastStepDistance < SLEEP_STEP_THRESHOLD && speed < SLEEP_SPEED_THRESHOLD
+      const quiet = sleepState.lastStepDistance < SLEEP_STEP_THRESHOLD
       if (cooled && quiet) {
         sleepState.restMs += deltaMs
         if (sleepState.restMs >= SLEEP_DWELL_MS) {
           sleepState.asleep = true
-          // Zero the residual wobble so a sleeping body is truly static (no leftover sub-threshold
-          // drift), which is what lets the scene treat it as unmoved and skip its redraw.
-          body.velocity.x = 0
-          body.velocity.y = 0
         }
       }
       else {
@@ -953,12 +894,10 @@ export class ForceLayout {
       const offsetY = destY - body.position.y
 
       // Step a fraction of the way toward the slot, never past it (Gource clamps `accel2` to
-      // `accel`). Files keep no velocity: they are momentumless satellites.
+      // `accel`). Files keep no momentum: they are deterministic satellites of their directory.
       const stepScale = Math.min(1, this.options.fileEaseSpeed * deltaSeconds)
       body.position.x += offsetX * stepScale
       body.position.y += offsetY * stepScale
-      body.velocity.x = 0
-      body.velocity.y = 0
     }
   }
 
@@ -1042,9 +981,9 @@ type SleepState = {
   /**
    * This body's own cooling temperature in `[0, 1]` (the localized former global `alpha`): the
    * integrator scales the body's force step by it and decays it toward 0 each awake step
-   * ({@link TEMPERATURE_DECAY_PER_SECOND}). A structural change near the body or a camera impulse
-   * reheats it to 1; an undisturbed, cooled body sits at 0 and does no force work, which is what
-   * keeps a settled forest from re-energizing on every event.
+   * ({@link TEMPERATURE_DECAY_PER_SECOND}). A structural change near the body reheats it to 1; an
+   * undisturbed, cooled body sits at 0 and does no force work, which is what keeps a settled forest
+   * from re-energizing on every event.
    */
   temperature: number
   /**
@@ -1150,14 +1089,6 @@ const DEFAULT_FILE_DIAMETER = 12
  */
 const DEFAULT_FILE_EASE_SPEED = 5
 
-/**
- * Default per-second velocity damping in `[0, 1)` on directory bodies. Gource runs with no damping
- * (elasticity 0, pure `pos += accel * dt`), but runewood's camera wobble injects a velocity that
- * needs to bleed off; this decays it over roughly a second so a kick settles into a wobble while the
- * steady-state layout stays Gource-faithful (at rest the velocity decays to zero regardless).
- */
-const DEFAULT_DAMPING = 0.85
-
 /** Default integration-step clamp: ~3 frames at 60fps, enough to smooth a hitch without stalling. */
 const DEFAULT_MAX_STEP_MS = 50
 
@@ -1183,7 +1114,7 @@ const MIN_DIR_STEP = 8
  * bodies sleep. This is the per-body convergence schedule that breaks the deep-tree limit cycle the
  * raw force model otherwise sits in. Lower cools faster (snappier settle, less organic glide); higher
  * cools slower (more lingering motion). A tuning knob. Reset to 1 by a local reheat (a structural
- * change near the body in {@link ForceLayout.sync}) or a camera impulse.
+ * change near the body in {@link ForceLayout.sync}).
  */
 const TEMPERATURE_DECAY_PER_SECOND = 0.08
 
@@ -1207,15 +1138,6 @@ const TEMPERATURE_FLOOR = 0.002
 const SLEEP_STEP_THRESHOLD = 0.05
 
 /**
- * The wobble-velocity magnitude (layout units per second) below which a directory counts as quiet
- * for sleeping. Only the camera-impulse channel carries velocity (the force response is
- * momentumless), so this is essentially "the camera kick has bled off"; paired with
- * {@link SLEEP_FORCE_THRESHOLD} so a body sleeps only when both its force and its residual motion
- * are small.
- */
-const SLEEP_SPEED_THRESHOLD = 4
-
-/**
  * How long (in accumulated below-threshold milliseconds) a directory must stay quiet before it
  * sleeps. A short dwell so a settled forest goes static within a fraction of a second, but long
  * enough that a node merely passing through its equilibrium on the way to overshoot does not sleep
@@ -1229,13 +1151,6 @@ const SLEEP_DWELL_MS = 250
  * accuracy / speed tradeoff. `0` forces exact all-pairs (every leaf visited).
  */
 const DEFAULT_QUAD_TREE_THETA = 0.5
-
-/**
- * Default cap on a single {@link ForceLayout.applyImpulse} kick, in layout units per second, so a
- * hard camera flick produces a lively-but-contained wobble rather than launching the forest
- * off-screen.
- */
-const DEFAULT_WOBBLE_MAX_SPEED = 220
 
 /**
  * Tuning for {@link ForceLayout}. Every field defaults to Gource's own constant (or, for the two
@@ -1265,12 +1180,6 @@ export type ForceLayoutOptions = {
    */
   fileEaseSpeed?: number
   /**
-   * Per-second velocity damping in `[0, 1)` on directory bodies (runewood-only, default `0.85`).
-   * Gource has none; runewood needs it so a camera-wobble impulse settles. At rest it is moot (the
-   * velocity is already zero), so it does not change the Gource steady-state layout.
-   */
-  damping?: number
-  /**
    * The largest single integration step, in milliseconds (default `50`). A real delta longer than
    * this (a backgrounded tab, a GC hitch) is clamped so one giant step never flings the forest
    * apart.
@@ -1281,11 +1190,6 @@ export type ForceLayoutOptions = {
    * accurate and slower; `0` is exact all-pairs.
    */
   quadTreeTheta?: number
-  /**
-   * The hard cap, in layout units per second, on the velocity {@link ForceLayout.applyImpulse}
-   * imparts in one kick (default `220`), so a fast camera gesture cannot fling the forest apart.
-   */
-  wobbleMaxSpeed?: number
 }
 
 /**
@@ -1606,55 +1510,6 @@ function packFilesIntoRings(
       }
       slotInRing = 0
     }
-  }
-}
-
-/**
- * Caps a velocity vector to a maximum magnitude, preserving its direction. Used by
- * {@link ForceLayout.applyImpulse} so a fast camera gesture cannot inject a runaway kick: at or
- * under `maxSpeed` the vector passes through unchanged; above it the magnitude is clamped while the
- * direction is kept. A non-finite component or a non-positive `maxSpeed` collapses to a zero kick.
- * Pure, so it is directly unit-testable.
- */
-export function clampSpeed(velocity: Vec2, maxSpeed: number): Vec2 {
-  if (!Number.isFinite(velocity.x) || !Number.isFinite(velocity.y) || !(maxSpeed > 0)) {
-    return { x: 0, y: 0 }
-  }
-
-  const speed = Math.hypot(velocity.x, velocity.y)
-  if (speed <= maxSpeed) {
-    return { x: velocity.x, y: velocity.y }
-  }
-
-  const scale = maxSpeed / speed
-  return { x: velocity.x * scale, y: velocity.y * scale }
-}
-
-/**
- * The radial wobble impulse for a zoom gesture: a velocity that points from the zoom anchor toward
- * (or, zooming out, away from) the forest's current center, so a wheel-zoom nudges the nodes out/in
- * along the zoom axis and they spring back into a wobble. `centerOffset` is the vector from the
- * anchor to the sim's center in WORLD units; `factor` is the zoom multiplier (`> 1` zoomed in, `< 1`
- * zoomed out); `strength` scales the kick. Zooming in pushes the forest outward (away from the
- * anchor) and zooming out pulls it inward, proportional to the zoom step (`|ln factor|`).
- *
- * An anchor on the center (no defined radial direction) or a non-positive / unit `factor` yields a
- * zero impulse. Pure, so the zoom kick is directly unit-testable.
- */
-export function zoomImpulse(centerOffset: Vec2, factor: number, strength: number): Vec2 {
-  if (!(factor > 0) || factor === 1) {
-    return { x: 0, y: 0 }
-  }
-
-  const distance = Math.hypot(centerOffset.x, centerOffset.y)
-  if (distance < EPSILON) {
-    return { x: 0, y: 0 }
-  }
-
-  const magnitude = -Math.log(factor) * strength
-  return {
-    x: (centerOffset.x / distance) * magnitude,
-    y: (centerOffset.y / distance) * magnitude,
   }
 }
 
