@@ -50,11 +50,15 @@ export type ActorActivity = {
   /** Stable actor id; drives the color and the deterministic separation direction. */
   actor: string
   /**
-   * Layout-space positions of the files this actor is currently acting on, within the
-   * controller's recency window. These are the action targets the user accelerates
-   * toward (Gource's `action->target->getAbsolutePos()`); the user drives toward their
-   * average, exactly like Gource averaging its active actions. Empty when the actor has
-   * gone quiet: it then has no force pulling it and coasts to a stop under friction.
+   * Layout-space positions of the files this actor is acting on, **most-recent first**:
+   * `touched[0]` is the file it is touching right now (its current action target), and
+   * any further entries are the immediately-preceding files within the controller's short
+   * recency window. The user chases the FIRST entry (the current file) and only leans
+   * gently toward the rest, so it visibly travels to each new file as the work moves
+   * instead of parking at the static average of everything it has touched (the old
+   * behavior, which made a busy actor rest in the dense middle and bounce between files).
+   * Empty when the actor has gone quiet: it then has no force pulling it and coasts to a
+   * stop under friction.
    */
   touched: Vec2[]
   /** Epoch ms of the actor's most recent activity, for the idle fade (Gource's `last_action`). */
@@ -115,10 +119,24 @@ export type ActorUserOptions = {
   /**
    * Friction coefficient that bleeds the acceleration off each frame as
    * `accel *= max(0, 1 - friction * dt)` (Gource's `user_friction`). Higher friction
-   * stops the user sooner; this is what rolls it to rest. Defaults to
-   * {@link DEFAULT_FRICTION}.
+   * stops the user sooner; this is what rolls it to rest. runewood defaults this WELL
+   * ABOVE Gource's `1`: Gource's weak friction lets a user keep ~98% of its momentum per
+   * frame, so in our integration it overshoots its file and oscillates back and forth
+   * between the files it just touched (the user's "springy / bouncy" complaint). A
+   * heavier friction makes the user GLIDE in and settle without that bounce, which is the
+   * Gource-on-screen feel we are after. Defaults to {@link DEFAULT_FRICTION}.
    */
   friction?: number
+  /**
+   * Critical-damping coefficient on the action pull, in per-second units. The pull toward
+   * the current file (and the brake within {@link actionDist}) is a spring; left undamped
+   * it overshoots and oscillates. This subtracts a velocity-proportional term from the
+   * action force (`accel -= approachDamping * velocity`) so the user eases to rest beside
+   * its file instead of springing past it and oscillating. Higher is more glide-and-rest,
+   * lower is springier. Defaults to {@link DEFAULT_APPROACH_DAMPING}; `0` restores the raw
+   * (springy) Gource pull.
+   */
+  approachDamping?: number
   /**
    * How long after its last action, in milliseconds, a user stays fully present before
    * it begins fading (Gource's `user_idle_time`, in seconds, here exposed in ms). An
@@ -154,8 +172,31 @@ const DEFAULT_PERSONAL_SPACE_DIST = 100
 /** Gource's `max_user_speed` (its `gource_settings.cpp`): the acceleration clamp, in layout units per second. */
 const DEFAULT_MAX_USER_SPEED = 500
 
-/** Gource's `user_friction` (its `gource_settings.cpp`): the per-second acceleration bleed coefficient. */
-const DEFAULT_FRICTION = 1
+/**
+ * The per-second acceleration-bleed coefficient. Gource ships `user_friction = 1`, but at
+ * that value a user keeps most of its momentum each frame and overshoots its file, bouncing
+ * back and forth between recently-touched files in our integration. runewood damps harder so
+ * the user glides in and settles smoothly (the user wants smooth, not springy); see
+ * {@link ActorUserOptions.friction}.
+ */
+const DEFAULT_FRICTION = 6
+
+/**
+ * Default critical-damping coefficient on the action pull (per second). Sized so the
+ * approach to a file is essentially critically damped at the {@link DEFAULT_FRICTION}
+ * friction: the user eases up to its resting band and stops, rather than springing past it
+ * and oscillating. See {@link ActorUserOptions.approachDamping}.
+ */
+const DEFAULT_APPROACH_DAMPING = 8
+
+/**
+ * How strongly the user leans toward the files it touched just BEFORE its current one,
+ * relative to the full pull toward the current file (`touched[0]`). Kept small so the user
+ * decisively follows the file it is acting on right now and only drifts a little toward its
+ * immediate predecessors, instead of parking at the average of the whole set (which left it
+ * stranded in the dense middle, barely moving while beams kept firing).
+ */
+const TRAILING_TARGET_WEIGHT = 0.15
 
 /**
  * Gource's `user_idle_time` of three seconds (its `gource_settings.cpp`), in ms: how
@@ -226,6 +267,15 @@ export class ActorUser {
    */
   private accel: Vec2
 
+  /**
+   * Whether this frame's {@link applyForceToActions} braked the user against its current
+   * file (it was inside `actionDist`). Set there, consumed and reset in {@link step}: when
+   * set, the integrator applies the extra {@link ActorUserOptions.approachDamping} so the
+   * user critically damps to rest beside the file rather than springing back out and
+   * oscillating. Coasting frames (no brake) settle on friction alone.
+   */
+  private brakedTowardTarget: boolean
+
   private readonly options: Required<ActorUserOptions>
 
   /**
@@ -237,12 +287,14 @@ export class ActorUser {
     this.actor = actor
     this.pos = { x: spawn.x, y: spawn.y }
     this.accel = { x: 0, y: 0 }
+    this.brakedTowardTarget = false
     this.options = {
       beamDist: options.beamDist ?? DEFAULT_BEAM_DIST,
       actionDist: options.actionDist ?? DEFAULT_ACTION_DIST,
       personalSpaceDist: options.personalSpaceDist ?? DEFAULT_PERSONAL_SPACE_DIST,
       maxUserSpeed: options.maxUserSpeed ?? DEFAULT_MAX_USER_SPEED,
       friction: options.friction ?? DEFAULT_FRICTION,
+      approachDamping: options.approachDamping ?? DEFAULT_APPROACH_DAMPING,
       idleMs: options.idleMs ?? DEFAULT_IDLE_MS,
       fadeMs: options.fadeMs ?? DEFAULT_FADE_MS,
       size: options.size ?? DEFAULT_SIZE,
@@ -255,32 +307,33 @@ export class ActorUser {
   }
 
   /**
-   * Adds the force pulling this user toward its action targets, the port of Gource's
-   * `applyForceToActions` + `applyForceAction`. The user drives toward the AVERAGE of
-   * its current action targets (Gource averages its active actions): beyond `beamDist`
-   * it accelerates toward them with a force that grows with the overshoot, and within
-   * `actionDist` it is repelled so it brakes to rest just beside the file rather than
-   * driving onto it. Between the two it coasts. With no targets there is no force and it
-   * rolls to a stop under friction (the idle case).
+   * Adds the force pulling this user toward its action target, a damped variant of Gource's
+   * `applyForceToActions` + `applyForceAction`. Unlike Gource (which averages all of its
+   * active actions, parking a busy user in the dense middle of everything it touched), the
+   * user chases its CURRENT file: `targets[0]`, the file it is acting on right now. It only
+   * leans gently toward the immediately-preceding files ({@link TRAILING_TARGET_WEIGHT}), so
+   * it visibly travels to each new file as the work moves instead of bouncing between a
+   * static spread (the user's "springy / barely moves" complaints).
    *
-   * Gource caps the number of active actions it averages at three; runewood passes the
-   * already-windowed touched set, so the average over them is the faithful equivalent.
+   * Beyond `beamDist` it accelerates toward the current file, harder the farther it is;
+   * within `actionDist` it brakes so it rests just beside the file rather than driving onto
+   * it; between the two it coasts. Either way the pull is critically damped by
+   * {@link ActorUserOptions.approachDamping} (a velocity-proportional term), so the user
+   * EASES to rest beside its file rather than overshooting and oscillating. With no targets
+   * there is no force and it rolls to a stop under friction (the idle case).
    */
   public applyForceToActions(targets: Vec2[]): void {
     if (targets.length === 0) {
       return
     }
 
-    let sumX = 0
-    let sumY = 0
-    for (const target of targets) {
-      sumX += target.x
-      sumY += target.y
-    }
-    const averageTarget = { x: sumX / targets.length, y: sumY / targets.length }
+    // Chase the CURRENT file (the first, most-recent target), leaning only slightly toward
+    // the immediately-preceding ones, so the user follows the file it is acting on now
+    // rather than the average of the whole window. With a single target this is just it.
+    const target = this.weightedTarget(targets)
 
-    const directionX = averageTarget.x - this.pos.x
-    const directionY = averageTarget.y - this.pos.y
+    const directionX = target.x - this.pos.x
+    const directionY = target.y - this.pos.y
     const distance = Math.hypot(directionX, directionY)
 
     // Coincident with the target: nudge out deterministically (Gource kicks randomly;
@@ -295,21 +348,47 @@ export class ActorUser {
     const unitX = directionX / distance
     const unitY = directionY / distance
 
-    // Within the action distance: repel (brake), so the user rests beside the file.
     if (distance < this.options.actionDist) {
+      // Within the action distance: repel (brake) so the user rests beside the file.
       const brake = this.options.actionDist - distance
       this.accel.x -= brake * unitX
       this.accel.y -= brake * unitY
+      this.brakedTowardTarget = true
       return
     }
 
-    // Beyond the beam distance: accelerate toward the file, harder the farther it is.
     if (distance > this.options.beamDist) {
+      // Beyond the beam distance: accelerate toward the file, harder the farther it is.
       const pull = distance - this.options.beamDist
       this.accel.x += pull * unitX
       this.accel.y += pull * unitY
     }
-    // In the dead zone between actionDist and beamDist: no force, the user coasts.
+    // In the dead zone between actionDist and beamDist: no pull, the user coasts (its
+    // momentum and the friction carry it to rest in the band).
+  }
+
+  /**
+   * The point the user actually chases: its current file ({@link applyForceToActions}'s
+   * `targets[0]`) plus a small lean toward the immediately-preceding files, normalized so
+   * the weights sum to one. Chasing the current file (rather than the plain average of the
+   * whole window) is what makes the user follow its live work instead of parking in the
+   * middle of everything it has touched.
+   */
+  private weightedTarget(targets: Vec2[]): Vec2 {
+    const [ current, ...trailing ] = targets
+    if (trailing.length === 0) {
+      return current
+    }
+
+    let weightSum = 1
+    let sumX = current.x
+    let sumY = current.y
+    for (const previous of trailing) {
+      sumX += previous.x * TRAILING_TARGET_WEIGHT
+      sumY += previous.y * TRAILING_TARGET_WEIGHT
+      weightSum += TRAILING_TARGET_WEIGHT
+    }
+    return { x: sumX / weightSum, y: sumY / weightSum }
   }
 
   /**
@@ -344,16 +423,21 @@ export class ActorUser {
   }
 
   /**
-   * Integrates one frame, the port of the tail of Gource's `RUser::logic`: clamp the
-   * acceleration to the max speed, advance `pos += accel * dt`, then bleed the
-   * acceleration off by the friction (`accel *= max(0, 1 - friction * dt)`). Call AFTER
-   * the per-frame forces ({@link applyForceToActions}, {@link applyForceUser}) have been
-   * added. `dt` is the real elapsed wall time for the frame, in seconds; a non-positive
-   * or non-finite delta holds the user still rather than corrupting it.
+   * Integrates one frame, the port of the tail of Gource's `RUser::logic` with runewood's
+   * added approach damping: clamp the acceleration to the max speed, advance
+   * `pos += accel * dt`, bleed the acceleration off by the friction
+   * (`accel *= max(0, 1 - friction * dt)`), and (when the user braked against its file this
+   * frame) apply the extra critical {@link ActorUserOptions.approachDamping} so it eases to
+   * rest beside the file instead of springing past it. Call AFTER the per-frame forces
+   * ({@link applyForceToActions}, {@link applyForceUser}) have been added. `dt` is the real
+   * elapsed wall time for the frame, in seconds; a non-positive or non-finite delta holds
+   * the user still rather than corrupting it.
    */
   public step(deltaSeconds: number): void {
     if (!Number.isFinite(deltaSeconds) || deltaSeconds <= 0) {
-      // A paused or malformed frame: leave the body untouched.
+      // A paused or malformed frame: leave the body untouched (but clear the brake flag so
+      // a stale brake from the prior frame cannot leak into the next live step).
+      this.brakedTowardTarget = false
       return
     }
 
@@ -371,9 +455,20 @@ export class ActorUser {
     this.pos.x += this.accel.x * deltaSeconds
     this.pos.y += this.accel.y * deltaSeconds
 
-    const friction = Math.max(0, 1 - this.options.friction * deltaSeconds)
-    this.accel.x *= friction
-    this.accel.y *= friction
+    let bleed = this.options.friction
+    if (this.brakedTowardTarget) {
+      // Braking against the file this frame: damp harder so the user critically settles
+      // into its resting band beside the file rather than overshooting and oscillating
+      // back and forth between the files it just touched. Framerate-independent: it is
+      // folded into the same `1 - rate * dt` bleed the friction already uses.
+      bleed += this.options.approachDamping
+    }
+    const retained = Math.max(0, 1 - bleed * deltaSeconds)
+    this.accel.x *= retained
+    this.accel.y *= retained
+
+    // Consume the brake flag: each frame's forces set it afresh.
+    this.brakedTowardTarget = false
   }
 
   /** The full visual of this user this frame: its live position, idle fade, size, and identity color. */

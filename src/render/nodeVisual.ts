@@ -141,10 +141,11 @@ const HEAT_BRIGHTNESS_WEIGHT = 0.6
  * added. A hot, idle node keeps a soft, *steady* glow so it still reads as a
  * glowing orb between touches even with the bloom post-process off, while a cold
  * idle node settles to no glow at all (heat is 0, so this contributes nothing).
- * Kept below 1 so the steady glow is a gentle halo, not a full flare; the touch
- * flash is what spikes it bright.
+ * Kept well below 1 (restrained alongside the smaller {@link import('./scene').GLOW_SCALE})
+ * so a busy cluster's steady glows stay gentle halos that do not bleed together and bury
+ * the tree; the touch flash is what spikes a freshly-touched node bright.
  */
-const HEAT_GLOW_WEIGHT = 0.5
+const HEAT_GLOW_WEIGHT = 0.35
 
 /**
  * Computes the full visual description of a node at playhead time `now`. Pure and

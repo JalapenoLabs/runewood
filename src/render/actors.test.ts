@@ -70,9 +70,8 @@ describe('ActorUser', () => {
     it('flies toward a file beyond the beam distance and ends up near it, not on it', () => {
       // The user starts far from its one file; under the action pull it flies in and,
       // after the physics settles, rests in the NEIGHBORHOOD of the file (a short beam)
-      // rather than far away or stacked exactly on it. Gource's weak friction means it
-      // overshoots and oscillates a little before settling, so the assertion is a bounded
-      // "near, not on" rather than "stops dead at the brake radius".
+      // rather than far away or stacked exactly on it. With runewood's heavier damping it
+      // glides in and settles rather than oscillating, so it lands cleanly in the band.
       const file: Vec2 = { x: 1_000, y: 0 }
       const user = new ActorUser('agent-1', { x: 0, y: 0 }, { beamDist: 100, actionDist: 50 })
 
@@ -105,16 +104,97 @@ describe('ActorUser', () => {
       expect(distanceToFile).toBeGreaterThan(actionDist - 30)
     })
 
-    it('drives toward the AVERAGE of several action targets', () => {
-      // Two files symmetric about x=500: the user should settle near their midpoint.
-      const files: Vec2[] = [{ x: 500, y: 300 }, { x: 500, y: -300 }]
+    it('chases its CURRENT file (the first target), not the average of the whole set', () => {
+      // The fix for "the user parks in the middle of everything it touched and barely
+      // moves": the user drives toward its current file (targets[0]) with only a slight
+      // lean toward the earlier ones. With the current file far up at +y and the trailing
+      // files down at -y, it must settle on the current file's side, NOT at the centroid.
+      const current: Vec2 = { x: 500, y: 400 }
+      const trailingA: Vec2 = { x: 500, y: -300 }
+      const trailingB: Vec2 = { x: 500, y: -300 }
       const user = new ActorUser('agent-1', { x: 0, y: 0 })
 
-      settle(user, files, 800)
+      settle(user, [ current, trailingA, trailingB ], 1_000)
 
-      // Pulled toward the average (500, 0): out along x, and centered on y.
+      // Out along x toward the files...
       expect(user.position.x).toBeGreaterThan(300)
-      expect(user.position.y).toBeCloseTo(0, 0)
+      // ...and clearly on the CURRENT file's (+y) side, not parked at the centroid (~ -67y)
+      // or below zero, proving it follows the live work rather than averaging the spread.
+      expect(user.position.y).toBeGreaterThan(200)
+    })
+
+    it('glides to its file and settles WITHOUT overshooting or oscillating', () => {
+      // The user's "springy / bounces back and forth" complaint: assert the approach is
+      // monotonic (the distance to the file only ever shrinks, never grows back, so it
+      // never overshoots and springs out) and that it comes fully to rest (the last frames
+      // barely move). This is the glide-and-rest feel, the explicit goal of the fix.
+      const file: Vec2 = { x: 900, y: 0 }
+      const user = new ActorUser('agent-1', { x: 0, y: 0 }, { beamDist: 100, actionDist: 50 })
+
+      let previousDistance = Math.hypot(user.position.x - file.x, user.position.y - file.y)
+      let lastStep = Infinity
+      let maxReboundOutward = 0
+      for (let frame = 0; frame < 1_000; frame++) {
+        const before = { ...user.position }
+        user.applyForceToActions([ file ])
+        user.step(1 / 60)
+        const distance = Math.hypot(user.position.x - file.x, user.position.y - file.y)
+        // The approach is monotonic apart from a sub-pixel settle as it eases into its
+        // resting band beside the file (the brake nudges it a hair when it dips just
+        // inside `actionDist`). A real oscillation would rebound outward by tens of units;
+        // assert the largest outward rebound stays sub-pixel, the opposite of springy.
+        maxReboundOutward = Math.max(maxReboundOutward, distance - previousDistance)
+        previousDistance = distance
+        lastStep = Math.hypot(user.position.x - before.x, user.position.y - before.y)
+      }
+
+      // No perceptible overshoot/bounce: any rebound outward is sub-pixel settling, not a
+      // spring back toward where it came from.
+      expect(maxReboundOutward).toBeLessThan(0.5)
+      // It came to rest: the final frame's movement has decayed to essentially nothing.
+      expect(lastStep).toBeLessThan(0.05)
+      // And it rested beside the file, not on it (a short beam).
+      expect(previousDistance).toBeGreaterThan(0)
+      expect(previousDistance).toBeLessThanOrEqual(100 + 1)
+    })
+
+    it('travels to a NEW target when the current file changes, without bouncing back', () => {
+      // Switching the action target must move the user to the new file (it follows the
+      // work), and it must NOT bounce between the old and new positions afterward.
+      const firstFile: Vec2 = { x: 600, y: 0 }
+      const secondFile: Vec2 = { x: -600, y: 0 }
+      const user = new ActorUser('agent-1', { x: 0, y: 0 })
+
+      // Settle on the first file.
+      settle(user, [ firstFile ], 600)
+      const settledOnFirst = { ...user.position }
+      expect(settledOnFirst.x).toBeGreaterThan(300)
+
+      // Now its current file becomes the second; it should travel there and settle.
+      let previousDistance = Math.hypot(user.position.x - secondFile.x, user.position.y - secondFile.y)
+      for (let frame = 0; frame < 1_000; frame++) {
+        user.applyForceToActions([ secondFile ])
+        user.step(1 / 60)
+      }
+      const settledOnSecond = { ...user.position }
+      // It moved across to the new file's side...
+      expect(settledOnSecond.x).toBeLessThan(-300)
+      const distanceToSecond = Math.hypot(settledOnSecond.x - secondFile.x, settledOnSecond.y - secondFile.y)
+      expect(distanceToSecond).toBeLessThanOrEqual(100 + 1)
+
+      // ...and once there it holds (no bounce back toward the old file): re-running the
+      // approach leaves it within a hair of where it settled, never oscillating back out.
+      previousDistance = distanceToSecond
+      let maxReboundOutward = 0
+      for (let frame = 0; frame < 300; frame++) {
+        user.applyForceToActions([ secondFile ])
+        user.step(1 / 60)
+        const distance = Math.hypot(user.position.x - secondFile.x, user.position.y - secondFile.y)
+        maxReboundOutward = Math.max(maxReboundOutward, distance - previousDistance)
+        previousDistance = distance
+      }
+      // No meaningful rebound outward: it does not bounce between the two files.
+      expect(maxReboundOutward).toBeLessThan(0.5)
     })
   })
 

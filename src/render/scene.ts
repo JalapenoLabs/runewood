@@ -778,12 +778,15 @@ const MIN_EDGE_SCREEN_PX = 1.5
 /**
  * How far past the core disc the soft glow sprite spreads, as a multiple of the
  * node radius. The sprite is a radial gradient that fades to nothing at its rim,
- * so this is the *reach* of the halo, not a hard ring: at ~3.2x the glow blooms
- * generously around the core (the "nice big glow" the user wanted) while still
- * trailing off softly. The big visible reach is what keeps the forest glowing with
- * the heavy bloom post-process off. A judgment call worth tuning to taste.
+ * so this is the *reach* of the halo, not a hard ring. This is RESTRAINED on purpose
+ * (it used to be 3.2x): with the base node radius aligned to the layout's file spacing,
+ * a 3.2x glow on every file bled the soft halos into each other and buried the tree (the
+ * user's "cluttered / buried" complaint, of which the big soft glows were the main
+ * culprit). At ~1.8x a file reads as a small crisp dot with a subtle glow, and a dense
+ * cluster stays legible instead of melting into one bright blob, while a hot/flashing node
+ * still blooms clearly. A judgment call worth tuning to taste.
  */
-const GLOW_SCALE = 3.2
+const GLOW_SCALE = 1.8
 
 /**
  * The minimum on-screen size, in screen pixels, the highlight reticle's working radius

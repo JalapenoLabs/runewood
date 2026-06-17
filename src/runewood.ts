@@ -878,11 +878,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   /**
    * Turns the reducer's actor tracking into drawable activity for the Gource `RUser`
    * physics (the actor's action targets + last-active time). It resolves the actor's
-   * touched paths to their live physics positions: these are the files the user
-   * accelerates toward this frame. An actor whose every touched file has no body yet
-   * (brand-new this frame) still emits an empty-touched activity so its retained user
-   * keeps coasting and fading rather than vanishing; the user's position is the physics
-   * body, never re-derived here.
+   * touched paths to their live physics positions, the **current file first**: the user
+   * chases `touched[0]` (the file it is acting on right now, the reducer's `recentPath`)
+   * and only leans gently toward its immediate predecessors, so it visibly travels to each
+   * new file as the work moves rather than parking at the static average of everything it
+   * has touched (the user's "springy / barely moves" complaints). An actor whose every
+   * touched file has no body yet (brand-new this frame) still emits an empty-touched
+   * activity so its retained user keeps coasting and fading rather than vanishing; the
+   * user's position is the physics body, never re-derived here.
    *
    * It also keeps each actor's parked `lastCentroid` current (used by the follow camera
    * to frame a quiet actor at where it last worked).
@@ -890,8 +893,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   function buildActorActivities(): ActorActivity[] {
     const activities: ActorActivity[] = []
     for (const track of frameState.actors.values()) {
+      // Order the touched paths current-file-first: the actor's `recentPath` (the file it
+      // is touching this instant) leads, then the rest of the window. Chasing the head of
+      // this list is what makes the user follow its live work instead of the centroid.
+      const orderedPaths = track.recentPath
+        ? [ track.recentPath, ...track.touchedPaths.filter((path) => path !== track.recentPath) ]
+        : track.touchedPaths
       const touched: Vec2[] = []
-      for (const path of track.touchedPaths) {
+      for (const path of orderedPaths) {
         const body = bodies.get(path)
         if (body) {
           touched.push(body.position)

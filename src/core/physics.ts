@@ -746,10 +746,16 @@ const DEFAULT_GRAVITY = 10
 const DEFAULT_DIRECTORY_PADDING = 1.5
 
 /**
- * Default file diameter (Gource `gGourceFileDiameter`): sets both the area each file contributes to
- * its directory's radius and the spacing between the concentric file rings. Gource's value.
+ * File diameter: sets both the area each file contributes to its directory's radius and the spacing
+ * between the concentric file rings. Gource ships `8`; runewood spreads the layout a little wider
+ * (`12`) so the file-ring spacing is comfortably larger than a rendered file dot (base radius ~4)
+ * plus its restrained glow. Combined with the smaller dots + glow, this is what reconciles the
+ * render sizes with the layout so a small tree reads airy and a big tree stays legible (the user's
+ * "cluttered / buried" complaint) instead of cramming overlapping glowing orbs together. The dot
+ * size is a fixed layout-unit value (it does not track this), so widening the spacing here directly
+ * opens the gaps between files.
  */
-const DEFAULT_FILE_DIAMETER = 8
+const DEFAULT_FILE_DIAMETER = 12
 
 /**
  * Default file ease speed (Gource `RFile::speed`): the per-second fraction of the remaining distance

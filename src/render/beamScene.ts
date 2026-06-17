@@ -43,14 +43,15 @@ import { ActorUser } from './actors'
  *
  * Each actor is an {@link ActorUser} (the port of Gource's `src/user.cpp`): a retained
  * physics body with a position and an acceleration. Every frame the controller hands it
- * the live positions of the files it is acting on (resolved from the node sim) and the
- * other actors; the user accelerates toward the average of its files when beyond its
- * beam distance, brakes within its action distance, repels actors inside its personal
- * space, clamps to its max speed, integrates its position, and bleeds the acceleration
- * off by friction. So an actor naturally flies to its file and eases to rest beside it
- * (a short beam) with no hand-authored animation, and coasts to a stop and fades when it
- * goes quiet. The motion is driven by the real frame delta, like the force-directed node
- * sim it rides above; only the fade is a pure function of the playhead.
+ * the live positions of the files it is acting on (resolved from the node sim, current
+ * file first) and the other actors; the user accelerates toward its CURRENT file when
+ * beyond its beam distance, brakes within its action distance, repels actors inside its
+ * personal space, clamps to its max speed, integrates its position, and bleeds the
+ * acceleration off by a heavy friction plus an approach damping. So an actor naturally
+ * glides to the file it is touching now and eases to rest beside it (a short beam) without
+ * springing or bouncing between files, with no hand-authored animation, and coasts to a
+ * stop and fades when it goes quiet. The motion is driven by the real frame delta, like
+ * the force-directed node sim it rides above; only the fade is a pure function of the playhead.
  *
  * The controller (#9) owns the playhead and the active event window; it spawns
  * beams via {@link spawn}/{@link spawnPulse}, supplies actor activity + the live node

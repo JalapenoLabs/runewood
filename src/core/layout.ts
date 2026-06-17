@@ -483,13 +483,17 @@ export type HeatOptions = {
   coolingMs?: number
 }
 
-// Node discs were reading too small in the playground, so the base size is generous.
-// The baseline no longer scales with cumulative touches (that was the "permanently
-// growing" bug); a heavily-touched node only gets a small, saturating importance
-// bump on top, so the resting forest reads as roughly uniform discs that pulse on a
-// touch rather than swelling forever.
-const DEFAULT_BASE_RADIUS = 7
-const DEFAULT_IMPORTANCE_BUMP = 5
+// The base disc size is kept CLOSE to Gource's file radius (its `fileDiameter / 2`, so ~4
+// at the default file diameter of 8) on purpose: the previous generous radius of 7 plus a
+// big glow drew each file as a ~40px glowing orb on a layout that spaces files only 8 apart,
+// so a small tree became overlapping bleeding orbs that buried everything (the user's
+// "cluttered / buried" complaint). A file now reads as a small crisp dot the size of its
+// layout slot, with a restrained glow ({@link import('../render/scene').GLOW_SCALE}), so the
+// forest is airy like Gource. The baseline still does not scale with cumulative touches (the
+// old "permanently growing" bug); a heavily-touched node gets only a small, saturating
+// importance bump, and the touch pulse briefly swells it.
+const DEFAULT_BASE_RADIUS = 4
+const DEFAULT_IMPORTANCE_BUMP = 2
 const DEFAULT_IMPORTANCE_SATURATION = 6
 const DEFAULT_TOUCH_SATURATION = 4
 const DEFAULT_COOLING_MS = 10_000
