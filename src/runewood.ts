@@ -36,7 +36,7 @@ import { compilePathFilter } from './core/filter'
 
 // Render
 import { Camera, autoFrame } from './render/camera'
-import { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
+import { recentActivityBounds, isAutoCameraMode, followActorBounds } from './render/cameraMode'
 import { resolveBloomQuality } from './render/bloom'
 import { PixiBackend } from './render/pixiBackend'
 import { actorAlpha } from './render/actors'
@@ -102,6 +102,20 @@ export type RunewoodController = {
    * view). New code should prefer {@link RunewoodController.setCameraMode}.
    */
   follow: (shouldFollow: boolean) => void
+  /**
+   * Lock the camera onto a single actor (the Gource click-to-follow), or release
+   * with `null`. While an actor is followed the camera eases each frame to keep that
+   * actor centered (framing it plus the files it is touching) at a closer "follow"
+   * zoom, overriding the {@link RunewoodController.setCameraMode} auto-framing. This
+   * is the mechanism only: the HOST decides when to call it, e.g. on an `actorClick`.
+   *
+   * The follow auto-releases when the actor no longer exists (faded out / gone),
+   * falling back to the current camera mode, and a manual pan / wheel-zoom releases
+   * it too (the same gesture that flips the mode to `manual`), so the user can take
+   * over. The followed actor is reflected on {@link RunewoodController.getState} as
+   * `followedActor` so a host overlay can show or offer to release it.
+   */
+  followActor: (actor: string | null) => void
   /**
    * Re-read the container size and resize the renderer. Called automatically by an
    * internal `ResizeObserver`; exposed for hosts that resize imperatively or run
@@ -278,6 +292,13 @@ export type RunewoodPlaybackState = {
   following: boolean
   /** The active camera mode, so a host overlay can reflect overview / follow / manual. */
   cameraMode: CameraMode
+  /**
+   * The actor the camera is currently locked onto (the Gource click-to-follow), or
+   * `null` when not following one. A host overlay reads this to reflect the lock and
+   * offer a release affordance. Set via {@link RunewoodController.followActor}; the
+   * camera auto-clears it when the actor is gone or the user pans / wheel-zooms.
+   */
+  followedActor: string | null
 }
 
 /** Construction options for {@link createRunewood}; every field has a sensible default. */
@@ -477,6 +498,24 @@ const FOLLOW_ACTIVITY_WINDOW_MS = 5_000
 const FOLLOW_REGION_PADDING = 240
 
 /**
+ * The minimum half-extent (world units) of the box framed around a followed actor
+ * (issue #20 click-to-follow). It sets the close-up "lock onto a user" zoom: a lone
+ * actor is framed in a box at least this wide on each side of its orb, so the camera
+ * holds a steady, readable follow distance instead of slamming to the tightest zoom
+ * on a zero-area point. Smaller pulls the camera in tighter on the followed actor;
+ * larger pulls it back. Comfortably tighter than the `follow`-mode region so a
+ * single locked actor reads as a deliberate close-up.
+ */
+const FOLLOW_ACTOR_MIN_HALF_EXTENT = 160
+
+/**
+ * World-space padding around the followed-actor box, so the actor's orb and its
+ * touched files are not framed flush against the screen edge. Mirrors the active
+ * region padding's intent at the closer follow distance.
+ */
+const FOLLOW_ACTOR_PADDING = 80
+
+/**
  * Creates a Runewood controller mounted in `container` and returns it
  * synchronously. The pixi backend initializes asynchronously in the background
  * (pixi v8's device bring-up is async); any `ingest`/`seed` made before it is
@@ -576,6 +615,14 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // The last bounds the `follow` camera framed, held so a quiet stretch (nothing
   // recently active) gently keeps the current view instead of snapping to origin.
   let lastFollowBounds: WorldBounds | null = null
+
+  // The actor the camera is LOCKED onto (the Gource click-to-follow), or null when
+  // not following one. While set, the tick eases the camera to keep this actor
+  // centered at a closer follow zoom, overriding the `cameraMode` auto-framing. It
+  // auto-releases when the actor's orb is gone (faded out) and is cleared by a manual
+  // pan / wheel-zoom (the same gesture that flips to `manual`). Set via `followActor`
+  // and reflected on `getState().followedActor`.
+  let followedActor: string | null = null
 
   // The typed event surface (issue #10). Dependency-free; cleared on destroy.
   const emitter = new Emitter<RunewoodEventMap>()
@@ -774,21 +821,35 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const physicsDeltaMs = prefersReducedMotion() ? deltaMs * REDUCED_MOTION_STEP_SCALE : deltaMs
     physics.step(physicsDeltaMs)
 
-    // 4. Frame the forest per the camera mode. `overview` fits the whole active
-    //    tree; `follow` (Gource-style) frames only the recently-active region at a
-    //    closer zoom and travels with the action; `manual` leaves the camera under
-    //    user control and frames nothing. Under reduced motion we snap straight to
-    //    the framed transform (no glide) so the camera still tracks the action but
-    //    does not animate; otherwise we ease toward it framerate-independently.
-    if (isAutoCameraMode(cameraMode)) {
-      const bounds = cameraMode === 'follow' ? followRegionBounds(now) : activeRegionBounds(bodies)
+    // 4. Frame the forest. A LOCKED followed actor (the Gource click-to-follow) wins
+    //    over the camera mode: the camera eases to keep that actor centered at a
+    //    closer follow zoom. The follow auto-releases when the actor's orb is gone
+    //    (`followedActorBounds` returns null), reverting to the mode below. Otherwise
+    //    the camera mode decides: `overview` fits the whole active tree; `follow`
+    //    (Gource-style) frames only the recently-active region and travels with the
+    //    action; `manual` leaves the camera under user control and frames nothing.
+    //    Under reduced motion we snap to the framed transform (no glide); otherwise
+    //    we ease toward it framerate-independently.
+    let framingBounds: WorldBounds | null = null
+    if (followedActor !== null) {
+      framingBounds = followedActorBounds()
+      // A null result means the followed actor faded out / is gone: auto-release the
+      // lock and fall through to the current camera mode this same frame.
+      if (framingBounds === null) {
+        followedActor = null
+      }
+    }
+    if (framingBounds === null && isAutoCameraMode(cameraMode)) {
+      framingBounds = cameraMode === 'follow' ? followRegionBounds(now) : activeRegionBounds(bodies)
+    }
+    if (framingBounds !== null) {
       if (prefersReducedMotion()) {
-        camera.frameBounds(bounds)
+        camera.frameBounds(framingBounds)
       }
       else {
         const eased = autoFrame({
           from: { center: camera.center, zoom: camera.zoom },
-          bounds,
+          bounds: framingBounds,
           viewport: camera.viewport,
           deltaSeconds: deltaMs / 1000,
         })
@@ -1099,6 +1160,36 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   }
 
   /**
+   * The world bounds to frame while LOCKED onto {@link followedActor} (the Gource
+   * click-to-follow), or `null` when the followed actor no longer has a live orb
+   * (it faded out / was never present). It resolves the actor's live orb position
+   * and the live positions of the files it is touching, then defers to the pure
+   * {@link followActorBounds} to box them at the close-up follow zoom. A `null`
+   * result is the auto-release signal the tick acts on: it drops the follow and
+   * reverts to the current camera mode.
+   */
+  function followedActorBounds(): WorldBounds | null {
+    if (followedActor === null) {
+      return null
+    }
+    const orbPosition = beamScene?.actorOrbPosition(followedActor) ?? null
+    const track = frameState.actors.get(followedActor)
+    const touchedPositions: Vec2[] = []
+    for (const path of track?.touchedPaths ?? []) {
+      const body = bodies.get(path)
+      if (body) {
+        touchedPositions.push(body.position)
+      }
+    }
+    return followActorBounds({
+      actorPosition: orbPosition,
+      touchedPositions,
+      minHalfExtent: FOLLOW_ACTOR_MIN_HALF_EXTENT,
+      padding: FOLLOW_ACTOR_PADDING,
+    })
+  }
+
+  /**
    * The follow camera's node samples, gathered in a single walk of the folded tree:
    * each node's live spring position paired with its `lastTouchedAt`, so the pure
    * bounds function can window by recency. Walking the tree (rather than iterating
@@ -1321,6 +1412,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         // yanking the view back to the active region each frame; the view sticks
         // like a maps app. `setCameraMode('overview'|'follow')` re-engages auto.
         cameraMode = 'manual'
+        // The same gesture releases a click-to-follow lock so the user can take over;
+        // otherwise the follow would yank the view straight back to the actor.
+        followedActor = null
       }
       // Pan by the incremental delta since the last move so the world tracks the
       // cursor 1:1. Even sub-threshold moves pan; the threshold only gates whether
@@ -1397,6 +1491,9 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     const anchorWorld = camera.screenToWorld(screenAnchor)
     camera.zoomBy(factor, screenAnchor)
     cameraMode = 'manual'
+    // A wheel zoom is a manual take-over too: release any click-to-follow lock so the
+    // user's chosen view sticks instead of the follow snapping it back to the actor.
+    followedActor = null
     // Jelly wobble (A): a small radial impulse from the zoom anchor toward the forest center, so the
     // nodes get nudged out (zoom in) or in (zoom out) and spring back. Skipped under reduced motion.
     if (!prefersReducedMotion()) {
@@ -1555,6 +1652,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       // follow off -> manual (free view). New code should call `setCameraMode`.
       cameraMode = shouldFollow ? 'follow' : 'manual'
     },
+    followActor(actor: string | null): void {
+      // Lock the camera onto this actor (or release with null). The tick reads
+      // `followedActor` each frame and eases toward the actor's framing, overriding
+      // the camera mode, so this takes effect on the very next draw with no queueing.
+      // The lock auto-releases when the actor's orb is gone and on a manual pan / zoom.
+      followedActor = actor
+    },
     on(event, handler) {
       return emitter.on(event, handler)
     },
@@ -1570,6 +1674,7 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
         speed: timeline.speed,
         following: timeline.live,
         cameraMode,
+        followedActor,
       }
     },
     highlight(paths: string[], highlightOptions: HighlightOptions = {}): RunewoodHighlight {

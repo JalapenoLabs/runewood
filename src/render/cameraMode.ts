@@ -133,3 +133,81 @@ export function recentActivityBounds(
     max: { x: maxX + padding, y: maxY + padding },
   }
 }
+
+/** Inputs to {@link followActorBounds}. */
+export type FollowActorBoundsOptions = {
+  /**
+   * The followed actor's live world position (its orb), or `null` when the actor
+   * no longer exists (faded out / gone). A `null` position is the auto-release
+   * signal: the function returns `null` so the caller drops the follow and falls
+   * back to its current camera mode.
+   */
+  actorPosition: Vec2 | null
+  /**
+   * The live world positions of the files the actor is currently touching, framed
+   * alongside the actor so its work stays on screen rather than only its orb. May
+   * be empty (the actor is between files), in which case only the actor + the
+   * minimum half-extent define the box.
+   */
+  touchedPositions: Vec2[]
+  /**
+   * The minimum half-width / half-height (world units) the framed box is grown to
+   * around the actor, so a lone actor (or an actor and a single nearby file) is
+   * framed at a steady, readable follow zoom instead of collapsing to a point and
+   * slamming to the max zoom. The Gource "lock onto a user" close-up distance.
+   */
+  minHalfExtent: number
+  /** World-space padding added on every side of the framed region. */
+  padding: number
+}
+
+/**
+ * Computes the world bounds the camera should frame while LOCKED onto a single
+ * followed actor (the Gource click-to-follow), or `null` when the actor is gone.
+ *
+ * The box encloses the actor's orb plus every file it is currently touching, then
+ * is grown to at least `minHalfExtent` on each side around the actor so a lone
+ * actor is framed at a stable close-up follow zoom rather than collapsing to a
+ * point. It is padded like the other framing functions. A `null` `actorPosition`
+ * means the actor no longer exists, and the function returns `null` so the caller
+ * auto-releases the follow and reverts to its current camera mode.
+ *
+ * Pure and I/O-free (no clock, no DOM): given the same positions it always yields
+ * the same box, so it is unit-tested in isolation and the live camera easing stays
+ * a thin wrapper that feeds it this frame's positions and eases toward the result.
+ */
+export function followActorBounds(options: FollowActorBoundsOptions): WorldBounds | null {
+  const { actorPosition, touchedPositions, minHalfExtent, padding } = options
+
+  // The actor is gone (faded out): signal the caller to release the follow.
+  if (actorPosition === null) {
+    return null
+  }
+
+  // Start the box at the actor's orb, then stretch it to include every file the
+  // actor is touching this frame so its live work is framed alongside it.
+  let minX = actorPosition.x
+  let minY = actorPosition.y
+  let maxX = actorPosition.x
+  let maxY = actorPosition.y
+  for (const position of touchedPositions) {
+    minX = Math.min(minX, position.x)
+    minY = Math.min(minY, position.y)
+    maxX = Math.max(maxX, position.x)
+    maxY = Math.max(maxY, position.y)
+  }
+
+  // Grow the box to at least the minimum half-extent AROUND THE ACTOR on each
+  // side, so the followed actor stays centered at a steady close-up zoom even when
+  // it is touching nothing (or only a file right beside it). Without this floor a
+  // lone actor would frame a zero-area box and snap to the tightest zoom.
+  minX = Math.min(minX, actorPosition.x - minHalfExtent)
+  minY = Math.min(minY, actorPosition.y - minHalfExtent)
+  maxX = Math.max(maxX, actorPosition.x + minHalfExtent)
+  maxY = Math.max(maxY, actorPosition.y + minHalfExtent)
+
+  return {
+    min: { x: minX - padding, y: minY - padding },
+    max: { x: maxX + padding, y: maxY + padding },
+  }
+}

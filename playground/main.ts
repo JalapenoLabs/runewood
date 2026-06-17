@@ -122,6 +122,7 @@ function main(): void {
   const avatarsToggle = requireElement<HTMLInputElement>('avatars')
   const controlsToggle = requireElement<HTMLInputElement>('controls')
   const playPauseButton = requireElement<HTMLButtonElement>('play-pause')
+  const releaseFollowButton = requireElement<HTMLButtonElement>('release-follow')
   const panel = requireElement<HTMLDivElement>('panel')
   const panelRestore = requireElement<HTMLButtonElement>('panel-restore')
   const legendGrid = requireElement<HTMLDivElement>('legend-grid')
@@ -189,6 +190,39 @@ function main(): void {
   controller.seed(seedPaths())
   wireControllerLogging(controller)
   wireHoverTooltip(controller, hoverTooltip)
+
+  // Click-to-follow (Gource, issue #20): clicking an actor's orb locks the camera onto
+  // it via `followActor`; clicking empty space, pressing Escape, or the Release button
+  // releases it with `followActor(null)`. The library already auto-releases when the
+  // actor fades out and on a manual pan / wheel-zoom, so this host only wires the
+  // intent. `clickHitActor` latches whether the just-finished click landed on an actor,
+  // so a pointerup that hit empty space (no `actorClick`) releases the lock.
+  let clickHitActor = false
+  function wireActorFollow(activeController: ReturnType<typeof createRunewood>): void {
+    activeController.on('actorClick', (payload) => {
+      clickHitActor = true
+      activeController.followActor(payload.actor)
+    })
+  }
+  wireActorFollow(controller)
+
+  // Release on a click that hit empty space: the canvas pointerup fires after the
+  // library has emitted any `actorClick` for the same gesture, so checking (and
+  // resetting) the latch here tells us the click missed every actor.
+  canvasHost.addEventListener('pointerup', () => {
+    if (!clickHitActor) {
+      controller.followActor(null)
+    }
+    clickHitActor = false
+  })
+
+  // Release on Escape and on the Release button, the two explicit affordances.
+  document.addEventListener('keydown', (keyboardEvent) => {
+    if (keyboardEvent.key === 'Escape') {
+      controller.followActor(null)
+    }
+  })
+  releaseFollowButton.addEventListener('click', () => controller.followActor(null))
 
   // The set of file paths the live forest currently knows about, accumulated from
   // the synthetic stream so the "Simulate CI on a PR" button can pick a handful of
@@ -386,6 +420,7 @@ function main(): void {
     controller.seed(seedPaths())
     wireControllerLogging(controller)
     wireHoverTooltip(controller, hoverTooltip)
+    wireActorFollow(controller)
     // Repoint the stream's sink at the new controller by recreating nothing: the
     // closure already captures `controller` by reference through the outer binding,
     // so re-reading it on each emit picks up the rebuild. We just resume if needed.
@@ -425,6 +460,7 @@ function main(): void {
     controller.seed(seedPaths())
     wireControllerLogging(controller)
     wireHoverTooltip(controller, hoverTooltip)
+    wireActorFollow(controller)
 
     // A brand-new generator starts the fake forest over from empty, rather than
     // continuing the previous run's retained tree.
@@ -444,6 +480,15 @@ function main(): void {
     const state = controller.getState()
     stateReadout.textContent = JSON.stringify(state, null, 2)
     syncCameraModeButtons(state.cameraMode)
+    // Show the Release affordance only while a click-to-follow lock is live, and label
+    // it with the followed actor. The state dump above already surfaces `followedActor`.
+    if (state.followedActor !== null) {
+      releaseFollowButton.hidden = false
+      releaseFollowButton.textContent = `Release follow (${state.followedActor})`
+    }
+    else {
+      releaseFollowButton.hidden = true
+    }
   }, STATE_READOUT_INTERVAL_MS)
 }
 

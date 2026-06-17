@@ -66,8 +66,15 @@ describe('public type exports', () => {
       speed: number
       following: boolean
       cameraMode: CameraMode
+      followedActor: string | null
     }>()
     expectTypeOf<RunewoodController['getState']>().returns.toEqualTypeOf<RunewoodPlaybackState>()
+  })
+
+  it('exposes the click-to-follow surface (followActor accepts an actor id or null)', () => {
+    expectTypeOf<RunewoodController['followActor']>().parameter(0).toEqualTypeOf<string | null>()
+    expectTypeOf<RunewoodController['followActor']>().returns.toEqualTypeOf<void>()
+    expectTypeOf<RunewoodPlaybackState>().toHaveProperty('followedActor').toEqualTypeOf<string | null>()
   })
 
   it('exposes the camera-mode surface (option, setter, state, and the mode union)', () => {

@@ -26,6 +26,7 @@ export type {
   RecentNodeSample,
   RecentActorSample,
   RecentActivityBoundsOptions,
+  FollowActorBoundsOptions,
 } from './render/cameraMode'
 export type { AvatarResolver } from './render/avatarRegistry'
 
@@ -50,7 +51,7 @@ export { HighlightRegistry, highlightPulse } from './core/highlight'
 export { nearestWithinRadius } from './core/picking'
 export { compilePathFilter } from './core/filter'
 export { AvatarRegistry } from './render/avatarRegistry'
-export { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
+export { recentActivityBounds, isAutoCameraMode, followActorBounds } from './render/cameraMode'
 
 // The public controller: the single entry point a host mounts against a div.
 export { createRunewood } from './runewood'
