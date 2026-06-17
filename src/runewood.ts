@@ -20,6 +20,7 @@ import type { PathFilter } from './core/filter'
 import type { VisibleNode } from './core/collapse'
 import type { CameraMode, RecentNodeSample, RecentActorSample } from './render/cameraMode'
 import type { Hsl } from './core/theme'
+import type { AvatarResolver } from './render/avatarRegistry'
 
 // Core
 import { Timeline } from './core/timeline'
@@ -39,6 +40,7 @@ import { recentActivityBounds, isAutoCameraMode } from './render/cameraMode'
 import { resolveBloomQuality } from './render/bloom'
 import { PixiBackend } from './render/pixiBackend'
 import { actorAlpha } from './render/actors'
+import { AvatarRegistry } from './render/avatarRegistry'
 
 /**
  * The public, imperative controller for a Runewood visualization (issue #9). This
@@ -148,6 +150,20 @@ export type RunewoodController = {
   highlight: (paths: string[], options?: HighlightOptions) => RunewoodHighlight
   /** Drop every active highlight group at once (e.g. all CI runs finished). */
   clearHighlights: () => void
+  /**
+   * Supply or update an actor's avatar image at runtime (issue #20), overriding the
+   * construction-time {@link RunewoodOptions.resolveAvatar} resolver for that actor.
+   * The canonical use is a host that fetches an agent's icon AFTER mounting the
+   * visualization (e.g. Seraphim resolving an agent's avatar URL once it loads) and
+   * pushing it in here, so the colored orb swaps to the photo the frame its image
+   * finishes loading. A data URI is a valid `url`, so a host with no CDN can inline
+   * the image.
+   *
+   * Passing `null` clears this actor's override, falling back to the resolver option
+   * (and then to the colored orb when that yields nothing). The override always wins
+   * over the resolver; see the resolution precedence on {@link RunewoodOptions.resolveAvatar}.
+   */
+  setAvatar: (actor: string, url: string | null) => void
   /**
    * Tear everything down: stop the RAF loop, disconnect the observer and media
    * query, drop every event subscriber, dispose every scene and the backend
@@ -387,6 +403,22 @@ export type RunewoodOptions = {
   scene?: SceneOptions
   /** Tuning forwarded to the retained beam scene (particles / actor orbs). */
   beams?: BeamSceneOptions
+  /**
+   * Supply an avatar image per actor (issue #20): given an actor's id, return an image
+   * URL to draw as that actor's avatar (a circular image with the actor's hashed color
+   * as a ring), or `null` / `undefined` to draw the existing colored orb instead. A
+   * data URI is a valid URL, so a host with no CDN can hand back an inline image and
+   * the feature works fully offline.
+   *
+   * This is the primary, framework-agnostic avatar API; a host can also push or update
+   * one avatar at runtime via {@link RunewoodController.setAvatar} (e.g. once it fetches
+   * an agent icon). Resolution precedence is: a `setAvatar` override beats this
+   * resolver beats none (the colored orb). The image loads lazily and is cached by URL;
+   * until it loads (or if it has no URL / fails to load), the actor draws the colored
+   * orb, then swaps to the avatar the frame the image finishes loading. Seraphim's
+   * watch page passes each agent's icon URL here.
+   */
+  resolveAvatar?: AvatarResolver
   /** Tuning forwarded to the retained label scene (LOD policy). */
   labels?: LabelLodOptions
   /**
@@ -582,6 +614,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
   // orb uses, keeping the label exactly as present as its orb through the linger and
   // idle pulse. The beam scene is constructed from the same resolved options.
   const actorVisualOptions: ActorUserOptions = resolveBeamSceneOptions(options).actors ?? {}
+
+  // The avatar registry (issue #20): folds the construction-time `resolveAvatar`
+  // resolver and any runtime `setAvatar` overrides into one resolution policy. The beam
+  // scene reads avatar URLs through its `resolve` each frame; the pure precedence
+  // (override beats resolver beats none) lives in the registry and is unit-tested. Held
+  // for the controller's life so `setAvatar` takes effect on the next frame's draw.
+  const avatars = new AvatarRegistry(options.resolveAvatar)
 
   // Click hit slop in screen pixels, converted to world units per click via zoom.
   const hitRadiusPx = options.hitRadius ?? DEFAULT_HIT_RADIUS_PX
@@ -1171,7 +1210,17 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     // Gource `RUser` idle time, while leaving any finer per-actor tuning the host passed
     // via `beams.actors` intact. An explicit `beams.actors.idleMs` wins, since it is the
     // more specific surface.
-    beamScene = backend.createBeamScene(resolveBeamSceneOptions(options))
+    // Thread the avatar resolver into the beam scene so an actor can draw its avatar in
+    // place of the colored orb. The registry folds the `resolveAvatar` option and any
+    // runtime `setAvatar` overrides, so the beam scene reads one flat function and stays
+    // framework-agnostic; it is only consulted when the host supplied avatars at all.
+    beamScene = backend.createBeamScene({
+      ...resolveBeamSceneOptions(options),
+      // Always thread the registry's resolver so a runtime `setAvatar` works even when no
+      // `resolveAvatar` option was given at construction. The beam scene builds its avatar
+      // texture cache lazily on the first non-null URL, so an all-orbs forest stays free.
+      resolveAvatar: (actor) => avatars.resolve(actor),
+    })
     labelScene = backend.createLabelScene(options.labels)
 
     camera.setViewport(width, height)
@@ -1544,6 +1593,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
     },
     clearHighlights(): void {
       highlights.clear()
+    },
+    setAvatar(actor: string, url: string | null): void {
+      // Update the registry immediately: the beam scene reads avatar URLs through the
+      // registry's `resolve` each frame, so the override takes effect on the very next
+      // draw whether or not the backend has finished initializing. A `null` clears the
+      // override back to the resolver / colored-orb fallback.
+      avatars.setAvatar(actor, url)
     },
     resize(): void {
       if (ready) {

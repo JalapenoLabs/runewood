@@ -10,7 +10,27 @@ import { createRunewood, colorForPath, themes } from '../src/index'
 import { hslToRgbInt } from '../src/render/color'
 
 // Misc
-import { createSyntheticStream, seedPaths } from './synthetic'
+import { createSyntheticStream, seedPaths, ACTORS } from './synthetic'
+
+/** Background fills for the demo letter avatars, one cycled per actor, distinct from the actor ring hue. */
+const AVATAR_BACKGROUNDS = [ '#3b2f6b', '#1f5b52' ] as const
+
+/** The avatar image's pixel size; small since it is only scaled down to the orb's on-screen size. */
+const AVATAR_PX = 96
+
+/**
+ * Locally generated avatar images for the two demo actors (issue #20), so the avatar
+ * feature is visible in the playground with zero external network: each is a small
+ * canvas-drawn lettered, colored disc baked into a data URI (a valid image URL). The
+ * forest's actor color rings still wrap them, so the avatar reads as that actor. A
+ * host like Seraphim instead returns each agent's real icon URL from `resolveAvatar`.
+ */
+const DEMO_AVATARS: Record<string, string> = Object.fromEntries(
+  ACTORS.map((actor, index) => [
+    actor,
+    makeLetterAvatarDataUri(actor, AVATAR_BACKGROUNDS[index % AVATAR_BACKGROUNDS.length]),
+  ]),
+)
 
 /**
  * The file types shown in the playground color legend, each paired with a sample
@@ -99,6 +119,7 @@ function main(): void {
   const themeSelect = requireElement<HTMLSelectElement>('theme')
   const bloomSelect = requireElement<HTMLSelectElement>('bloom')
   const labelsToggle = requireElement<HTMLInputElement>('labels')
+  const avatarsToggle = requireElement<HTMLInputElement>('avatars')
   const controlsToggle = requireElement<HTMLInputElement>('controls')
   const playPauseButton = requireElement<HTMLButtonElement>('play-pause')
   const panel = requireElement<HTMLDivElement>('panel')
@@ -113,6 +134,20 @@ function main(): void {
     overview: requireElement<HTMLButtonElement>('camera-overview'),
     follow: requireElement<HTMLButtonElement>('camera-follow'),
     manual: requireElement<HTMLButtonElement>('camera-manual'),
+  }
+
+  /**
+   * The avatar resolver handed to the controller, honoring the Avatars toggle: when on,
+   * each demo actor resolves to its locally-generated lettered avatar (so the feature is
+   * visible offline); when off, it returns null for every actor so the forest draws the
+   * colored orbs, letting the user compare avatar vs orb. Avatars are a construction-time
+   * option, so flipping the toggle rebuilds the controller (like theme / labels).
+   */
+  function resolveAvatar(actor: string): string | null {
+    if (!avatarsToggle.checked) {
+      return null
+    }
+    return DEMO_AVATARS[actor] ?? null
   }
 
   // Drive the FPS readout off the page's own requestAnimationFrame deltas, which
@@ -147,6 +182,9 @@ function main(): void {
     // than a ring of separate fans.
     rootLabel: 'root',
     exclude: parseExcludePatterns(excludeInput.value),
+    // Give the two demo actors locally-generated lettered avatars (issue #20), gated by
+    // the Avatars toggle so the user can compare the avatar vs the colored orb.
+    resolveAvatar,
   })
   controller.seed(seedPaths())
   wireControllerLogging(controller)
@@ -294,6 +332,9 @@ function main(): void {
   })
   bloomSelect.addEventListener('change', () => rebuild())
   labelsToggle.addEventListener('change', () => rebuild())
+  // Avatars are a construction-time option (the resolver is wired at create time), so
+  // toggling them rebuilds the controller in place, exactly like labels.
+  avatarsToggle.addEventListener('change', () => rebuild())
 
   // Rebuilding the controller is the way to apply new exclude globs (filtering is
   // construction-time), so editing the patterns rebuilds in place, debounced so a
@@ -340,6 +381,7 @@ function main(): void {
       cameraMode: 'follow',
       rootLabel: 'root',
       exclude: parseExcludePatterns(excludeInput.value),
+      resolveAvatar,
     })
     controller.seed(seedPaths())
     wireControllerLogging(controller)
@@ -378,6 +420,7 @@ function main(): void {
       cameraMode: 'follow',
       rootLabel: 'root',
       exclude: parseExcludePatterns(excludeInput.value),
+      resolveAvatar,
     })
     controller.seed(seedPaths())
     wireControllerLogging(controller)
@@ -533,6 +576,39 @@ function pickRandomPaths(paths: Set<string>, count: number): string[] {
     pool[swapWith] = temporary
   }
   return pool.slice(0, take)
+}
+
+/**
+ * Bakes a simple lettered avatar into a PNG data URI: a filled disc in `background`
+ * with the actor's first initial centered in white. Drawn on an offscreen canvas so
+ * the playground demonstrates the avatar feature with zero external network (a data
+ * URI is a valid image URL). A real host (Seraphim) hands the controller its agents'
+ * actual icon URLs instead; this is just the demo's stand-in image source.
+ */
+function makeLetterAvatarDataUri(actor: string, background: string): string {
+  const canvas = document.createElement('canvas')
+  canvas.width = AVATAR_PX
+  canvas.height = AVATAR_PX
+  const context = canvas.getContext('2d')
+  if (!context) {
+    console.debug('[runewood] 2D canvas context unavailable, avatar will fall back to the colored orb', actor)
+    return ''
+  }
+
+  const center = AVATAR_PX / 2
+  context.fillStyle = background
+  context.beginPath()
+  context.arc(center, center, center, 0, Math.PI * 2)
+  context.fill()
+
+  context.fillStyle = '#ffffff'
+  context.font = `${Math.round(AVATAR_PX * 0.56)}px ui-monospace, monospace`
+  context.textAlign = 'center'
+  context.textBaseline = 'middle'
+  // A small vertical nudge centers the cap-height glyph in the disc more evenly.
+  context.fillText(actor.charAt(0).toUpperCase(), center, center + AVATAR_PX * 0.04)
+
+  return canvas.toDataURL('image/png')
 }
 
 /** Fetches an element by id, throwing loudly if the page markup is missing it. */

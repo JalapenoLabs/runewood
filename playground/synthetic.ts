@@ -28,7 +28,7 @@ import type { RunewoodEvent, RunewoodAction } from '../src/index'
  * follow camera calmer (it no longer chases a swarm scattered across the whole
  * forest) and reads more like a real, focused work session.
  */
-const ACTORS = [ 'fable', 'sonnet' ] as const
+export const ACTORS = [ 'fable', 'sonnet' ] as const
 
 /** The repo roots of the fake forest. Mirrors a real Seraphim-style multi-repo workspace. */
 const REPO_ROOTS = [ 'api', 'frontend', 'workspace', 'docs', 'infra' ] as const

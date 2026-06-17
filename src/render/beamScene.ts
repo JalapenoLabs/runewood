@@ -1,17 +1,20 @@
 // Copyright © 2026 Jalapeno Labs
 
-import type { Container } from 'pixi.js'
+import type { Container, Texture } from 'pixi.js'
 import type { Vec2 } from '../core/layout'
 import type { RunewoodTheme } from '../core/theme'
 import type { BeamFieldOptions, ActiveBeam, BeamEndpointResolver } from './beams'
 import type { ActorActivity, ActorUserOptions } from './actors'
+import type { AvatarResolver } from './avatarRegistry'
 
 // Core
-import { BlurFilter, Graphics } from 'pixi.js'
+import { BlurFilter, Graphics, Sprite } from 'pixi.js'
 
+import { colorForActor } from '../core/theme'
 import { hslToRgbInt } from './color'
 import { BeamField } from './beams'
 import { ActorUser } from './actors'
+import { AvatarTextureCache } from './avatarTexture'
 
 /**
  * The retained beam/particle layer that sits *above* the forest (issue #6, and as
@@ -71,6 +74,39 @@ export class BeamScene {
   /** Retained actor orb graphics, keyed by actor id. */
   private readonly actorGraphics: Map<string, Graphics>
   /**
+   * The host's avatar resolver (an actor id -> image URL, or null for the colored-orb
+   * fallback), already flattened to a plain function by the controller so the render
+   * layer stays framework-agnostic. `undefined` when the host supplied no avatars at
+   * all, in which case every actor draws its orb exactly as before. See
+   * {@link import('../runewood').RunewoodOptions.resolveAvatar}.
+   */
+  private readonly avatarResolve: AvatarResolver | undefined
+  /**
+   * The lazy, URL-keyed avatar texture cache, built on the FIRST actor that resolves to a
+   * real avatar URL (see {@link avatarTextureFor}) and `null` until then, so a forest that
+   * only ever draws colored orbs never allocates it even when a resolver is wired.
+   */
+  private avatarTextures: AvatarTextureCache | null
+  /**
+   * Retained per-actor avatar sprites, keyed by actor id: the circular image drawn in
+   * place of the orb once its texture has loaded. Created on the first frame an actor's
+   * avatar texture is ready and culled with the rest of the actor's graphics.
+   */
+  private readonly avatarSprites: Map<string, Sprite>
+  /**
+   * Retained per-actor avatar ring graphics, keyed by actor id: the colored border drawn
+   * around the avatar in the actor's hashed {@link colorForActor} color, so an avatared
+   * actor still reads as that actor at a glance. Paired with {@link avatarSprites}.
+   */
+  private readonly avatarRings: Map<string, Graphics>
+  /**
+   * Retained per-actor circular mask graphics, keyed by actor id: a filled circle that
+   * clips the square avatar texture into a disc. One mask per sprite (a pixi mask is a
+   * single display object), sized + positioned with its sprite each frame. Paired with
+   * {@link avatarSprites}.
+   */
+  private readonly avatarMasks: Map<string, Graphics>
+  /**
    * Retained per-actor physics bodies (Gource `RUser`s), keyed by actor id. Each holds
    * its live position so a beam fired by this actor can resolve its source from where
    * the orb actually is, and so the orb flies and rolls to rest under the physics rather
@@ -101,6 +137,15 @@ export class BeamScene {
 
     this.actorGraphics = new Map()
     this.actorUsers = new Map()
+
+    // Avatars are opt-in and lazy: the resolver is held, but the texture cache is built
+    // only once an actor actually resolves to a real avatar URL, so a forest of colored
+    // orbs never allocates it.
+    this.avatarResolve = options.resolveAvatar
+    this.avatarTextures = null
+    this.avatarSprites = new Map()
+    this.avatarRings = new Map()
+    this.avatarMasks = new Map()
   }
 
   /**
@@ -184,7 +229,10 @@ export class BeamScene {
   /** Removes every retained graphic. Call when tearing the scene down. */
   public dispose(): void {
     this.beamGraphics.destroy()
-    for (const actor of [ ...this.actorGraphics.keys() ]) {
+    // An avatared actor may have only avatar graphics (no orb), so tear down the union of
+    // both retained sets, not just the orbs.
+    const retained = new Set<string>([ ...this.actorGraphics.keys(), ...this.avatarSprites.keys() ])
+    for (const actor of retained) {
       this.removeActor(actor)
     }
   }
@@ -312,38 +360,163 @@ export class BeamScene {
         continue
       }
 
-      let graphics = this.actorGraphics.get(activity.actor)
-      if (!graphics) {
-        graphics = new Graphics()
-        graphics.blendMode = 'add'
-        this.layer.addChild(graphics)
-        this.actorGraphics.set(activity.actor, graphics)
-      }
-
       const radius = Math.max(visual.size, minWorldRadius)
-      const color = hslToRgbInt(visual.color)
-      graphics.clear()
-      graphics
-        .circle(0, 0, radius)
-        .fill({ color, alpha: visual.alpha * theme.bloomIntensity })
-      graphics.position.set(visual.position.x, visual.position.y)
+
+      // When the host gave this actor an avatar and its image has finished loading, draw
+      // the circular avatar (image + colored ring) in place of the orb; otherwise (no
+      // avatar, still loading, or load failed) fall back to the colored orb. Either way the
+      // drawn thing rides the same `visual.alpha` idle fade and `visual.position`.
+      const avatarTexture = this.avatarTextureFor(activity.actor)
+      if (avatarTexture) {
+        this.drawAvatar(activity.actor, avatarTexture, visual.position, radius, visual.alpha)
+        this.hideOrb(activity.actor)
+      }
+      else {
+        this.drawOrb(activity.actor, visual.position, radius, visual.alpha, theme)
+        this.hideAvatar(activity.actor)
+      }
     }
 
     // Cull retained actors the controller no longer reports at all (their window
-    // dropped them), so a quiet actor's orb does not linger.
-    for (const actor of [ ...this.actorGraphics.keys() ]) {
+    // dropped them), so a quiet actor's orb / avatar does not linger. An avatared actor
+    // may have only avatar graphics (no orb), so the cull set is the union of both maps.
+    const retained = new Set<string>([ ...this.actorGraphics.keys(), ...this.avatarSprites.keys() ])
+    for (const actor of retained) {
       if (!present.has(actor)) {
         this.removeActor(actor)
       }
     }
   }
 
-  /** Tears down one actor's retained orb graphic and its physics body. */
+  /**
+   * The ready avatar texture for an actor this frame, or `null` to draw the colored-orb
+   * fallback. `null` whenever the host configured no avatars, this actor resolves to no
+   * URL, or its image has not loaded yet / failed to load. The cache kicks the lazy load
+   * on the first ask and returns the texture the frame after it resolves.
+   */
+  private avatarTextureFor(actor: string): Texture | null {
+    if (!this.avatarResolve) {
+      return null
+    }
+    const url = this.avatarResolve(actor)
+    if (!url) {
+      return null
+    }
+    // First avatar URL ever seen: stand up the cache now (lazily), so an all-orbs forest
+    // never allocates it even though the resolver is always wired.
+    this.avatarTextures ??= new AvatarTextureCache()
+    return this.avatarTextures.get(url)
+  }
+
+  /**
+   * Draws an actor as a circular avatar at `position`: a colored ring in the actor's
+   * hashed {@link colorForActor} color around the image, the image itself clipped to a
+   * disc by a circular mask, all riding the idle-fade `alpha`. The sprite, ring, and
+   * mask are retained per actor and reused each frame. Unlike the additive orb, the
+   * avatar is drawn with normal blending so the photo reads true rather than glowing white.
+   */
+  private drawAvatar(actor: string, texture: Texture, position: Vec2, radius: number, alpha: number): void {
+    let sprite = this.avatarSprites.get(actor)
+    let ring = this.avatarRings.get(actor)
+    let mask = this.avatarMasks.get(actor)
+    if (!sprite || !ring || !mask) {
+      sprite = new Sprite()
+      sprite.anchor.set(0.5)
+      ring = new Graphics()
+      mask = new Graphics()
+      // The mask is parented under the sprite and clips it to a circle; the ring rides
+      // above the masked image as its colored border. Add the ring last so it reads on top.
+      this.layer.addChild(sprite)
+      this.layer.addChild(ring)
+      sprite.mask = mask
+      sprite.addChild(mask)
+      this.avatarSprites.set(actor, sprite)
+      this.avatarRings.set(actor, ring)
+      this.avatarMasks.set(actor, mask)
+    }
+
+    // Point the sprite at the (possibly newly-loaded) texture, then scale the square
+    // image so its diameter is 2 * radius in world units regardless of the source pixels.
+    if (sprite.texture !== texture) {
+      sprite.texture = texture
+    }
+    const sourceSize = Math.max(texture.width, texture.height, 1)
+    const scale = (radius * 2) / sourceSize
+    sprite.scale.set(scale)
+    sprite.position.set(position.x, position.y)
+    sprite.alpha = alpha
+
+    // The mask is a sprite-local circle (the sprite's anchor is its center), drawn in the
+    // sprite's pre-scale coordinate space, so its radius is the source half-size.
+    mask.clear()
+    mask.circle(0, 0, sourceSize / 2).fill({ color: 0xffffff })
+
+    // The colored identity ring sits in world space around the avatar, its width floored so
+    // it stays visible as the camera pulls out. It fades with the avatar.
+    const ringWidth = Math.max(radius * AVATAR_RING_WIDTH_FRACTION, 1)
+    ring.clear()
+    ring
+      .circle(position.x, position.y, radius)
+      .stroke({ color: hslToRgbInt(colorForActor(actor)), width: ringWidth, alpha })
+  }
+
+  /** Hides an actor's avatar graphics without destroying them (it fell back to the orb this frame). */
+  private hideAvatar(actor: string): void {
+    const sprite = this.avatarSprites.get(actor)
+    if (sprite) {
+      sprite.visible = false
+    }
+    const ring = this.avatarRings.get(actor)
+    if (ring) {
+      ring.visible = false
+    }
+  }
+
+  /** Draws the colored additive orb fallback for an actor, getting-or-creating its retained graphic. */
+  private drawOrb(actor: string, position: Vec2, radius: number, alpha: number, theme: RunewoodTheme): void {
+    let graphics = this.actorGraphics.get(actor)
+    if (!graphics) {
+      graphics = new Graphics()
+      graphics.blendMode = 'add'
+      this.layer.addChild(graphics)
+      this.actorGraphics.set(actor, graphics)
+    }
+    graphics.visible = true
+    graphics.clear()
+    graphics
+      .circle(0, 0, radius)
+      .fill({ color: hslToRgbInt(colorForActor(actor)), alpha: alpha * theme.bloomIntensity })
+    graphics.position.set(position.x, position.y)
+  }
+
+  /** Hides an actor's orb graphic without destroying it (its avatar was drawn this frame). */
+  private hideOrb(actor: string): void {
+    const graphics = this.actorGraphics.get(actor)
+    if (graphics) {
+      graphics.visible = false
+    }
+  }
+
+  /** Tears down one actor's retained orb + avatar graphics and its physics body. */
   private removeActor(actor: string): void {
     const graphics = this.actorGraphics.get(actor)
     if (graphics) {
       graphics.destroy()
       this.actorGraphics.delete(actor)
+    }
+    // The mask is a child of the sprite, so destroying the sprite with `children: true`
+    // takes the mask down too; destroy the ring separately. Clear the mask binding first.
+    const sprite = this.avatarSprites.get(actor)
+    if (sprite) {
+      sprite.mask = null
+      sprite.destroy({ children: true })
+      this.avatarSprites.delete(actor)
+      this.avatarMasks.delete(actor)
+    }
+    const ring = this.avatarRings.get(actor)
+    if (ring) {
+      ring.destroy()
+      this.avatarRings.delete(actor)
     }
     // Drop the user too so a reappearance spawns fresh rather than resuming from a stale
     // physics body.
@@ -402,6 +575,14 @@ const BEAM_GLOW_LAYERS = [
  */
 const BEAM_BLUR_STRENGTH = 6
 
+/**
+ * The fraction of an actor's drawn radius the avatar's identity ring is thick. A
+ * small fraction keeps the colored border a crisp rim around the photo rather than a
+ * heavy donut, and it is floored at one pixel in {@link BeamScene} so it stays visible
+ * as the camera pulls out.
+ */
+const AVATAR_RING_WIDTH_FRACTION = 0.18
+
 /** Construction options for a {@link BeamScene}; forwards tuning to the pure models. */
 export type BeamSceneOptions = {
   beams?: BeamFieldOptions
@@ -411,4 +592,13 @@ export type BeamSceneOptions = {
    * field defaults to Gource's own value. See {@link ActorUserOptions}.
    */
   actors?: ActorUserOptions
+  /**
+   * The host's avatar resolver: an actor id -> image URL (a data URI is fine), or
+   * `null` / `undefined` for the colored-orb fallback. The controller flattens its
+   * {@link import('../runewood').RunewoodOptions.resolveAvatar} option and its
+   * {@link import('../runewood').RunewoodController.setAvatar} overrides into this one
+   * function. Omitted means no avatars: every actor draws the colored orb, exactly as
+   * before, at zero extra cost. See {@link AvatarResolver}.
+   */
+  resolveAvatar?: AvatarResolver
 }
