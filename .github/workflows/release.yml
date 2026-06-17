@@ -73,10 +73,16 @@ jobs:
       # release-it ONLY bumps the version, tags it, pushes the release commit, and
       # opens the GitHub Release (its npm.publish is false). The bumped version is
       # left in package.json on disk for the two publish steps below to reuse.
+      #
+      # The increment defaults to `patch` (the every-push auto-release), but can be
+      # overridden to `minor` / `major` for a one-off milestone release by setting
+      # the repo Actions variable RELEASE_INCREMENT before the push, then clearing
+      # it so subsequent pushes resume patching.
       - name: Bump version, tag, and GitHub release
-        run: yarn release patch --ci
+        run: yarn release "${RELEASE_INCREMENT:-patch}" --ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_INCREMENT: ${{ vars.RELEASE_INCREMENT }}
 
       # Publish the unscoped `runewood` to npmjs via trusted publishing: no token,
       # the OIDC id-token is exchanged for a short-lived credential and provenance
