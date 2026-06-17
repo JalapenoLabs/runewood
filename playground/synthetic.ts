@@ -30,8 +30,14 @@ import type { RunewoodEvent, RunewoodAction } from '../src/index'
  */
 export const ACTORS = [ 'fable', 'sonnet' ] as const
 
-/** The repo roots of the fake forest. Mirrors a real Seraphim-style multi-repo workspace. */
-const REPO_ROOTS = [ 'api', 'frontend', 'workspace', 'docs', 'infra' ] as const
+/**
+ * The three repo roots of the fake forest, branching off the shared `root` node,
+ * mirroring a real Seraphim-style multi-repo workspace. Each is built out into a
+ * substantial tree (see {@link buildMockRepoTree}) so the playground reproduces the
+ * large multi-repo first-load (~1800 nodes) that stresses the layout, not a toy
+ * handful of files.
+ */
+const REPO_ROOTS = [ 'seraphim', 'yearloom', 'plunder' ] as const
 
 /** Filename stems the generator pairs with an extension to invent plausible file paths. */
 const FILE_STEMS = [
@@ -39,14 +45,26 @@ const FILE_STEMS = [
   'service', 'store', 'view', 'parser', 'loader', 'worker', 'schema', 'guard',
 ]
 
-/** Extensions per repo root, so a repo's invented files look like they belong to it. */
+/** Extensions per repo root, so a repo's files look like they belong to it (and color distinctly). */
 const EXTENSIONS_BY_ROOT = {
-  api: [ 'rs', 'toml', 'sql' ],
-  frontend: [ 'ts', 'tsx', 'svelte', 'css' ],
-  workspace: [ 'sh', 'dockerfile', 'ts' ],
-  docs: [ 'md', 'mdx' ],
-  infra: [ 'yml', 'tf', 'sh' ],
+  seraphim: [ 'rs', 'toml', 'sql', 'ts' ],
+  yearloom: [ 'ts', 'tsx', 'svelte', 'css' ],
+  plunder: [ 'rs', 'ts', 'sh', 'md' ],
 } as const satisfies Record<typeof REPO_ROOTS[number], string[]>
+
+/** Source areas every mock repo carries; each is filled with feature modules of files. */
+const REPO_SOURCE_AREAS = [ 'src', 'lib', 'internal', 'pkg' ]
+
+/** Feature modules under each source area, giving each repo's tree realistic breadth. */
+const REPO_MODULES = [
+  'auth', 'users', 'billing', 'session', 'config', 'http', 'db', 'cache',
+  'queue', 'render', 'store', 'router', 'parser', 'loader', 'worker', 'schema',
+]
+
+/** File stems generated under each module. */
+const MODULE_FILE_STEMS = [
+  'index', 'handler', 'service', 'model', 'types', 'utils', 'guard', 'client',
+]
 
 /** Mid-path directory segments used to build realistic, sometimes deep, paths. */
 const DIRECTORY_SEGMENTS = [
@@ -321,14 +339,52 @@ export function createSyntheticStream(options: SyntheticOptions) {
 
 export type SyntheticStream = ReturnType<typeof createSyntheticStream>
 
-/** Builds the initial forest: a handful of seed files per repo so there is structure to discover. */
+/**
+ * Builds one mock repo's full file tree: a couple of root files plus, for every
+ * source area, a set of feature modules each holding a handful of files (with one
+ * file a level deeper for depth), plus a flat tests area mirroring the modules.
+ * This yields ~600 realistic, sometimes-deep paths per repo, so three repos seed a
+ * ~1800-node forest, enough to reproduce and test the large multi-repo first load.
+ *
+ * The extension for each file is chosen deterministically by cycling the repo's
+ * languages, so the seeded tree is identical run to run (reproducible scale tests)
+ * rather than reshuffling on every reload.
+ */
+function buildMockRepoTree(repo: string, extensions: readonly string[]): string[] {
+  const paths = [ `${repo}/README.md`, `${repo}/${repo}.config.${extensions[0]}` ]
+
+  let fileIndex = 0
+  const nextExtension = (): string => extensions[fileIndex++ % extensions.length]
+
+  for (const area of REPO_SOURCE_AREAS) {
+    for (const moduleName of REPO_MODULES) {
+      for (const stem of MODULE_FILE_STEMS) {
+        paths.push(`${repo}/${area}/${moduleName}/${stem}.${nextExtension()}`)
+      }
+      // One file a level deeper so the tree has depth, not just breadth.
+      paths.push(`${repo}/${area}/${moduleName}/internal/impl.${nextExtension()}`)
+    }
+  }
+
+  for (const moduleName of REPO_MODULES) {
+    paths.push(`${repo}/tests/${moduleName}.test.${nextExtension()}`)
+  }
+
+  return paths
+}
+
+/**
+ * Builds the initial forest: all three repos built out to their full trees (see
+ * {@link buildMockRepoTree}), so the playground opens on a large multi-repo
+ * workspace (~1800 dim nodes) to discover, the same scale a real Seraphim instance
+ * with several repos hits on first load.
+ */
 function createForest(): Forest {
   const files = new Set<string>()
   for (const root of REPO_ROOTS) {
-    const extensions = EXTENSIONS_BY_ROOT[root]
-    files.add(`${root}/src/${FILE_STEMS[0]}.${extensions[0]}`)
-    files.add(`${root}/src/${FILE_STEMS[1]}.${extensions[0]}`)
-    files.add(`${root}/README.md`)
+    for (const path of buildMockRepoTree(root, EXTENSIONS_BY_ROOT[root])) {
+      files.add(path)
+    }
   }
   return { files, focusByActor: new Map() }
 }
