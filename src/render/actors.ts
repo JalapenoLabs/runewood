@@ -278,13 +278,18 @@ export class ActorUser {
 
   private readonly options: Required<ActorUserOptions>
 
+  /** The identity color, fixed for this user's lifetime. */
+  private readonly color: Hsl
+
   /**
    * @param actor the actor's stable id.
    * @param spawn where the user first appears (Gource spawns a user at a file's
    *   position). It then flies toward its action targets from here.
+   * @param color the identity color; omitted, the hashed {@link colorForActor} color.
    */
-  constructor(actor: string, spawn: Vec2, options: ActorUserOptions = {}) {
+  constructor(actor: string, spawn: Vec2, options: ActorUserOptions = {}, color: Hsl = colorForActor(actor)) {
     this.actor = actor
+    this.color = color
     this.pos = { x: spawn.x, y: spawn.y }
     this.accel = { x: 0, y: 0 }
     this.brakedTowardTarget = false
@@ -477,7 +482,7 @@ export class ActorUser {
       position: { x: this.pos.x, y: this.pos.y },
       alpha: actorAlpha(lastActiveAt, now, this.options.idleMs, this.options.fadeMs),
       size: this.options.size,
-      color: colorForActor(this.actor),
+      color: this.color,
     }
   }
 }

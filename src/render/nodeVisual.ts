@@ -102,7 +102,18 @@ export type NodeVisualOptions = {
    * cumulative growth.
    */
   pulseStrength?: number
+  /**
+   * The host's color for a file node, or `null` / `undefined` to keep its extension
+   * hue ({@link colorForPath}). The node carries its `lastActor`, so returning that
+   * actor's color paints each file in the color of whoever touched it last. It should
+   * be a pure function of the node so a rewind repaints identically. Directories
+   * always keep the theme's hub color.
+   */
+  color?: NodeColorResolver
 }
+
+/** See {@link NodeVisualOptions.color}. */
+export type NodeColorResolver = (node: TreeNode) => Hsl | null | undefined
 
 /**
  * How long a deleted node takes to shrink to zero radius before it is culled, in
@@ -158,8 +169,9 @@ const HEAT_GLOW_WEIGHT = 0.35
  *   scaled by a transient touch *pulse*: each touch briefly swells it and it eases
  *   back to baseline over `pulseMs`. The baseline no longer grows with cumulative
  *   touches, so a busy file throbs on each edit instead of permanently ballooning.
- * - **color** is the file's vivid extension hue ({@link colorForPath}) for a leaf,
- *   or the theme's neutral hub color for a directory, so directories read as
+ * - **color** is the host's {@link NodeVisualOptions.color} choice for a leaf when it
+ *   makes one, otherwise the file's vivid extension hue ({@link colorForPath}), or the
+ *   theme's neutral hub color for a directory, so directories read as
  *   structural wood and files as their language.
  * - **alpha** is a flat `1` for every persistent node (seeded, discovered,
  *   directory, root) AND for a deleted one: nodes never differ by opacity. A
@@ -197,7 +209,7 @@ export function nodeVisualFor(
   // hub color and read as the structural wood the files hang from. Files take
   // their vivid extension color, so folder vs file is obvious at a glance.
   const color = node.isFile
-    ? colorForPath(node.path)
+    ? options.color?.(node) ?? colorForPath(node.path)
     : { ...theme.hub }
 
   // Every node is fully opaque: persistent nodes never differ by opacity (the

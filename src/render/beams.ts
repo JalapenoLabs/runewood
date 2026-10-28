@@ -2,9 +2,9 @@
 
 import type { RunewoodAction } from '../types'
 import type { Vec2 } from '../core/layout'
-import type { Hsl } from '../core/theme'
+import type { ActorColorResolver, Hsl } from '../core/theme'
 
-import { colorForActor } from '../core/theme'
+import { resolveActorColor } from '../core/theme'
 import { beamActionColor } from './beamColor'
 
 /**
@@ -66,7 +66,11 @@ export class BeamField {
    *   simultaneously live beams; once full, a new spawn evicts the
    *   nearest-to-expiry slot so the freshest activity always wins.
    */
-  constructor(options: BeamFieldOptions = {}) {
+  /**
+   * @param actorColor the host's actor colors (see {@link ActorColorResolver}); omitted, every
+   *   actor keeps its hashed color.
+   */
+  constructor(options: BeamFieldOptions = {}, private readonly actorColor?: ActorColorResolver) {
     this.options = resolveOptions(options)
     this.pool = Array.from({ length: this.options.capacity }, makeDeadBeam)
     this.nextSlot = 0
@@ -88,7 +92,8 @@ export class BeamField {
    * a spawn placed a beam.
    */
   spawn(spawn: BeamSpawn): number {
-    const color = blendActionColor(spawn.action, spawn.actor, this.options.actionTint)
+    const actorColor = resolveActorColor(spawn.actor, this.actorColor)
+    const color = blendActionColor(spawn.action, actorColor, this.options.actionTint)
     const slot = this.claimSlot(spawn.at)
     writeBeam(slot, spawn, color, this.options)
     return 1
@@ -357,8 +362,7 @@ function resolveOptions(options: BeamFieldOptions): ResolvedBeamOptions {
  * `tint = 0` the beam is pure actor color, at `1` pure action color, and the default
  * `0.5` splits the difference. Pure: same inputs always yield the same color.
  */
-function blendActionColor(action: RunewoodAction, actor: string, tint: number): Hsl {
-  const actorColor = colorForActor(actor)
+function blendActionColor(action: RunewoodAction, actorColor: Hsl, tint: number): Hsl {
   const actionColor = beamActionColor(action)
 
   // Hue is angular, so lerp along the shorter way around the wheel rather than

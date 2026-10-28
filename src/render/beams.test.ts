@@ -208,6 +208,13 @@ describe('BeamField', () => {
       expect(colorA.h).not.toBeCloseTo(colorB.h, 1)
     })
 
+    it('uses the host actor color when one is supplied', () => {
+      const hostColor = { h: 42, s: 0.7, l: 0.5 }
+      const field = new BeamField({ actionTint: 0 }, (actor) => actor === 'agent-1' ? hostColor : null)
+      field.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'delete' }))
+      expect(field.activeBeams(1, defaultResolver())[0].color.h).toBeCloseTo(42, 5)
+    })
+
     it('is pure actor color at tint 0', () => {
       const pureActor = new BeamField({ actionTint: 0 })
       pureActor.spawn(makeSpawn({ at: 0, actor: 'agent-1', action: 'delete' }))

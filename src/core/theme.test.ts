@@ -11,6 +11,7 @@ import {
   colorForPath,
   defaultTheme,
   mergeTheme,
+  resolveActorColor,
   themes,
 } from './theme'
 
@@ -147,6 +148,20 @@ describe('colorForActor', () => {
     expect(actorColor.s).toBe(EXPECTED_NODE_SATURATION)
     expect(actorColor.l).toBe(EXPECTED_NODE_LIGHTNESS)
     expectValidHue(actorColor)
+  })
+})
+
+describe('resolveActorColor', () => {
+  const sharathGreen: Hsl = { h: 120, s: 0.6, l: 0.5 }
+
+  it('uses the host color when the resolver picks one', () => {
+    expect(resolveActorColor('sharath', (actor) => actor === 'sharath' ? sharathGreen : null)).toEqual(sharathGreen)
+  })
+
+  it('falls back to the hashed color when the resolver declines or is absent', () => {
+    expect(resolveActorColor('alex', () => null)).toEqual(colorForActor('alex'))
+    expect(resolveActorColor('alex', () => undefined)).toEqual(colorForActor('alex'))
+    expect(resolveActorColor('alex')).toEqual(colorForActor('alex'))
   })
 })
 

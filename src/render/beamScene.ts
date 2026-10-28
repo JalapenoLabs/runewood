@@ -2,7 +2,7 @@
 
 import type { Container, Renderer, Texture } from 'pixi.js'
 import type { Vec2 } from '../core/layout'
-import type { RunewoodTheme } from '../core/theme'
+import type { ActorColorResolver, RunewoodTheme } from '../core/theme'
 import type { BeamFieldOptions, ActiveBeam, BeamEndpointResolver } from './beams'
 import type { ActorActivity, ActorUserOptions } from './actors'
 import type { AvatarResolver } from './avatarRegistry'
@@ -10,7 +10,7 @@ import type { AvatarResolver } from './avatarRegistry'
 // Core
 import { Graphics, Sprite } from 'pixi.js'
 
-import { colorForActor } from '../core/theme'
+import { resolveActorColor } from '../core/theme'
 import { hslToRgbInt } from './color'
 import { buildBeamTexture } from './glowTexture'
 import { beamPlacement } from './beamGeometry'
@@ -113,7 +113,7 @@ export class BeamScene {
   private readonly avatarSprites: Map<string, Sprite>
   /**
    * Retained per-actor avatar ring graphics, keyed by actor id: the colored border drawn
-   * around the avatar in the actor's hashed {@link colorForActor} color, so an avatared
+   * around the avatar in the actor's identity color ({@link resolveActorColor}), so an avatared
    * actor still reads as that actor at a glance. Paired with {@link avatarSprites}.
    */
   private readonly avatarRings: Map<string, Graphics>
@@ -132,6 +132,9 @@ export class BeamScene {
    */
   private readonly actorUsers: Map<string, ActorUser>
 
+  /** The host's actor colors, or `undefined` for the hashed default. */
+  private readonly actorColor: ActorColorResolver | undefined
+
   /**
    * @param layer the world container for beams/actors, added above the forest
    *   layers so the glow reads on top of the wood.
@@ -141,7 +144,8 @@ export class BeamScene {
    */
   constructor(layer: Container, renderer?: Renderer, options: BeamSceneOptions = {}) {
     this.layer = layer
-    this.field = new BeamField(options.beams)
+    this.actorColor = options.actorColor
+    this.field = new BeamField(options.beams, options.actorColor)
     this.actorOptions = options.actors ?? {}
 
     // Bake the one shared beam-gradient texture up front (Gource's beam.png). Every
@@ -370,7 +374,12 @@ export class BeamScene {
       present.add(activity.actor)
       let user = this.actorUsers.get(activity.actor)
       if (!user) {
-        user = new ActorUser(activity.actor, spawnPositionFor(activity.touched), this.actorOptions)
+        user = new ActorUser(
+          activity.actor,
+          spawnPositionFor(activity.touched),
+          this.actorOptions,
+          resolveActorColor(activity.actor, this.actorColor),
+        )
         this.actorUsers.set(activity.actor, user)
       }
       stepping.push({ activity, user })
@@ -447,7 +456,7 @@ export class BeamScene {
 
   /**
    * Draws an actor as a circular avatar at `position`: a colored ring in the actor's
-   * hashed {@link colorForActor} color around the image, the image itself clipped to a
+   * identity color ({@link resolveActorColor}) around the image, the image itself clipped to a
    * disc by a circular mask, all riding the idle-fade `alpha`. The sprite, ring, and
    * mask are retained per actor and reused each frame. Unlike the additive orb, the
    * avatar is drawn with normal blending so the photo reads true rather than glowing white.
@@ -494,7 +503,7 @@ export class BeamScene {
     ring.clear()
     ring
       .circle(position.x, position.y, radius)
-      .stroke({ color: hslToRgbInt(colorForActor(actor)), width: ringWidth, alpha })
+      .stroke({ color: hslToRgbInt(resolveActorColor(actor, this.actorColor)), width: ringWidth, alpha })
   }
 
   /** Hides an actor's avatar graphics without destroying them (it fell back to the orb this frame). */
@@ -522,7 +531,7 @@ export class BeamScene {
     graphics.clear()
     graphics
       .circle(0, 0, radius)
-      .fill({ color: hslToRgbInt(colorForActor(actor)), alpha: alpha * theme.bloomIntensity })
+      .fill({ color: hslToRgbInt(resolveActorColor(actor, this.actorColor)), alpha: alpha * theme.bloomIntensity })
     graphics.position.set(position.x, position.y)
   }
 
@@ -614,4 +623,9 @@ export type BeamSceneOptions = {
    * before, at zero extra cost. See {@link AvatarResolver}.
    */
   resolveAvatar?: AvatarResolver
+  /**
+   * The host's actor colors, applied to the orb, the avatar ring, and every beam the
+   * actor fires. Omitted, each actor keeps its hashed color. See {@link ActorColorResolver}.
+   */
+  actorColor?: ActorColorResolver
 }

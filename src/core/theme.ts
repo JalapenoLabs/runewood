@@ -243,6 +243,19 @@ export function colorForActor(actor: string): Hsl {
 }
 
 /**
+ * A host's color choice for an actor, or `null` / `undefined` to keep the hashed
+ * {@link colorForActor} color. Lets a host give each actor a color it already uses
+ * elsewhere (a person's color in its own UI) instead of a hash it does not control.
+ * It should be pure: the same actor must always map to the same color.
+ */
+export type ActorColorResolver = (actor: string) => Hsl | null | undefined
+
+/** An actor's color: the host's choice when it made one, otherwise the hashed default. */
+export function resolveActorColor(actor: string, resolver?: ActorColorResolver): Hsl {
+  return resolver?.(actor) ?? colorForActor(actor)
+}
+
+/**
  * A caller-supplied partial theme. Every field is optional, and the three color
  * fields accept a partial {@link Hsl} so a host can override just a hue and keep
  * the base saturation and lightness. This is the shape {@link mergeTheme} takes.
