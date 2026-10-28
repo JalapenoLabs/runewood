@@ -26,6 +26,8 @@ export type TreeNode = {
   touchCount: number
   /** Epoch ms of the most recent event on this node, for cooldown effects. */
   lastTouchedAt: number | null
+  /** The actor of the most recent event on this exact node, or `null` if none has landed on it yet. */
+  lastActor: string | null
 }
 
 /**
@@ -42,6 +44,7 @@ export function createTree(): TreeNode {
     status: 'discovered',
     touchCount: 0,
     lastTouchedAt: null,
+    lastActor: null,
   }
 }
 
@@ -94,6 +97,7 @@ export function applyEvent(root: TreeNode, event: RunewoodEvent): ApplyEventResu
   const { node, created } = ensurePath(root, path, 'discovered')
   node.touchCount += 1
   node.lastTouchedAt = event.at
+  node.lastActor = event.actor
 
   if (event.action === 'delete') {
     markDeleted(node)
@@ -128,6 +132,7 @@ function ensurePath(root: TreeNode, path: string, statusForNew: NodeStatus): { n
         status: statusForNew,
         touchCount: 0,
         lastTouchedAt: null,
+        lastActor: null,
       }
       current.children.set(segment, child)
       created = true

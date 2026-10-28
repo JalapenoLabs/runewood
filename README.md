@@ -68,6 +68,27 @@ viz.follow('live')                 // pin the playhead to now
 The renderer and this controller surface are still being built; the event and
 tree primitives below are stable today.
 
+## Choosing colors
+
+By default every actor gets a hashed color and every file node takes the hue of its
+extension. A host that already gives people colors can carry them into the forest:
+
+```ts
+const colorByPerson = { alice: { h: 140, s: 0.7, l: 0.5 }, bob: { h: 280, s: 0.7, l: 0.6 } }
+
+const viz = createRunewood(container, {
+  // The orb, avatar ring, and beams of each actor
+  actorColor: (actor) => colorByPerson[actor],
+  // Paint each file in the color of whoever touched it last
+  nodeColor: (node) => node.lastActor ? colorByPerson[node.lastActor] : null,
+})
+```
+
+Return `null` or `undefined` from either resolver to keep the default for that actor
+or node. Keep both pure, so the same input always gives the same color and a rewind
+repaints identically. Every tree node records `lastActor`, the actor of the latest
+event that landed on it.
+
 ## Develop
 
 ```bash

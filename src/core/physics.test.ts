@@ -31,6 +31,7 @@ function nodeFor(path: string, isFile: boolean): TreeNode {
     status: 'discovered',
     touchCount: 0,
     lastTouchedAt: null,
+    lastActor: null,
   }
 }
 

@@ -18,6 +18,16 @@ function event(overrides: Partial<RunewoodEvent>): RunewoodEvent {
 }
 
 describe('applyEvent', () => {
+  it('records the actor of the latest event on the node it lands on', () => {
+    const root = createTree()
+    applyEvent(root, event({ action: 'create', actor: 'alice', at: 1000 }))
+    const { node } = applyEvent(root, event({ action: 'modify', actor: 'bob', at: 2000 }))
+
+    expect(node?.lastActor).toBe('bob')
+    // Only the touched node is attributed; the directories it passed through are not
+    expect(root.children.get('repo')?.lastActor).toBeNull()
+  })
+
   it('creates intermediate directories on the way to a file', () => {
     const root = createTree()
     const { node } = applyEvent(root, event({ action: 'create' }))

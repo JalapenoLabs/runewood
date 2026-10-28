@@ -22,6 +22,7 @@ function makeNode(overrides: Partial<TreeNode> = {}): TreeNode {
     status: overrides.status ?? 'discovered',
     touchCount: overrides.touchCount ?? 0,
     lastTouchedAt: overrides.lastTouchedAt ?? null,
+    lastActor: overrides.lastActor ?? null,
   }
 }
 
@@ -305,6 +306,24 @@ describe('nodeVisualFor', () => {
       expect(directoryVisual.color).not.toEqual(fileVisual.color)
       // And the directory reads as the desaturated hub, not a vivid file hue.
       expect(directoryVisual.color.s).toBeLessThan(fileVisual.color.s)
+    })
+
+    it('lets the host color a file by whoever touched it last', () => {
+      const aliceColor = { h: 10, s: 0.8, l: 0.5 }
+      const color = (node: TreeNode) => node.lastActor === 'alice' ? aliceColor : null
+
+      const touched = makeNode({ isFile: true, path: 'repo/src/main.ts', lastActor: 'alice' })
+      const untouched = makeNode({ isFile: true, path: 'repo/src/main.ts' })
+
+      expect(nodeVisualFor(touched, 1000, defaultTheme, { color }).color).toEqual(aliceColor)
+      // Declining (null) keeps the extension hue
+      expect(nodeVisualFor(untouched, 1000, defaultTheme, { color }).color).toEqual(colorForPath('repo/src/main.ts'))
+    })
+
+    it('keeps directories on the hub color even when the host colors nodes', () => {
+      const directory = makeNode({ isFile: false, path: 'repo/src', name: 'src', lastActor: 'alice' })
+      const visual = nodeVisualFor(directory, 1000, defaultTheme, { color: () => ({ h: 10, s: 0.8, l: 0.5 }) })
+      expect(visual.color).toEqual(defaultTheme.hub)
     })
   })
 

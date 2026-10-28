@@ -13,7 +13,8 @@ export type {
   HeatOptions,
 } from './core/layout'
 export type { ForceLayoutOptions, NodeMeta } from './core/physics'
-export type { Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
+export type { ActorColorResolver, Hsl, RunewoodTheme, RunewoodThemeOverrides, ThemeName } from './core/theme'
+export type { NodeColorResolver } from './render/nodeVisual'
 export type {
   HighlightGroup,
   HighlightResolution,
@@ -44,7 +45,7 @@ export {
   buildQuadTree,
 } from './core/physics'
 export type { QuadTree, QuadPoint, SiblingGroup } from './core/physics'
-export { colorForPath, colorForActor, themes, defaultTheme, mergeTheme } from './core/theme'
+export { colorForPath, colorForActor, resolveActorColor, themes, defaultTheme, mergeTheme } from './core/theme'
 export { Emitter } from './core/emitter'
 export { HighlightRegistry, highlightPulse } from './core/highlight'
 export { nearestWithinRadius } from './core/picking'

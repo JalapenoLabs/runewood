@@ -3,7 +3,8 @@
 import type { RunewoodEvent } from './types'
 import type { Vec2, NodePhysics, LayoutOptions, SpringParams } from './core/layout'
 import type { ForceLayoutOptions } from './core/physics'
-import type { RunewoodTheme, RunewoodThemeOverrides } from './core/theme'
+import type { ActorColorResolver, RunewoodTheme, RunewoodThemeOverrides } from './core/theme'
+import type { NodeColorResolver } from './render/nodeVisual'
 import type { WorldBounds } from './render/camera'
 import type { FrameState, BeamSpawnRequest, PulseSpawnRequest } from './core/frameStep'
 import type { ActorActivity, ActorUserOptions } from './render/actors'
@@ -438,6 +439,23 @@ export type RunewoodOptions = {
    * watch page passes each agent's icon URL here.
    */
   resolveAvatar?: AvatarResolver
+  /**
+   * Choose each actor's color instead of the hashed default: given an actor id, return
+   * an {@link Hsl}, or `null` / `undefined` to keep the hash. Applies to the actor's orb,
+   * its avatar ring, and every beam it fires. Useful when the host already gives people
+   * colors elsewhere in its UI and wants the forest to match. Keep it pure (same actor,
+   * same color) so a rewind repaints identically.
+   */
+  actorColor?: ActorColorResolver
+  /**
+   * Choose a file node's color instead of its extension hue: given the node, return an
+   * {@link Hsl}, or `null` / `undefined` to keep the extension hue. The node carries its
+   * `lastActor`, so `(node) => node.lastActor ? colorOf(node.lastActor) : null` paints
+   * every file in the color of whoever touched it last. Directories keep the theme's hub
+   * color. Keep it pure so a rewind repaints identically. Takes precedence over
+   * `scene.node.color` when both are given.
+   */
+  nodeColor?: NodeColorResolver
   /** Tuning forwarded to the retained label scene (LOD policy). */
   labels?: LabelLodOptions
   /**
@@ -1289,7 +1307,13 @@ export function createRunewood(container: HTMLElement, options: RunewoodOptions 
       return
     }
 
-    scene = backend.createScene(options.scene)
+    scene = backend.createScene({
+      ...options.scene,
+      node: {
+        ...options.scene?.node,
+        color: options.nodeColor ?? options.scene?.node?.color,
+      },
+    })
     // Fold the top-level `actorLingerMs` knob into the beam scene's actor options as the
     // Gource `RUser` idle time, while leaving any finer per-actor tuning the host passed
     // via `beams.actors` intact. An explicit `beams.actors.idleMs` wins, since it is the
@@ -1838,7 +1862,10 @@ const REDUCED_MOTION_STEP_SCALE = 4
  * paused contributor stays present rather than fading after Gource's default few seconds.
  */
 function resolveBeamSceneOptions(options: RunewoodOptions): BeamSceneOptions {
-  const beams = options.beams ?? {}
+  const beams = {
+    ...options.beams,
+    actorColor: options.actorColor ?? options.beams?.actorColor,
+  }
   if (options.actorLingerMs === undefined) {
     return beams
   }
